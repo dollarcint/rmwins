@@ -1,0 +1,43 @@
+{% load static %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Secure login for Alessar Research Cloud.">
+  <title>Login · Alessar Research Cloud</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{% static 'surveys/css/dashboard.css' %}">
+</head>
+<body>
+  <main class="login-page">
+    <section class="login-brand-panel">
+      <div class="login-brand-content">
+        <a class="login-brand-link" href="https://alessarsolutions.in/"><span class="brand-dot"></span>Alessar Solutions</a>
+        <p class="login-kicker">Alessar Research Cloud</p>
+        <h1>Survey operations, clearly organized.</h1>
+        <p>Access the live research inventory across countries and partners from one secure workspace.</p>
+      </div>
+    </section>
+    <section class="login-form-panel">
+      <div class="login-card">
+        <p class="login-kicker">Secure workspace</p>
+        <h2>Welcome back</h2>
+        <p class="login-intro">Sign in with your Alessar administrator credentials.</p>
+        {% if form.errors %}<div class="login-error">The username or password is incorrect. Please try again.</div>{% endif %}
+        <form method="post">
+          {% csrf_token %}
+          {% if next %}<input type="hidden" name="next" value="{{ next }}">{% endif %}
+          <label class="login-field" for="id_username">Username<input type="text" name="username" id="id_username" autocomplete="username" required autofocus></label>
+          <label class="login-field" for="id_password">Password<input type="password" name="password" id="id_password" autocomplete="current-password" required></label>
+          <button class="login-submit" type="submit">Sign in to dashboard</button>
+        </form>
+        <a class="login-back" href="https://alessarsolutions.in/">← Back to Alessar Solutions</a>
+        <p class="login-security">Protected access for authorized research operations users.</p>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

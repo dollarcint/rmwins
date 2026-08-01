@@ -1,5 +1,8 @@
-import { Menu, X } from 'lucide-react';
+import { LogIn, Menu, X } from 'lucide-react';
 import { useState } from 'react';
+
+const dashboardLoginUrl =
+  import.meta.env.VITE_DASHBOARD_LOGIN_URL || 'https://api.alessarsolutions.in/login/';
 
 const links = [
   { id: 'home', label: 'Home' },
@@ -37,18 +40,28 @@ export default function Navbar() {
                 {link.label}
               </button>
             ))}
-            <button
-              onClick={() => scrollToSection('contact')}
-              className="text-sm bg-brand-700 text-white px-4 py-2 rounded-lg font-medium hover:bg-brand-600 transition-colors"
-            >
-              Request a study
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => scrollToSection('contact')}
+                className="text-sm bg-brand-700 text-white px-4 py-2 rounded-lg font-medium hover:bg-brand-600 transition-colors"
+              >
+                Request a study
+              </button>
+              <a
+                href={dashboardLoginUrl}
+                className="inline-flex items-center gap-1.5 text-sm border border-slate-200 text-slate-700 px-3.5 py-2 rounded-lg font-medium hover:border-brand-500 hover:text-brand-700 hover:bg-brand-50 transition-colors"
+              >
+                <LogIn size={15} />
+                Login
+              </a>
+            </div>
           </div>
 
           <button
             onClick={() => setIsOpen(!isOpen)}
             className="md:hidden text-slate-600 hover:text-slate-900 p-1"
             aria-label="Menu"
+            aria-expanded={isOpen}
           >
             {isOpen ? <X size={22} /> : <Menu size={22} />}
           </button>
@@ -73,6 +86,13 @@ export default function Navbar() {
             >
               Request a study
             </button>
+            <a
+              href={dashboardLoginUrl}
+              className="flex items-center justify-center gap-2 w-full border border-slate-200 text-slate-700 px-4 py-2.5 rounded-lg text-sm font-medium hover:border-brand-500 hover:text-brand-700 hover:bg-brand-50 transition-colors"
+            >
+              <LogIn size={16} />
+              Login
+            </a>
           </div>
         </div>
       )}

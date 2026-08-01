@@ -1,0 +1,137 @@
+{% load static %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Live survey inventory dashboard with country and company filtering.">
+  <title>Alessar Research Cloud · Live Inventory</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{% static 'surveys/css/dashboard.css' %}">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a class="brand" href="https://alessarsolutions.in/" aria-label="Alessar Solutions website">
+          <span class="brand-dot" aria-hidden="true"></span>
+          <span class="brand-lockup"><strong>Alessar Solutions</strong><small>Research operations</small></span>
+        </a>
+        <div class="topbar-actions">
+          <a class="marketing-link" href="https://alessarsolutions.in/">Website ↗</a>
+          <div class="live-badge" id="liveBadge"><span></span><b>Live feed</b></div>
+          <button class="icon-button" id="refreshButton" type="button" aria-label="Refresh live surveys" title="Refresh live surveys">↻</button>
+          <div class="account-menu">
+            <span class="avatar">{{ request.user.username|first|upper }}</span>
+            <span class="user-meta"><small>Signed in as</small><strong>{{ request.user.username }}</strong></span>
+            <form method="post" action="{% url 'logout' %}">{% csrf_token %}<button class="logout-button" type="submit">Logout</button></form>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero" aria-labelledby="pageTitle">
+        <div>
+          <p class="eyebrow">Alessar Research Cloud</p>
+          <h1 id="pageTitle">Live survey inventory</h1>
+          <p class="hero-copy">Monitor every survey opportunity across markets and research partners in one secure workspace.</p>
+        </div>
+        <div class="sync-meta">
+          <span class="sync-dot"></span>
+          <div><small>Last synced</small><strong id="lastSync">Connecting…</strong></div>
+        </div>
+      </section>
+
+      <section class="stats-grid" aria-label="Survey summary">
+        <article class="stat-card stat-primary">
+          <div class="stat-icon">↗</div>
+          <div><span>Available surveys</span><strong id="totalStat">—</strong><small id="filteredNote">Across live feed</small></div>
+        </article>
+        <article class="stat-card">
+          <div class="stat-icon">◎</div>
+          <div><span>Active countries</span><strong id="countryStat">—</strong><small>Current selection</small></div>
+        </article>
+        <article class="stat-card">
+          <div class="stat-icon">◇</div>
+          <div><span>Companies</span><strong id="companyStat">—</strong><small>Current selection</small></div>
+        </article>
+        <article class="stat-card">
+          <div class="stat-icon">$</div>
+          <div><span>Average payout</span><strong id="payoutStat">—</strong><small>Per survey</small></div>
+        </article>
+      </section>
+
+      <section class="filter-panel" aria-labelledby="filterHeading">
+        <div class="section-heading">
+          <div><p class="eyebrow">Refine inventory</p><h2 id="filterHeading">Find the right surveys</h2></div>
+          <button class="text-button" id="clearFilters" type="button">Clear all</button>
+        </div>
+        <div class="filters">
+          <label>Country
+            <span class="select-wrap"><select id="countryFilter"><option value="">All countries</option></select></span>
+          </label>
+          <label>Company
+            <span class="select-wrap"><select id="companyFilter"><option value="">All companies</option></select></span>
+          </label>
+          <label>Survey name
+            <span class="select-wrap"><select id="nameFilter"><option value="">All survey names</option></select></span>
+          </label>
+          <div class="automation-card" aria-label="Fixed user ID enabled">
+            <span class="automation-icon">⌁</span>
+            <div><small>User ID handling</small><strong>Fixed as “opop”</strong><p>Used for every company and survey link.</p></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="table-panel" aria-labelledby="resultsHeading">
+        <div class="table-toolbar">
+          <div>
+            <h2 id="resultsHeading">All surveys</h2>
+            <p id="resultCount">Loading live inventory…</p>
+          </div>
+          <div class="toolbar-actions">
+            <label class="search-box" aria-label="Search surveys"><span>⌕</span><input id="searchInput" type="search" placeholder="Search survey ID, name or company"></label>
+            <button class="export-button" id="exportButton" type="button">Export CSV</button>
+          </div>
+        </div>
+
+        <div class="notice hidden" id="notice" role="status"></div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th><button data-sort="survey_id">Survey ID <span>↕</span></button></th>
+                <th><button data-sort="name">Survey name <span>↕</span></button></th>
+                <th><button data-sort="company">Company <span>↕</span></button></th>
+                <th><button data-sort="country">Country <span>↕</span></button></th>
+                <th><button data-sort="payout">Payout <span>↕</span></button></th>
+                <th>Placement</th>
+                <th class="align-right">Survey link</th>
+              </tr>
+            </thead>
+            <tbody id="surveyRows">
+              <tr class="loading-row"><td colspan="7"><div class="loader"></div><span>Connecting to live feed…</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <footer class="table-footer">
+          <div class="page-size">Rows per page <select id="pageSize"><option>10</option><option selected>20</option><option>50</option><option>100</option></select></div>
+          <div class="pagination">
+            <span id="pageSummary">—</span>
+            <button id="prevPage" type="button" aria-label="Previous page">←</button>
+            <strong id="pageNumber">1</strong>
+            <button id="nextPage" type="button" aria-label="Next page">→</button>
+          </div>
+        </footer>
+      </section>
+    </main>
+    <footer class="site-footer"><span>Alessar Solutions</span><small>Live inventory refreshes automatically every 30 seconds.</small></footer>
+  </div>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="{% static 'surveys/js/dashboard.js' %}" defer></script>
+</body>
+</html>
