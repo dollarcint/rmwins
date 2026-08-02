@@ -1,6 +1,8 @@
 (() => {
   "use strict";
 
+  const FIXED_USER_ID = "omega";
+
   const state = { page: 1, pageSize: 20, sort: "survey_id", direction: "desc", timer: null, requestId: 0, lastPayload: null };
   const el = (id) => document.getElementById(id);
   const controls = {
@@ -17,7 +19,7 @@
   function formatMoney(value) { return `$${Number(value || 0).toFixed(3)}`; }
   function displayCompany(value) { return value === "Unknown" ? value : value.charAt(0).toUpperCase() + value.slice(1); }
   function personalizedSurveyUrl(url) {
-    const userId = "omega";
+    const userId = FIXED_USER_ID;
     const parsed = new URL(url, window.location.origin);
     parsed.searchParams.set("user_id", userId);
     return { url: parsed.toString(), userId };
@@ -166,19 +168,36 @@
   }));
 
   el("exportButton").addEventListener("click", async () => {
-    const originalPage = state.page, originalSize = state.pageSize;
-    const params = new URLSearchParams(queryString(false)); params.set("page", "1"); params.set("page_size", "100");
+    const button = el("exportButton");
+    const originalText = button.textContent;
+    const params = new URLSearchParams(queryString(false));
+    params.delete("page");
+    params.delete("page_size");
+    params.delete("refresh");
+    params.set("user_id", FIXED_USER_ID);
+    button.disabled = true;
+    button.textContent = "Exporting…";
     try {
-      const response = await fetch(`/api/surveys/?${params}`); const payload = await response.json();
-      if (!response.ok) throw new Error(payload.message);
-      const header = ["Survey ID", "Survey name", "Company", "Country", "Payout", "Placement ID", "Entry URL"];
-      const escape = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
-      const lines = [header, ...payload.surveys.map((s) => [s.survey_id, s.name, s.company, s.country, s.payout, s.placement_id, personalizedSurveyUrl(s.entry_url).url])];
-      const blob = new Blob([lines.map((row) => row.map(escape).join(",")).join("\r\n")], { type: "text/csv;charset=utf-8" });
-      const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = `surveys-${new Date().toISOString().slice(0,10)}.csv`; link.click(); URL.revokeObjectURL(link.href);
-      if (payload.pagination.total > 100) showToast("Exported the first 100 filtered surveys"); else showToast("CSV export ready");
-    } catch (_) { showToast("Export could not be created"); }
-    finally { state.page = originalPage; state.pageSize = originalSize; }
+      const response = await fetch(`/api/surveys/export/?${params}`, { headers: { Accept: "text/csv" } });
+      if (!response.ok) throw new Error("Export failed");
+      const blob = await response.blob();
+      const disposition = response.headers.get("Content-Disposition") || "";
+      const filenameMatch = disposition.match(/filename="?([^";]+)"?/i);
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = filenameMatch?.[1] || `surveys-${new Date().toISOString().slice(0, 10)}.csv`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+      const exportedCount = response.headers.get("X-Exported-Count");
+      showToast(exportedCount ? `${formatNumber(exportedCount)} surveys exported` : "Full CSV export ready");
+    } catch (_) {
+      showToast("Export could not be created");
+    } finally {
+      button.disabled = false;
+      button.textContent = originalText;
+    }
   });
 
   loadSurveys();

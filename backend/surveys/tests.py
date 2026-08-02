@@ -66,3 +66,17 @@ class SurveyViewsTests(TestCase):
         payload = response.json()
         self.assertEqual(payload["pagination"]["total_pages"], 2)
         self.assertEqual(len(payload["surveys"]), 1)
+
+    @patch("surveys.views.get_surveys")
+    def test_csv_export_contains_all_matching_rows_without_page_limit(self, get_surveys):
+        self.client.force_login(self.user)
+        get_surveys.return_value = (SAMPLE, datetime.now(timezone.utc), False)
+        response = self.client.get("/api/surveys/export/?page_size=1&user_id=omega")
+        content = b"".join(response.streaming_content).decode("utf-8-sig")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["X-Exported-Count"], "2")
+        self.assertIn("LMS-1", content)
+        self.assertIn("LMS-2", content)
+        self.assertIn("user_id=omega", content)
+        self.assertNotIn("{userId}", content)

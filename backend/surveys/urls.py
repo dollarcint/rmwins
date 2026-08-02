@@ -8,4 +8,5 @@ app_name = "surveys"
 urlpatterns = [
     path("", views.dashboard, name="dashboard"),
     path("api/surveys/", views.survey_api, name="survey_api"),
+    path("api/surveys/export/", views.survey_export, name="survey_export"),
 ]
