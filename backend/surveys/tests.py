@@ -5,7 +5,7 @@ from django.contrib.auth import get_user_model
 from django.test import SimpleTestCase, TestCase, override_settings
 
 from . import services
-from .services import FeedError, normalize_innovatemr_survey, normalize_voqall_survey
+from .services import FeedError, normalize_innovatemr_question, normalize_innovatemr_survey, normalize_voqall_survey
 
 
 SAMPLE = [
@@ -50,6 +50,32 @@ class SurveyViewsTests(TestCase):
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "Live survey inventory")
+
+
+    def test_questions_endpoint_requires_login(self):
+        response = self.client.get("/api/surveys/questions/?company=InnovateMR&survey_id=LMS-2")
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.url.startswith("/login/?next="))
+
+    @patch("surveys.views.get_survey_questions")
+    @patch("surveys.views.get_surveys")
+    def test_questions_endpoint_returns_current_survey_questions(self, get_surveys, get_questions):
+        self.client.force_login(self.user)
+        get_surveys.return_value = (SAMPLE, datetime.now(timezone.utc), False)
+        get_questions.return_value = {
+            "company": "innovatemr",
+            "survey_id": "LMS-2",
+            "survey_name": "Enligne Survey",
+            "questions": [{"id": "2", "code": "GENDER", "text": "What is your gender?", "type": "Single Punch", "category": "Demographic", "options": []}],
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        response = self.client.get("/api/surveys/questions/?company=innovatemr&survey_id=LMS-2")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["questions"][0]["code"], "GENDER")
+        get_questions.assert_called_once_with(SAMPLE[1], force=False)
+
 
     @patch("surveys.views.get_surveys")
     def test_api_filters_by_company_and_country(self, get_surveys):
@@ -106,11 +132,17 @@ class SurveyServicesTests(SimpleTestCase):
         services._cache.update(data=None, fetched_at=None, monotonic=0.0, stale=False)
         services._supplier_cache.update(InnovateMR=None, Voqall=None)
         services._voqall_language_cache = {}
+        services._voqall_qualification_catalog_cache = {}
+        services._voqall_question_detail_cache.clear()
+        services._question_cache.clear()
 
     def tearDown(self):
         services._cache.update(data=None, fetched_at=None, monotonic=0.0, stale=False)
         services._supplier_cache.update(InnovateMR=None, Voqall=None)
         services._voqall_language_cache = {}
+        services._voqall_qualification_catalog_cache = {}
+        services._voqall_question_detail_cache.clear()
+        services._question_cache.clear()
 
     def test_innovatemr_schema_is_normalized(self):
         survey = normalize_innovatemr_survey(
@@ -126,6 +158,40 @@ class SurveyServicesTests(SimpleTestCase):
         self.assertEqual(survey["company"], "InnovateMR")
         self.assertEqual(survey["country"], "US")
         self.assertEqual(survey["payout"], 4.5)
+
+
+    def test_innovatemr_question_schema_is_normalized(self):
+        question = normalize_innovatemr_question(
+            {
+                "QuestionId": 2,
+                "QuestionKey": "GENDER",
+                "QuestionText": "What is your gender?",
+                "QuestionType": "Single Punch",
+                "QuestionCategory": "Demographic",
+                "Options": [{"OptionId": 1, "OptionText": "Male"}],
+            }
+        )
+        self.assertEqual(question["code"], "GENDER")
+        self.assertEqual(question["options"], [{"id": "1", "text": "Male"}])
+
+    def test_voqall_question_uses_language_detail_and_allowed_options(self):
+        question = services._normalize_voqall_question(
+            {"QualificationId": 59, "OptionIds": [1]},
+            {
+                "Id": 59,
+                "Code": "GENDER",
+                "QuestionText": "What is your gender?",
+                "TypeName": "Single select",
+                "Options": [
+                    {"OptionCode": 1, "OptionText": "Male"},
+                    {"OptionCode": 2, "OptionText": "Female"},
+                ],
+            },
+            {},
+        )
+        self.assertEqual(question["text"], "What is your gender?")
+        self.assertEqual(question["options"], [{"id": "1", "text": "Male"}])
+
 
     def test_voqall_schema_and_language_market_are_normalized(self):
         survey = normalize_voqall_survey(

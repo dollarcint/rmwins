@@ -28,3 +28,5 @@ Optional settings:
 - `DJANGO_SECRET_KEY`, `DJANGO_DEBUG`, `DJANGO_ALLOWED_HOSTS`: standard deployment settings.
 
 Every **Copy link**, **Open**, and CSV export action populates the supplier-specific respondent field (`PID`, `vq_uid`, or `user_id`) with the fixed user ID `omega`.
+
+The eye action beside each survey link loads that survey's live InnovateMR targeting or Voqall qualifications on demand. Question responses are cached briefly to keep the dashboard responsive.

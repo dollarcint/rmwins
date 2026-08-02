@@ -131,6 +131,20 @@
     </main>
     <footer class="site-footer"><span>Alessar Solutions</span><small>Live inventory refreshes automatically every 30 seconds.</small></footer>
   </div>
+  <div class="question-modal hidden" id="questionModal" role="dialog" aria-modal="true" aria-labelledby="questionModalTitle">
+    <div class="question-modal-backdrop" id="questionModalBackdrop"></div>
+    <section class="question-modal-panel">
+      <header class="question-modal-header">
+        <div>
+          <p class="eyebrow">Pre-screening details</p>
+          <h2 id="questionModalTitle">Survey questions</h2>
+          <p id="questionModalMeta">Loading supplier targeting…</p>
+        </div>
+        <button class="question-modal-close" id="questionModalClose" type="button" aria-label="Close question viewer">×</button>
+      </header>
+      <div class="question-modal-body" id="questionModalBody" aria-live="polite"></div>
+    </section>
+  </div>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
   <script src="{% static 'surveys/js/dashboard.js' %}" defer></script>
 </body>

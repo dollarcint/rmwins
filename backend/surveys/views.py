@@ -8,7 +8,7 @@ from django.shortcuts import render
 from django.utils import timezone
 from django.views.decorators.http import require_GET
 
-from .services import FeedError, get_surveys
+from .services import FeedError, get_survey_questions, get_surveys
 
 
 @login_required
@@ -162,6 +162,38 @@ def survey_api(request):
             },
         }
     )
+
+
+@login_required
+@require_GET
+def survey_questions(request):
+    company = request.GET.get("company", "").strip()
+    survey_id = request.GET.get("survey_id", "").strip()
+    if not company or not survey_id or len(company) > 80 or len(survey_id) > 160:
+        return JsonResponse({"status": "error", "message": "A valid company and survey ID are required."}, status=400)
+
+    try:
+        surveys, _, _ = get_surveys()
+    except FeedError as exc:
+        return JsonResponse({"status": "error", "message": str(exc)}, status=502)
+
+    survey = next(
+        (
+            row
+            for row in surveys
+            if row["company"].casefold() == company.casefold() and row["survey_id"] == survey_id
+        ),
+        None,
+    )
+    if survey is None:
+        return JsonResponse({"status": "error", "message": "This survey is no longer available."}, status=404)
+
+    try:
+        payload = get_survey_questions(survey, force=request.GET.get("refresh") == "1")
+    except FeedError as exc:
+        return JsonResponse({"status": "error", "message": str(exc)}, status=502)
+    return JsonResponse({"status": "success", **payload})
+
 
 @login_required
 @require_GET

@@ -115,6 +115,10 @@ INNOVATEMR_SURVEY_URL = os.environ.get(
     "https://supplier.innovatemr.net/api/v2/supply/getAllocatedSurveys",
 )
 INNOVATEMR_ACCESS_TOKEN = os.environ.get("INNOVATEMR_ACCESS_TOKEN", "")
+INNOVATEMR_TARGETING_URL = os.environ.get(
+    "INNOVATEMR_TARGETING_URL",
+    "https://supplier.innovatemr.net/api/v2/supply/getSurveyTargeting",
+)
 VOQALL_SURVEY_URL = os.environ.get(
     "VOQALL_SURVEY_URL",
     "https://partner-api.voqall.com/api/v1/surveys",
@@ -124,5 +128,19 @@ VOQALL_LANGUAGES_URL = os.environ.get(
     "https://partner-api.voqall.com/api/v1/collection/languages",
 )
 VOQALL_ACCESS_KEY = os.environ.get("VOQALL_ACCESS_KEY", "")
+VOQALL_SURVEY_QUALIFICATIONS_URL = os.environ.get(
+    "VOQALL_SURVEY_QUALIFICATIONS_URL",
+    "https://partner-api.voqall.com/api/v1/survey-qualifications",
+)
+VOQALL_QUALIFICATION_CATALOG_URL = os.environ.get(
+    "VOQALL_QUALIFICATION_CATALOG_URL",
+    "https://partner-api.voqall.com/api/v1/collection/qualifications",
+)
+VOQALL_QUALIFICATION_DETAIL_URL = os.environ.get(
+    "VOQALL_QUALIFICATION_DETAIL_URL",
+    "https://partner-api.voqall.com/api/v1/collection/languages/{language_id}/qualifications/{qualification_id}",
+)
 SURVEY_FEED_TIMEOUT = int(os.environ.get("SURVEY_FEED_TIMEOUT", "15"))
 SURVEY_CACHE_SECONDS = int(os.environ.get("SURVEY_CACHE_SECONDS", "12"))
+SURVEY_QUESTION_TIMEOUT = int(os.environ.get("SURVEY_QUESTION_TIMEOUT", "10"))
+SURVEY_QUESTION_CACHE_SECONDS = int(os.environ.get("SURVEY_QUESTION_CACHE_SECONDS", "300"))

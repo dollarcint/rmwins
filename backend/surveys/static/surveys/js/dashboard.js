@@ -3,7 +3,7 @@
 
   const FIXED_USER_ID = "omega";
 
-  const state = { page: 1, pageSize: 20, sort: "survey_id", direction: "desc", timer: null, requestId: 0, lastPayload: null };
+  const state = { page: 1, pageSize: 20, sort: "survey_id", direction: "desc", timer: null, requestId: 0, questionRequestId: 0, lastPayload: null, lastQuestionTrigger: null };
   const el = (id) => document.getElementById(id);
   const controls = {
     country: el("countryFilter"), company: el("companyFilter"), name: el("nameFilter"),
@@ -60,6 +60,94 @@
     return cell;
   }
 
+
+  function closeQuestionModal() {
+    state.questionRequestId += 1;
+    el("questionModal").classList.add("hidden");
+    document.body.classList.remove("modal-open");
+    if (state.lastQuestionTrigger) state.lastQuestionTrigger.focus();
+  }
+
+  function questionState(title, message, loading = false) {
+    const body = el("questionModalBody");
+    body.replaceChildren();
+    const stateBox = document.createElement("div"); stateBox.className = "question-state";
+    if (loading) { const loader = document.createElement("div"); loader.className = "loader"; stateBox.appendChild(loader); }
+    const heading = document.createElement("strong"); heading.textContent = title;
+    const copy = document.createElement("span"); copy.textContent = message;
+    stateBox.append(heading, copy); body.appendChild(stateBox);
+  }
+
+  function renderQuestions(payload) {
+    const body = el("questionModalBody");
+    body.replaceChildren();
+    if (!payload.questions.length) {
+      questionState("No pre-screeners supplied", "This supplier has not returned targeting or qualification questions for this survey.");
+      return;
+    }
+
+    const summary = document.createElement("div"); summary.className = "question-summary";
+    const summaryText = document.createElement("strong"); summaryText.textContent = `${formatNumber(payload.questions.length)} qualification${payload.questions.length === 1 ? "" : "s"}`;
+    const summaryNote = document.createElement("span"); summaryNote.textContent = "Live targeting requirements from the supplier";
+    summary.append(summaryText, summaryNote); body.appendChild(summary);
+
+    const list = document.createElement("div"); list.className = "question-list";
+    payload.questions.forEach((question, index) => {
+      const card = document.createElement("article"); card.className = "question-card";
+      const top = document.createElement("div"); top.className = "question-card-top";
+      const number = document.createElement("span"); number.className = "question-number"; number.textContent = String(index + 1).padStart(2, "0");
+      const tags = document.createElement("div"); tags.className = "question-tags";
+      [question.category, question.type].filter(Boolean).forEach((value) => {
+        const tag = document.createElement("span"); tag.textContent = value; tags.appendChild(tag);
+      });
+      top.append(number, tags);
+
+      const text = document.createElement("h3"); text.textContent = question.text || question.code || `Question ${index + 1}`;
+      card.append(top, text);
+      if (question.code) {
+        const code = document.createElement("code"); code.textContent = question.code; card.appendChild(code);
+      }
+
+      const options = document.createElement("div"); options.className = "question-options";
+      if (question.options.length) {
+        question.options.forEach((option) => {
+          const chip = document.createElement("span"); chip.className = "question-option";
+          chip.textContent = option.id && option.text !== option.id ? `${option.id} · ${option.text}` : option.text;
+          options.appendChild(chip);
+        });
+      } else {
+        const openEnded = document.createElement("span"); openEnded.className = "question-open-ended"; openEnded.textContent = "Open-ended or no fixed answer list";
+        options.appendChild(openEnded);
+      }
+      card.appendChild(options); list.appendChild(card);
+    });
+    body.appendChild(list);
+  }
+
+  async function showQuestions(survey, trigger) {
+    const requestId = ++state.questionRequestId;
+    state.lastQuestionTrigger = trigger;
+    el("questionModalTitle").textContent = survey.name;
+    el("questionModalMeta").textContent = `${displayCompany(survey.company)} · Survey ${survey.survey_id}`;
+    el("questionModal").classList.remove("hidden");
+    document.body.classList.add("modal-open");
+    questionState("Loading questions", "Fetching the latest supplier targeting and pre-screening requirements…", true);
+    el("questionModalClose").focus();
+    trigger.classList.add("loading"); trigger.disabled = true;
+    const params = new URLSearchParams({ company: survey.company, survey_id: survey.survey_id });
+    try {
+      const response = await fetch(`/api/surveys/questions/?${params}`, { headers: { Accept: "application/json" } });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.message || "Could not load question data.");
+      if (requestId === state.questionRequestId) renderQuestions(payload);
+    } catch (error) {
+      if (requestId === state.questionRequestId) questionState("Questions unavailable", error.message);
+    } finally {
+      trigger.classList.remove("loading"); trigger.disabled = false;
+    }
+  }
+
+
   function renderRows(rows) {
     const body = el("surveyRows");
     body.replaceChildren();
@@ -92,13 +180,17 @@
       const actions = document.createElement("div"); actions.className = "link-actions";
       const copy = document.createElement("button"); copy.type = "button"; copy.className = "copy-button"; copy.textContent = "Copy link";
       copy.addEventListener("click", () => copyLink(survey.entry_url));
+      const questions = document.createElement("button"); questions.type = "button"; questions.className = "question-button";
+      questions.setAttribute("aria-label", `View pre-screening questions for ${survey.name}`); questions.title = "View questions";
+      const eye = document.createElement("span"); eye.className = "eye-icon"; eye.setAttribute("aria-hidden", "true"); questions.appendChild(eye);
+      questions.addEventListener("click", () => showQuestions(survey, questions));
       const open = document.createElement("button"); open.type = "button"; open.className = "open-button"; open.textContent = "Open ↗";
       open.addEventListener("click", () => {
         const personalized = personalizedSurveyUrl(survey.entry_url);
         window.open(personalized.url, "_blank", "noopener,noreferrer");
         // The supplier-specific respondent parameter has already been populated.
       });
-      actions.append(copy, open); actionCell.appendChild(actions); row.appendChild(actionCell);
+      actions.append(copy, questions, open); actionCell.appendChild(actions); row.appendChild(actionCell);
       body.appendChild(row);
     });
   }
@@ -180,6 +272,12 @@
     state.direction = state.sort === nextSort && state.direction === "asc" ? "desc" : "asc";
     state.sort = nextSort; state.page = 1; loadSurveys();
   }));
+
+  el("questionModalClose").addEventListener("click", closeQuestionModal);
+  el("questionModalBackdrop").addEventListener("click", closeQuestionModal);
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !el("questionModal").classList.contains("hidden")) closeQuestionModal();
+  });
 
   el("exportButton").addEventListener("click", async () => {
     const button = el("exportButton");
