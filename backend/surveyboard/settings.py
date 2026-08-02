@@ -110,9 +110,19 @@ if IS_RENDER:
     SECURE_HSTS_INCLUDE_SUBDOMAINS = False
     SECURE_HSTS_PRELOAD = False
 
-SURVEY_FEED_URL = os.environ.get(
-    "SURVEY_FEED_URL",
-    "https://enlignesurvey.com/get/api_feed/2a206b3a-c00c-4596-8fac-5ace104226de",
+INNOVATEMR_SURVEY_URL = os.environ.get(
+    "INNOVATEMR_SURVEY_URL",
+    "https://supplier.innovatemr.net/api/v2/supply/getAllocatedSurveys",
 )
+INNOVATEMR_ACCESS_TOKEN = os.environ.get("INNOVATEMR_ACCESS_TOKEN", "")
+VOQALL_SURVEY_URL = os.environ.get(
+    "VOQALL_SURVEY_URL",
+    "https://partner-api.voqall.com/api/v1/surveys",
+)
+VOQALL_LANGUAGES_URL = os.environ.get(
+    "VOQALL_LANGUAGES_URL",
+    "https://partner-api.voqall.com/api/v1/collection/languages",
+)
+VOQALL_ACCESS_KEY = os.environ.get("VOQALL_ACCESS_KEY", "")
 SURVEY_FEED_TIMEOUT = int(os.environ.get("SURVEY_FEED_TIMEOUT", "15"))
 SURVEY_CACHE_SECONDS = int(os.environ.get("SURVEY_CACHE_SECONDS", "12"))

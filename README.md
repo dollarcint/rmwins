@@ -33,4 +33,6 @@ Copy `frontend/.env.example` to `frontend/.env.local` when a different dashboard
 
 ## Deployment
 
-Create a Render Blueprint from the repository-level `render.yaml`. It provisions the frontend static site, Django web service, and PostgreSQL database. Set `DJANGO_SUPERUSER_PASSWORD` as a secret during Blueprint creation. Connect `api.alessarsolutions.in` as the backend custom domain after the first successful deployment.
+Create a Render Blueprint from the repository-level `render.yaml`. It provisions the frontend static site, Django web service, and PostgreSQL database. Set `DJANGO_SUPERUSER_PASSWORD`, `INNOVATEMR_ACCESS_TOKEN`, and `VOQALL_ACCESS_KEY` as secret environment variables during Blueprint creation. Connect `api.alessarsolutions.in` as the backend custom domain after the first successful deployment.
+
+The dashboard combines the live InnovateMR and Voqall survey inventories. Voqall market codes are resolved from its `/collection/languages` endpoint so the country filter stays accurate. Supplier credentials must never be committed to Git.

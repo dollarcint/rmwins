@@ -18,10 +18,24 @@
   function formatNumber(value) { return new Intl.NumberFormat().format(value || 0); }
   function formatMoney(value) { return `$${Number(value || 0).toFixed(3)}`; }
   function displayCompany(value) { return value === "Unknown" ? value : value.charAt(0).toUpperCase() + value.slice(1); }
+  const USER_ID_QUERY_KEYS = new Set(["user_id", "userid", "user-id", "uid", "pid", "vq_uid", "vendor_user_id"]);
+  const USER_ID_PLACEHOLDER = /\{user_?id\}|\[%%(?:pid|vendor_user_id)%%\]/gi;
+
   function personalizedSurveyUrl(url) {
     const userId = FIXED_USER_ID;
     const parsed = new URL(url, window.location.origin);
-    parsed.searchParams.set("user_id", userId);
+    let replaced = false;
+    Array.from(parsed.searchParams.entries()).forEach(([key, value]) => {
+      if (USER_ID_QUERY_KEYS.has(key.toLowerCase())) {
+        parsed.searchParams.set(key, userId);
+        replaced = true;
+      } else if (USER_ID_PLACEHOLDER.test(value)) {
+        parsed.searchParams.set(key, value.replace(USER_ID_PLACEHOLDER, userId));
+        replaced = true;
+      }
+      USER_ID_PLACEHOLDER.lastIndex = 0;
+    });
+    if (!replaced) parsed.searchParams.set("user_id", userId);
     return { url: parsed.toString(), userId };
   }
 
@@ -82,7 +96,7 @@
       open.addEventListener("click", () => {
         const personalized = personalizedSurveyUrl(survey.entry_url);
         window.open(personalized.url, "_blank", "noopener,noreferrer");
-        //showToast("Opened with user ID opop");
+        // The supplier-specific respondent parameter has already been populated.
       });
       actions.append(copy, open); actionCell.appendChild(actions); row.appendChild(actionCell);
       body.appendChild(row);
@@ -91,7 +105,7 @@
 
   async function copyLink(url) {
     const personalized = personalizedSurveyUrl(url);
-    try { await navigator.clipboard.writeText(personalized.url); showToast("Link copied with user ID opop"); }
+    try { await navigator.clipboard.writeText(personalized.url); showToast(`Link copied with user ID ${personalized.userId}`); }
     catch (_) { showToast("Could not access the clipboard"); }
   }
 

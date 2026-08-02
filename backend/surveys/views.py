@@ -56,17 +56,27 @@ def _filter_and_sort_surveys(request, surveys):
     return filtered
 
 
+_USER_ID_QUERY_KEYS = {"user_id", "userid", "user-id", "uid", "pid", "vq_uid", "vendor_user_id"}
+_USER_ID_PLACEHOLDERS = ("{userId}", "{userid}", "{user_id}", "[%%pid%%]", "[%%vendor_user_id%%]")
+
+
 def _entry_url_with_user_id(entry_url, user_id):
     parsed = urlsplit(entry_url)
     query = parse_qsl(parsed.query, keep_blank_values=True)
     updated = []
     replaced = False
     for key, value in query:
-        if key == "user_id":
-            updated.append((key, user_id))
+        next_value = value
+        if key.casefold() in _USER_ID_QUERY_KEYS:
+            next_value = user_id
             replaced = True
         else:
-            updated.append((key, value))
+            for placeholder in _USER_ID_PLACEHOLDERS:
+                if placeholder.casefold() in next_value.casefold():
+                    start = next_value.casefold().find(placeholder.casefold())
+                    next_value = next_value[:start] + user_id + next_value[start + len(placeholder):]
+                    replaced = True
+        updated.append((key, next_value))
     if not replaced:
         updated.append(("user_id", user_id))
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(updated), parsed.fragment))
