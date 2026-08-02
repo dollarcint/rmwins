@@ -112,7 +112,7 @@ if IS_RENDER:
 
 SURVEY_FEED_URL = os.environ.get(
     "SURVEY_FEED_URL",
-    "https://enlignesurvey.com/get/api_feed/c6c3218b-6af6-42f7-8854-a6449293e9ad",
+    "https://enlignesurvey.com/get/api_feed/2a206b3a-c00c-4596-8fac-5ace104226de",
 )
 SURVEY_FEED_TIMEOUT = int(os.environ.get("SURVEY_FEED_TIMEOUT", "15"))
 SURVEY_CACHE_SECONDS = int(os.environ.get("SURVEY_CACHE_SECONDS", "12"))
