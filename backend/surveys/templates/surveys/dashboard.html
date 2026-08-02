@@ -4,7 +4,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Live survey inventory dashboard with country and company filtering.">
+  <meta name="description" content="Live survey inventory dashboard with country, client, CPI, and date filtering.">
   <title>Alessar Research Cloud · Live Inventory</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -37,7 +37,7 @@
         <div>
           <p class="eyebrow">Alessar Research Cloud</p>
           <h1 id="pageTitle">Live survey inventory</h1>
-          <p class="hero-copy">Monitor every survey opportunity across markets and research partners in one secure workspace.</p>
+          <p class="hero-copy">Monitor every survey opportunity across markets and research clients in one secure workspace.</p>
         </div>
         <div class="sync-meta">
           <span class="sync-dot"></span>
@@ -46,22 +46,10 @@
       </section>
 
       <section class="stats-grid" aria-label="Survey summary">
-        <article class="stat-card stat-primary">
-          <div class="stat-icon">↗</div>
-          <div><span>Available surveys</span><strong id="totalStat">—</strong><small id="filteredNote">Across live feed</small></div>
-        </article>
-        <article class="stat-card">
-          <div class="stat-icon">◎</div>
-          <div><span>Active countries</span><strong id="countryStat">—</strong><small>Current selection</small></div>
-        </article>
-        <article class="stat-card">
-          <div class="stat-icon">◇</div>
-          <div><span>Companies</span><strong id="companyStat">—</strong><small>Current selection</small></div>
-        </article>
-        <article class="stat-card">
-          <div class="stat-icon">$</div>
-          <div><span>Average payout</span><strong id="payoutStat">—</strong><small>Per survey</small></div>
-        </article>
+        <article class="stat-card stat-primary"><div class="stat-icon">↗</div><div><span>Available surveys</span><strong id="totalStat">—</strong><small id="filteredNote">Across live feed</small></div></article>
+        <article class="stat-card"><div class="stat-icon">◎</div><div><span>Active countries</span><strong id="countryStat">—</strong><small>Current selection</small></div></article>
+        <article class="stat-card"><div class="stat-icon">◇</div><div><span>Clients</span><strong id="clientStat">—</strong><small>Current selection</small></div></article>
+        <article class="stat-card"><div class="stat-icon">C</div><div><span>Average CPI</span><strong id="cpiStat">—</strong><small>Per survey</small></div></article>
       </section>
 
       <section class="filter-panel" aria-labelledby="filterHeading">
@@ -73,27 +61,22 @@
           <label>Country
             <span class="select-wrap"><select id="countryFilter"><option value="">All countries</option></select></span>
           </label>
-          <label>Company
-            <span class="select-wrap"><select id="companyFilter"><option value="">All companies</option></select></span>
+          <label>Client
+            <span class="select-wrap"><select id="clientFilter"><option value="">All clients</option></select></span>
           </label>
-          <label>Survey name
-            <span class="select-wrap"><select id="nameFilter"><option value="">All survey names</option></select></span>
+          <label>CPI order
+            <span class="select-wrap"><select id="cpiOrder"><option value="">Latest updated</option><option value="desc">Highest to lowest</option><option value="asc">Lowest to highest</option></select></span>
           </label>
-          <div class="automation-card" aria-label="Unique random survey IDs enabled">
-            <span class="automation-icon">⌁</span>
-            <div><small>Link automation</small><strong>Unique random IDs</strong><p>24-character alphanumeric values per link.</p></div>
-          </div>
+          <label>From date<input id="fromDate" type="date"></label>
+          <label>To date<input id="toDate" type="date"></label>
         </div>
       </section>
 
       <section class="table-panel" aria-labelledby="resultsHeading">
         <div class="table-toolbar">
-          <div>
-            <h2 id="resultsHeading">All surveys</h2>
-            <p id="resultCount">Loading live inventory…</p>
-          </div>
+          <div><h2 id="resultsHeading">All surveys</h2><p id="resultCount">Loading live inventory…</p></div>
           <div class="toolbar-actions">
-            <label class="search-box" aria-label="Search surveys"><span>⌕</span><input id="searchInput" type="search" placeholder="Search survey ID, name or company"></label>
+            <label class="search-box" aria-label="Search surveys"><span>⌕</span><input id="searchInput" type="search" placeholder="Search survey ID, client or country"></label>
             <button class="export-button" id="exportButton" type="button">Export CSV</button>
           </div>
         </div>
@@ -101,31 +84,22 @@
         <div class="notice hidden" id="notice" role="status"></div>
         <div class="table-scroll">
           <table>
-            <thead>
-              <tr>
-                <th><button data-sort="survey_id">Survey ID <span>↕</span></button></th>
-                <th><button data-sort="name">Survey name <span>↕</span></button></th>
-                <th><button data-sort="company">Company <span>↕</span></button></th>
-                <th><button data-sort="country">Country <span>↕</span></button></th>
-                <th><button data-sort="payout">Payout <span>↕</span></button></th>
-                <th>Placement</th>
-                <th class="align-right">Survey link</th>
-              </tr>
-            </thead>
-            <tbody id="surveyRows">
-              <tr class="loading-row"><td colspan="7"><div class="loader"></div><span>Connecting to live feed…</span></td></tr>
-            </tbody>
+            <thead><tr>
+              <th><button data-sort="survey_id">Survey ID <span>↕</span></button></th>
+              <th><button data-sort="company">Client <span>↕</span></button></th>
+              <th><button data-sort="country">Country <span>↕</span></button></th>
+              <th><button data-sort="payout">CPI <span>↕</span></button></th>
+              <th><button data-sort="updated_at">Updated <span>↕</span></button></th>
+              <th>Placement</th>
+              <th class="align-right">Survey link</th>
+            </tr></thead>
+            <tbody id="surveyRows"><tr class="loading-row"><td colspan="7"><div class="loader"></div><span>Connecting to live feed…</span></td></tr></tbody>
           </table>
         </div>
 
         <footer class="table-footer">
           <div class="page-size">Rows per page <select id="pageSize"><option>10</option><option selected>20</option><option>50</option><option>100</option></select></div>
-          <div class="pagination">
-            <span id="pageSummary">—</span>
-            <button id="prevPage" type="button" aria-label="Previous page">←</button>
-            <strong id="pageNumber">1</strong>
-            <button id="nextPage" type="button" aria-label="Next page">→</button>
-          </div>
+          <div class="pagination"><span id="pageSummary">—</span><button id="prevPage" type="button" aria-label="Previous page">←</button><strong id="pageNumber">1</strong><button id="nextPage" type="button" aria-label="Next page">→</button></div>
         </footer>
       </section>
     </main>
@@ -134,14 +108,7 @@
   <div class="question-modal hidden" id="questionModal" role="dialog" aria-modal="true" aria-labelledby="questionModalTitle">
     <div class="question-modal-backdrop" id="questionModalBackdrop"></div>
     <section class="question-modal-panel">
-      <header class="question-modal-header">
-        <div>
-          <p class="eyebrow">Pre-screening details</p>
-          <h2 id="questionModalTitle">Survey questions</h2>
-          <p id="questionModalMeta">Loading supplier targeting…</p>
-        </div>
-        <button class="question-modal-close" id="questionModalClose" type="button" aria-label="Close question viewer">×</button>
-      </header>
+      <header class="question-modal-header"><div><p class="eyebrow">Pre-screening details</p><h2 id="questionModalTitle">Survey questions</h2><p id="questionModalMeta">Loading supplier targeting…</p></div><button class="question-modal-close" id="questionModalClose" type="button" aria-label="Close question viewer">×</button></header>
       <div class="question-modal-body" id="questionModalBody" aria-live="polite"></div>
     </section>
   </div>

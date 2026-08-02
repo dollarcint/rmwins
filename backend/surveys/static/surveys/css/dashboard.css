@@ -55,14 +55,11 @@ h1 { font-size: clamp(32px, 4vw, 48px); line-height: 1.08; }
 .section-heading, .table-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
 .section-heading { margin-bottom: 20px; }.section-heading h2, .table-toolbar h2 { font-size: 19px; }
 .text-button { padding: 8px 0; border: 0; color: var(--blue); background: none; font-size: 12px; font-weight: 700; }
-.filters { display: grid; grid-template-columns: 1fr 1fr 1.15fr 1.3fr; gap: 13px; }
+.filters { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 13px; }
 .filters label { color: #4f5b72; font-size: 11px; font-weight: 700; letter-spacing: .02em; }
 .filters select, .filters input { width: 100%; height: 45px; margin-top: 7px; padding: 0 13px; color: var(--ink); background: #fafbfc; border: 1px solid #dfe4ec; border-radius: 9px; transition: border .15s, box-shadow .15s; }
 .filters select:hover, .filters input:hover { border-color: #b8c5dc; }.filters input::placeholder { color: #a5adbc; }
 .select-wrap { display: block; position: relative; }
-.automation-card { min-height: 66px; display: flex; align-items: center; gap: 11px; align-self: end; padding: 10px 12px; color: #35517c; background: var(--blue-soft); border: 1px solid #d8e6ff; border-radius: 9px; }
-.automation-icon { width: 34px; height: 34px; display: grid; place-items: center; flex: 0 0 auto; color: white; background: var(--blue); border-radius: 9px; font-size: 18px; }
-.automation-card small, .automation-card strong { display: block; }.automation-card small { color: #7183a2; font-size: 9px; text-transform: uppercase; letter-spacing: .05em; }.automation-card strong { margin-top: 1px; font-size: 11px; }.automation-card p { margin: 2px 0 0; color: #7e8ca6; font-size: 9px; }
 
 .table-panel { overflow: hidden; }
 .table-toolbar { padding: 23px 25px 20px; }
@@ -80,15 +77,14 @@ th:first-child, td:first-child { padding-left: 25px; } th:last-child, td:last-ch
 th button { padding: 0; border: 0; color: inherit; background: none; font-size: inherit; font-weight: 700; text-transform: inherit; }.align-right { text-align: right; }
 td { height: 68px; padding: 12px 20px; border-bottom: 1px solid #edf0f4; color: #546078; font-size: 12px; }
 tbody tr { transition: background .15s; } tbody tr:not(.loading-row):hover { background: #fbfcff; }
-.survey-code { color: var(--ink); font-weight: 700; }.survey-name { color: #3f4d67; font-weight: 600; }
+.survey-code { color: var(--ink); font-weight: 700; }
 .company-pill, .country-pill { display: inline-flex; align-items: center; border-radius: 99px; font-weight: 700; }
 .company-pill { padding: 6px 10px; color: #35517c; background: #eef3fa; text-transform: capitalize; }
 .country-pill { gap: 6px; color: #4b5870; }.country-pill::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #7aa3ed; }
-.payout { color: #128562; font-weight: 700; }.placement { max-width: 150px; overflow: hidden; text-overflow: ellipsis; color: #8a95a8; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.payout { color: #128562; font-weight: 700; }.date-cell { color: #718096; font-size: 10px; }.placement { max-width: 150px; overflow: hidden; text-overflow: ellipsis; color: #8a95a8; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 .link-actions { display: flex; justify-content: flex-end; gap: 7px; }
-.copy-button, .open-button { height: 32px; padding: 0 11px; border-radius: 7px; font-size: 10px; font-weight: 700; }
+.copy-button { height: 32px; padding: 0 11px; border-radius: 7px; font-size: 10px; font-weight: 700; }
 .copy-button { color: var(--blue); background: var(--blue-soft); border: 1px solid #d8e6ff; }.copy-button:hover { background: #dfeaff; }
-.open-button { display: inline-grid; place-items: center; color: #68748a; background: white; border: 1px solid #dfe4ec; text-decoration: none; }.open-button:hover { color: var(--blue); border-color: #aac6f7; }
 .loading-row td, .empty-row td { height: 230px; text-align: center; color: var(--muted); }.loading-row td { font-size: 13px; }
 .loader { width: 26px; height: 26px; margin: 0 auto 12px; border: 3px solid #e0e8f6; border-top-color: var(--blue); border-radius: 50%; animation: spin .8s linear infinite; }
 .empty-state strong { display: block; margin-bottom: 5px; color: var(--ink); font-size: 16px; }.empty-state span { font-size: 12px; }

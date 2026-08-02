@@ -1,13 +1,15 @@
 import json
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlparse
 from urllib.request import Request, urlopen
 
+import pycountry
 from django.conf import settings
 
 
@@ -16,7 +18,7 @@ class FeedError(Exception):
 
 
 _cache = {"data": None, "fetched_at": None, "monotonic": 0.0, "stale": False}
-_supplier_cache = {"InnovateMR": None, "Voqall": None}
+_supplier_cache = {"InnovateMR": None, "BioBrain": None}
 _voqall_language_cache = {}
 _voqall_qualification_catalog_cache = {}
 _voqall_question_detail_cache = {}
@@ -30,6 +32,56 @@ def _clean_payout(value):
         return float(Decimal(str(value)).quantize(Decimal("0.001")))
     except (InvalidOperation, TypeError, ValueError):
         return 0.0
+
+
+_TIMEZONE_OFFSETS = {
+    "UTC": 0,
+    "GMT": 0,
+    "PST": -8,
+    "PDT": -7,
+    "MST": -7,
+    "MDT": -6,
+    "CST": -6,
+    "CDT": -5,
+    "EST": -5,
+    "EDT": -4,
+}
+
+
+def _country_name(code, fallback=None):
+    normalized_code = str(code or "").strip().upper()
+    fallback_value = str(fallback or "").strip()
+    if fallback_value and len(fallback_value) > 3 and fallback_value.casefold() != "unknown":
+        return fallback_value
+    country = pycountry.countries.get(alpha_2=normalized_code) if len(normalized_code) == 2 else None
+    return country.name if country else (fallback_value or normalized_code or "Unknown")
+
+
+def _normalize_updated_at(value):
+    raw_value = str(value or "").strip()
+    if not raw_value:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+    except ValueError:
+        timezone_match = re.search(r"\s+(UTC|GMT|PST|PDT|MST|MDT|CST|CDT|EST|EDT)$", raw_value, re.IGNORECASE)
+        timezone_name = timezone_match.group(1).upper() if timezone_match else "UTC"
+        value_without_timezone = raw_value[: timezone_match.start()].strip() if timezone_match else raw_value
+        parsed = None
+        for date_format in ("%m/%d/%Y, %I:%M:%S %p", "%m/%d/%Y %I:%M:%S %p", "%Y-%m-%d %H:%M:%S"):
+            try:
+                parsed = datetime.strptime(value_without_timezone, date_format)
+                break
+            except ValueError:
+                continue
+        if parsed is None:
+            return None
+        parsed = parsed.replace(tzinfo=timezone(timedelta(hours=_TIMEZONE_OFFSETS[timezone_name])))
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).isoformat()
 
 
 def _first(raw, *keys, default=None):
@@ -63,15 +115,17 @@ def _description(raw):
 
 def normalize_innovatemr_survey(raw):
     entry_url = str(_first(raw, "entryLink", "entry_url", "entryUrl", default=""))
+    country_code = _first(raw, "CountryCode", "countryCode", "country")
     return {
         "survey_id": str(_first(raw, "surveyId", "survey_id", "id", default="")).strip(),
         "name": str(_first(raw, "surveyName", "name", "title", default="Untitled survey")).strip(),
         "payout": _clean_payout(_first(raw, "CPI", "cpi", "supplierCPI", "supplierCpi", default=0)),
         "description": _description(raw),
         "entry_url": entry_url,
-        "country": str(_first(raw, "CountryCode", "countryCode", "country", "Country", default="Unknown")).strip().upper(),
+        "country": _country_name(country_code, _first(raw, "Country")),
         "company": "InnovateMR",
         "language_id": str(_first(raw, "LanguageCode", "languageCode", default="")).strip(),
+        "updated_at": _normalize_updated_at(_first(raw, "modifiedDate", "ModifiedDate", "updatedAt", "updated_at", "createdDate")),
         "placement_id": str(_first(raw, "placementId", "placement_id", default="")).strip()
         or _query_value(entry_url, "placement_id"),
     }
@@ -81,9 +135,9 @@ def normalize_voqall_survey(raw, languages=None):
     languages = languages or {}
     entry_url = str(_first(raw, "SurveyUrl", "surveyUrl", "entryLink", "entry_url", "url", default=""))
     language_id = str(_first(raw, "LanguageId", "languageId", default="")).strip()
-    country = _first(raw, "CountryCode", "countryCode", "country", "Country")
-    if not country and language_id:
-        country = languages.get(language_id)
+    country_code = _first(raw, "CountryCode", "countryCode", "country", "Country")
+    if not country_code and language_id:
+        country_code = languages.get(language_id)
 
     return {
         "survey_id": str(_first(raw, "SurveyId", "surveyId", "survey_id", "id", default="")).strip(),
@@ -91,9 +145,10 @@ def normalize_voqall_survey(raw, languages=None):
         "payout": _clean_payout(_first(raw, "Revenue", "revenue", "Cpi", "CPI", "cpi", default=0)),
         "description": _description(raw),
         "entry_url": entry_url,
-        "country": str(country or "Unknown").strip().upper(),
-        "company": "Voqall",
+        "country": _country_name(country_code),
+        "company": "BioBrain",
         "language_id": language_id,
+        "updated_at": _normalize_updated_at(_first(raw, "LastUpdatedOnUTC", "lastUpdatedOnUTC", "updatedAt", "updated_at", "StartDate")),
         "placement_id": str(_first(raw, "PlacementId", "placementId", "placement_id", default="")).strip()
         or _query_value(entry_url, "placement_id"),
     }
@@ -153,9 +208,9 @@ def _fetch_voqall_languages(access_key):
         payload = _request_json(
             settings.VOQALL_LANGUAGES_URL,
             {"EQ-PARTNER-ACCESS-KEY": access_key},
-            "Voqall markets",
+            "BioBrain markets",
         )
-        rows = _extract_rows(payload, ("Languages", "languages", "data"), "Voqall markets")
+        rows = _extract_rows(payload, ("Languages", "languages", "data"), "BioBrain markets")
         languages = {}
         for row in rows:
             if not isinstance(row, dict):
@@ -174,13 +229,13 @@ def _fetch_voqall_languages(access_key):
 def _fetch_voqall_surveys():
     access_key = settings.VOQALL_ACCESS_KEY.strip()
     if not access_key:
-        raise FeedError("Voqall is not configured.")
+        raise FeedError("BioBrain is not configured.")
     payload = _request_json(
         settings.VOQALL_SURVEY_URL,
         {"EQ-PARTNER-ACCESS-KEY": access_key},
-        "Voqall",
+        "BioBrain",
     )
-    rows = _extract_rows(payload, ("Surveys", "surveys", "result", "data"), "Voqall")
+    rows = _extract_rows(payload, ("Surveys", "surveys", "result", "data"), "BioBrain")
     languages = _fetch_voqall_languages(access_key)
     surveys = [normalize_voqall_survey(row, languages) for row in rows if isinstance(row, dict)]
     return [survey for survey in surveys if survey["survey_id"] and survey["entry_url"]]
@@ -240,10 +295,10 @@ def _fetch_voqall_qualification_catalog(access_key):
         payload = _request_json(
             settings.VOQALL_QUALIFICATION_CATALOG_URL,
             {"EQ-PARTNER-ACCESS-KEY": access_key},
-            "Voqall qualification catalog",
+            "BioBrain qualification catalog",
             timeout=settings.SURVEY_QUESTION_TIMEOUT,
         )
-        rows = _extract_rows(payload, ("Qualifications", "qualifications", "data"), "Voqall qualification catalog")
+        rows = _extract_rows(payload, ("Qualifications", "qualifications", "data"), "BioBrain qualification catalog")
         catalog = {}
         for row in rows:
             if not isinstance(row, dict):
@@ -272,12 +327,12 @@ def _fetch_voqall_question_detail(access_key, language_id, qualification_id):
     payload = _request_json(
         url,
         {"EQ-PARTNER-ACCESS-KEY": access_key},
-        "Voqall qualification detail",
+        "BioBrain qualification detail",
         timeout=settings.SURVEY_QUESTION_TIMEOUT,
     )
     detail = payload.get("Qualification") if isinstance(payload, dict) else None
     if not isinstance(detail, dict):
-        raise FeedError("Voqall qualification detail returned an unexpected response.")
+        raise FeedError("BioBrain qualification detail returned an unexpected response.")
     with _question_cache_lock:
         _voqall_question_detail_cache[cache_key] = detail
     return detail
@@ -329,15 +384,15 @@ def _normalize_voqall_question(raw, detail, catalog):
 def _fetch_voqall_questions(survey_id, language_id):
     access_key = settings.VOQALL_ACCESS_KEY.strip()
     if not access_key:
-        raise FeedError("Voqall is not configured.")
+        raise FeedError("BioBrain is not configured.")
     url = f"{settings.VOQALL_SURVEY_QUALIFICATIONS_URL.rstrip('/')}/{quote(str(survey_id), safe='')}"
     payload = _request_json(
         url,
         {"EQ-PARTNER-ACCESS-KEY": access_key},
-        "Voqall qualifications",
+        "BioBrain qualifications",
         timeout=settings.SURVEY_QUESTION_TIMEOUT,
     )
-    rows = _extract_rows(payload, ("Qualifications", "qualifications", "result", "data"), "Voqall qualifications")
+    rows = _extract_rows(payload, ("Qualifications", "qualifications", "result", "data"), "BioBrain qualifications")
     rows = [row for row in rows if isinstance(row, dict)]
     catalog = _fetch_voqall_qualification_catalog(access_key)
 
@@ -382,7 +437,7 @@ def get_survey_questions(survey, force=False):
 
     if company.casefold() == "innovatemr":
         questions = _fetch_innovatemr_questions(survey_id)
-    elif company.casefold() == "voqall":
+    elif company.casefold() == "biobrain":
         questions = _fetch_voqall_questions(survey_id, str(survey.get("language_id", "")).strip())
     else:
         raise FeedError("Question data is not supported for this supplier.")
@@ -390,7 +445,6 @@ def get_survey_questions(survey, force=False):
     result = {
         "company": company,
         "survey_id": survey_id,
-        "survey_name": survey.get("name") or "Untitled survey",
         "questions": questions,
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -412,7 +466,7 @@ def get_surveys(force=False):
         live_suppliers = 0
         for name, fetcher in (
             ("InnovateMR", _fetch_innovatemr_surveys),
-            ("Voqall", _fetch_voqall_surveys),
+            ("BioBrain", _fetch_voqall_surveys),
         ):
             try:
                 rows = fetcher()

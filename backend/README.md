@@ -1,6 +1,6 @@
 # SurveyBoard
 
-An authenticated Django dashboard that combines the live InnovateMR and Voqall survey inventories with company, country, name, and text filters.
+An authenticated Django dashboard that combines live InnovateMR and BioBrain inventory with client, full-country, CPI, updated-date, and text filters.
 
 ## Run locally
 
@@ -27,6 +27,6 @@ Optional settings:
 - `SURVEY_CACHE_SECONDS`: backend cache duration (default `12`).
 - `DJANGO_SECRET_KEY`, `DJANGO_DEBUG`, `DJANGO_ALLOWED_HOSTS`: standard deployment settings.
 
-Every **Copy link**, **Open**, and CSV export action replaces InnovateMR `[%%pid%%]` and Voqall `[#vq_tid#]` / `[#vq_tuid#]` placeholders with distinct cryptographically random 24-character alphanumeric values. Generated values are checked for duplicates within the active browser session or export.
+Every **Copy link** and CSV export replaces InnovateMR `[%%pid%%]` and BioBrain `[#vq_tid#]` / `[#vq_tuid#]` placeholders with distinct cryptographically random 24-character alphanumeric values. Generated values are checked for duplicates within the active browser session or export.
 
-The eye action beside each survey link loads that survey's live InnovateMR targeting or Voqall qualifications on demand. Question responses are cached briefly to keep the dashboard responsive.
+The eye action beside each survey link loads that survey's live InnovateMR targeting or BioBrain qualifications on demand. Question responses are cached briefly to keep the dashboard responsive.

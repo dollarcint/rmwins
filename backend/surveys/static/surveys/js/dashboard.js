@@ -1,11 +1,11 @@
 (() => {
   "use strict";
 
-  const state = { page: 1, pageSize: 20, sort: "survey_id", direction: "desc", timer: null, requestId: 0, questionRequestId: 0, lastPayload: null, lastQuestionTrigger: null };
+  const state = { page: 1, pageSize: 20, sort: "updated_at", direction: "desc", timer: null, requestId: 0, questionRequestId: 0, lastPayload: null, lastQuestionTrigger: null };
   const el = (id) => document.getElementById(id);
   const controls = {
-    country: el("countryFilter"), company: el("companyFilter"), name: el("nameFilter"),
-    search: el("searchInput"), pageSize: el("pageSize")
+    country: el("countryFilter"), client: el("clientFilter"), cpiOrder: el("cpiOrder"),
+    fromDate: el("fromDate"), toDate: el("toDate"), search: el("searchInput"), pageSize: el("pageSize")
   };
 
   function debounce(callback, wait) {
@@ -14,8 +14,12 @@
   }
 
   function formatNumber(value) { return new Intl.NumberFormat().format(value || 0); }
-  function formatMoney(value) { return `$${Number(value || 0).toFixed(3)}`; }
-  function displayCompany(value) { return value === "Unknown" ? value : value.charAt(0).toUpperCase() + value.slice(1); }
+  function formatCpi(value) { return Number(value || 0).toFixed(3).replace(/\.?0+$/, ""); }
+  function formatUpdated(value) {
+    if (!value) return "Not supplied";
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? "Not supplied" : date.toLocaleString([], { year: "numeric", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit" });
+  }
   const ALPHANUMERIC = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
   const RANDOM_ID_LENGTH = 24;
   const generatedIds = new Set();
@@ -48,7 +52,7 @@
     allOption.value = ""; allOption.textContent = label; fragment.appendChild(allOption);
     values.forEach((value) => {
       const option = document.createElement("option");
-      option.value = value; option.textContent = select === controls.company ? displayCompany(value) : value;
+      option.value = value; option.textContent = value;
       fragment.appendChild(option);
     });
     select.replaceChildren(fragment);
@@ -129,8 +133,8 @@
   async function showQuestions(survey, trigger) {
     const requestId = ++state.questionRequestId;
     state.lastQuestionTrigger = trigger;
-    el("questionModalTitle").textContent = survey.name;
-    el("questionModalMeta").textContent = `${displayCompany(survey.company)} · Survey ${survey.survey_id}`;
+    el("questionModalTitle").textContent = `Survey ${survey.survey_id}`;
+    el("questionModalMeta").textContent = `${survey.company} · ${survey.country}`;
     el("questionModal").classList.remove("hidden");
     document.body.classList.add("modal-open");
     questionState("Loading questions", "Fetching the latest supplier targeting and pre-screening requirements…", true);
@@ -165,17 +169,17 @@
     rows.forEach((survey) => {
       const row = document.createElement("tr");
       row.appendChild(makeCell("survey-code", survey.survey_id));
-      row.appendChild(makeCell("survey-name", survey.name));
 
-      const companyCell = document.createElement("td");
-      const company = document.createElement("span"); company.className = "company-pill"; company.textContent = displayCompany(survey.company);
-      companyCell.appendChild(company); row.appendChild(companyCell);
+      const clientCell = document.createElement("td");
+      const client = document.createElement("span"); client.className = "company-pill"; client.textContent = survey.company;
+      clientCell.appendChild(client); row.appendChild(clientCell);
 
       const countryCell = document.createElement("td");
       const country = document.createElement("span"); country.className = "country-pill"; country.textContent = survey.country;
       countryCell.appendChild(country); row.appendChild(countryCell);
 
-      row.appendChild(makeCell("payout", formatMoney(survey.payout)));
+      row.appendChild(makeCell("payout", formatCpi(survey.payout)));
+      row.appendChild(makeCell("date-cell", formatUpdated(survey.updated_at)));
       const placement = makeCell("placement", survey.placement_id || "—"); placement.title = survey.placement_id; row.appendChild(placement);
 
       const actionCell = document.createElement("td");
@@ -183,14 +187,10 @@
       const copy = document.createElement("button"); copy.type = "button"; copy.className = "copy-button"; copy.textContent = "Copy link";
       copy.addEventListener("click", () => copyLink(survey.entry_url));
       const questions = document.createElement("button"); questions.type = "button"; questions.className = "question-button";
-      questions.setAttribute("aria-label", `View pre-screening questions for ${survey.name}`); questions.title = "View questions";
+      questions.setAttribute("aria-label", `View pre-screening questions for survey ${survey.survey_id}`); questions.title = "View questions";
       const eye = document.createElement("span"); eye.className = "eye-icon"; eye.setAttribute("aria-hidden", "true"); questions.appendChild(eye);
       questions.addEventListener("click", () => showQuestions(survey, questions));
-      const open = document.createElement("button"); open.type = "button"; open.className = "open-button"; open.textContent = "Open ↗";
-      open.addEventListener("click", () => {
-        window.open(generatedSurveyUrl(survey.entry_url), "_blank", "noopener,noreferrer");
-      });
-      actions.append(copy, questions, open); actionCell.appendChild(actions); row.appendChild(actionCell);
+      actions.append(copy, questions); actionCell.appendChild(actions); row.appendChild(actionCell);
       body.appendChild(row);
     });
   }
@@ -210,14 +210,13 @@
     state.lastPayload = payload;
     const { summary, pagination, filters, live } = payload;
     setOptions(controls.country, filters.countries, "All countries");
-    setOptions(controls.company, filters.companies, "All companies");
-    setOptions(controls.name, filters.names, "All survey names");
+    setOptions(controls.client, filters.clients, "All clients");
     renderRows(payload.surveys);
 
     el("totalStat").textContent = formatNumber(summary.filtered_surveys);
     el("countryStat").textContent = formatNumber(summary.country_count);
-    el("companyStat").textContent = formatNumber(summary.company_count);
-    el("payoutStat").textContent = formatMoney(summary.average_payout);
+    el("clientStat").textContent = formatNumber(summary.client_count);
+    el("cpiStat").textContent = formatCpi(summary.average_cpi);
     el("filteredNote").textContent = summary.filtered_surveys === summary.all_surveys ? "Across live feed" : `of ${formatNumber(summary.all_surveys)} total`;
     el("resultCount").textContent = pagination.total ? `Showing ${pagination.start}–${pagination.end} of ${formatNumber(pagination.total)} surveys` : "No surveys found";
     el("pageSummary").textContent = pagination.total ? `${pagination.start}–${pagination.end} of ${formatNumber(pagination.total)}` : "0 results";
@@ -237,8 +236,9 @@
   function queryString(force) {
     const params = new URLSearchParams({ page: state.page, page_size: state.pageSize, sort: state.sort, direction: state.direction });
     if (controls.country.value) params.set("country", controls.country.value);
-    if (controls.company.value) params.set("company", controls.company.value);
-    if (controls.name.value) params.set("name", controls.name.value);
+    if (controls.client.value) params.set("company", controls.client.value);
+    if (controls.fromDate.value) params.set("from_date", controls.fromDate.value);
+    if (controls.toDate.value) params.set("to_date", controls.toDate.value);
     if (controls.search.value.trim()) params.set("search", controls.search.value.trim());
     if (force) params.set("refresh", "1");
     return params.toString();
@@ -260,17 +260,28 @@
   }
 
   function filtersChanged() { state.page = 1; loadSurveys(); }
-  [controls.country, controls.company, controls.name].forEach((control) => control.addEventListener("change", filtersChanged));
+  [controls.country, controls.client, controls.fromDate, controls.toDate].forEach((control) => control.addEventListener("change", filtersChanged));
+  controls.cpiOrder.addEventListener("change", () => {
+    state.sort = controls.cpiOrder.value ? "payout" : "updated_at";
+    state.direction = controls.cpiOrder.value || "desc";
+    filtersChanged();
+  });
   controls.search.addEventListener("input", debounce(filtersChanged, 300));
   controls.pageSize.addEventListener("change", () => { state.pageSize = Number(controls.pageSize.value); filtersChanged(); });
-  el("clearFilters").addEventListener("click", () => { controls.country.value = ""; controls.company.value = ""; controls.name.value = ""; controls.search.value = ""; filtersChanged(); });
+  el("clearFilters").addEventListener("click", () => {
+    controls.country.value = ""; controls.client.value = ""; controls.cpiOrder.value = "";
+    controls.fromDate.value = ""; controls.toDate.value = ""; controls.search.value = "";
+    state.sort = "updated_at"; state.direction = "desc"; filtersChanged();
+  });
   el("refreshButton").addEventListener("click", () => loadSurveys(true));
   el("prevPage").addEventListener("click", () => { if (state.page > 1) { state.page -= 1; loadSurveys(); } });
   el("nextPage").addEventListener("click", () => { state.page += 1; loadSurveys(); });
   document.querySelectorAll("th button[data-sort]").forEach((button) => button.addEventListener("click", () => {
     const nextSort = button.dataset.sort;
     state.direction = state.sort === nextSort && state.direction === "asc" ? "desc" : "asc";
-    state.sort = nextSort; state.page = 1; loadSurveys();
+    state.sort = nextSort; state.page = 1;
+    controls.cpiOrder.value = nextSort === "payout" ? state.direction : "";
+    loadSurveys();
   }));
 
   el("questionModalClose").addEventListener("click", closeQuestionModal);
