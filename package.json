@@ -1,0 +1,11 @@
+{
+  "name": "alessar-solutions-monorepo",
+  "private": true,
+  "version": "1.0.0",
+  "engines": {
+    "node": ">=20 <23"
+  },
+  "scripts": {
+    "build": "npm --prefix frontend ci && npm --prefix frontend run build -- --outDir ../dist --emptyOutDir"
+  }
+}
