@@ -1,8 +1,6 @@
 (() => {
   "use strict";
 
-  const FIXED_USER_ID = "omega";
-
   const state = { page: 1, pageSize: 20, sort: "survey_id", direction: "desc", timer: null, requestId: 0, questionRequestId: 0, lastPayload: null, lastQuestionTrigger: null };
   const el = (id) => document.getElementById(id);
   const controls = {
@@ -18,25 +16,29 @@
   function formatNumber(value) { return new Intl.NumberFormat().format(value || 0); }
   function formatMoney(value) { return `$${Number(value || 0).toFixed(3)}`; }
   function displayCompany(value) { return value === "Unknown" ? value : value.charAt(0).toUpperCase() + value.slice(1); }
-  const USER_ID_QUERY_KEYS = new Set(["user_id", "userid", "user-id", "uid", "pid", "vq_uid", "vendor_user_id"]);
-  const USER_ID_PLACEHOLDER = /\{user_?id\}|\[%%(?:pid|vendor_user_id)%%\]/gi;
+  const ALPHANUMERIC = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  const RANDOM_ID_LENGTH = 24;
+  const generatedIds = new Set();
 
-  function personalizedSurveyUrl(url) {
-    const userId = FIXED_USER_ID;
-    const parsed = new URL(url, window.location.origin);
-    let replaced = false;
-    Array.from(parsed.searchParams.entries()).forEach(([key, value]) => {
-      if (USER_ID_QUERY_KEYS.has(key.toLowerCase())) {
-        parsed.searchParams.set(key, userId);
-        replaced = true;
-      } else if (USER_ID_PLACEHOLDER.test(value)) {
-        parsed.searchParams.set(key, value.replace(USER_ID_PLACEHOLDER, userId));
-        replaced = true;
-      }
-      USER_ID_PLACEHOLDER.lastIndex = 0;
+  function randomAlphanumeric(length = RANDOM_ID_LENGTH) {
+    let value = "";
+    do {
+      const randomValues = new Uint32Array(length);
+      window.crypto.getRandomValues(randomValues);
+      value = Array.from(randomValues, (number) => ALPHANUMERIC[number % ALPHANUMERIC.length]).join("");
+    } while (generatedIds.has(value));
+    generatedIds.add(value);
+    return value;
+  }
+
+  function generatedSurveyUrl(url) {
+    let generatedUrl = url;
+    const placeholders = [/\[%%pid%%\]/g, /\[#vq_tid#\]/g, /\[#vq_tuid#\]/g];
+    placeholders.forEach((placeholder) => {
+      if (placeholder.test(generatedUrl)) generatedUrl = generatedUrl.replace(placeholder, randomAlphanumeric());
+      placeholder.lastIndex = 0;
     });
-    if (!replaced) parsed.searchParams.set("user_id", userId);
-    return { url: parsed.toString(), userId };
+    return generatedUrl;
   }
 
   function setOptions(select, values, label) {
@@ -186,9 +188,7 @@
       questions.addEventListener("click", () => showQuestions(survey, questions));
       const open = document.createElement("button"); open.type = "button"; open.className = "open-button"; open.textContent = "Open ↗";
       open.addEventListener("click", () => {
-        const personalized = personalizedSurveyUrl(survey.entry_url);
-        window.open(personalized.url, "_blank", "noopener,noreferrer");
-        // The supplier-specific respondent parameter has already been populated.
+        window.open(generatedSurveyUrl(survey.entry_url), "_blank", "noopener,noreferrer");
       });
       actions.append(copy, questions, open); actionCell.appendChild(actions); row.appendChild(actionCell);
       body.appendChild(row);
@@ -196,8 +196,8 @@
   }
 
   async function copyLink(url) {
-    const personalized = personalizedSurveyUrl(url);
-    try { await navigator.clipboard.writeText(personalized.url); showToast(`Link copied with user ID ${personalized.userId}`); }
+    const generatedUrl = generatedSurveyUrl(url);
+    try { await navigator.clipboard.writeText(generatedUrl); showToast("Link copied with unique random IDs"); }
     catch (_) { showToast("Could not access the clipboard"); }
   }
 
@@ -286,7 +286,6 @@
     params.delete("page");
     params.delete("page_size");
     params.delete("refresh");
-    params.set("user_id", FIXED_USER_ID);
     button.disabled = true;
     button.textContent = "Exporting…";
     try {

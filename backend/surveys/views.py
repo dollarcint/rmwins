@@ -1,7 +1,7 @@
 import csv
 import math
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
-
+import secrets
+import string
 from django.contrib.auth.decorators import login_required
 from django.http import JsonResponse, StreamingHttpResponse
 from django.shortcuts import render
@@ -56,30 +56,24 @@ def _filter_and_sort_surveys(request, surveys):
     return filtered
 
 
-_USER_ID_QUERY_KEYS = {"user_id", "userid", "user-id", "uid", "pid", "vq_uid", "vendor_user_id"}
-_USER_ID_PLACEHOLDERS = ("{userId}", "{userid}", "{user_id}", "[%%pid%%]", "[%%vendor_user_id%%]")
+_ALPHANUMERIC = string.ascii_letters + string.digits
+_RANDOM_ID_LENGTH = 24
 
 
-def _entry_url_with_user_id(entry_url, user_id):
-    parsed = urlsplit(entry_url)
-    query = parse_qsl(parsed.query, keep_blank_values=True)
-    updated = []
-    replaced = False
-    for key, value in query:
-        next_value = value
-        if key.casefold() in _USER_ID_QUERY_KEYS:
-            next_value = user_id
-            replaced = True
-        else:
-            for placeholder in _USER_ID_PLACEHOLDERS:
-                if placeholder.casefold() in next_value.casefold():
-                    start = next_value.casefold().find(placeholder.casefold())
-                    next_value = next_value[:start] + user_id + next_value[start + len(placeholder):]
-                    replaced = True
-        updated.append((key, next_value))
-    if not replaced:
-        updated.append(("user_id", user_id))
-    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(updated), parsed.fragment))
+def _random_alphanumeric(used_ids, length=_RANDOM_ID_LENGTH):
+    while True:
+        value = "".join(secrets.choice(_ALPHANUMERIC) for _ in range(length))
+        if value not in used_ids:
+            used_ids.add(value)
+            return value
+
+
+def _entry_url_with_random_ids(entry_url, used_ids):
+    generated_url = entry_url
+    for placeholder in ("[%%pid%%]", "[#vq_tid#]", "[#vq_tuid#]"):
+        if placeholder in generated_url:
+            generated_url = generated_url.replace(placeholder, _random_alphanumeric(used_ids))
+    return generated_url
 
 
 class _CsvEcho:
@@ -204,11 +198,8 @@ def survey_export(request):
         return JsonResponse({"status": "error", "message": str(exc)}, status=502)
 
     filtered = _filter_and_sort_surveys(request, surveys)
-    user_id = request.GET.get("user_id", "omega").strip() or "omega"
-    if len(user_id) > 120 or any(ord(character) < 32 for character in user_id):
-        user_id = "omega"
-
     writer = csv.writer(_CsvEcho(), lineterminator="\r\n")
+    generated_ids = set()
 
     def csv_rows():
         yield "\ufeff"
@@ -224,7 +215,7 @@ def survey_export(request):
                     survey["country"],
                     survey["payout"],
                     survey["placement_id"],
-                    _entry_url_with_user_id(survey["entry_url"], user_id),
+                    _entry_url_with_random_ids(survey["entry_url"], generated_ids),
                 ]
             )
 

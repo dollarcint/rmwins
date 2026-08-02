@@ -1,3 +1,4 @@
+import re
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -100,31 +101,34 @@ class SurveyViewsTests(TestCase):
     def test_csv_export_contains_all_matching_rows_without_page_limit(self, get_surveys):
         self.client.force_login(self.user)
         get_surveys.return_value = (SAMPLE, datetime.now(timezone.utc), False)
-        response = self.client.get("/api/surveys/export/?page_size=1&user_id=omega")
+        response = self.client.get("/api/surveys/export/?page_size=1")
         content = b"".join(response.streaming_content).decode("utf-8-sig")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response["X-Exported-Count"], "2")
         self.assertIn("LMS-1", content)
         self.assertIn("LMS-2", content)
-        self.assertIn("user_id=omega", content)
-        self.assertNotIn("{userId}", content)
+        self.assertIn("user_id={userId}", content)
 
     @patch("surveys.views.get_surveys")
-    def test_csv_export_personalizes_supplier_specific_user_ids(self, get_surveys):
+    def test_csv_export_generates_distinct_alphanumeric_supplier_ids(self, get_surveys):
         self.client.force_login(self.user)
         rows = [
             {**SAMPLE[0], "entry_url": "https://example.test/start?PID=[%%pid%%]"},
-            {**SAMPLE[1], "entry_url": "https://example.test/start?vq_uid=&vq_token=keep-me"},
+            {**SAMPLE[1], "entry_url": "https://example.test/start?vq_token=[#vq_tid#]&vq_uid=[#vq_tuid#]"},
         ]
         get_surveys.return_value = (rows, datetime.now(timezone.utc), False)
 
-        response = self.client.get("/api/surveys/export/?user_id=omega")
+        response = self.client.get("/api/surveys/export/")
         content = b"".join(response.streaming_content).decode("utf-8-sig")
 
-        self.assertIn("PID=omega", content)
-        self.assertIn("vq_uid=omega", content)
-        self.assertIn("vq_token=keep-me", content)
+        self.assertNotIn("[%%pid%%]", content)
+        self.assertNotIn("[#vq_tid#]", content)
+        self.assertNotIn("[#vq_tuid#]", content)
+        generated = re.findall(r"(?:PID|vq_token|vq_uid)=([A-Za-z0-9]{24})", content)
+        self.assertEqual(len(generated), 3)
+        self.assertEqual(len(set(generated)), 3)
+        self.assertNotIn("omega", content)
 
 
 class SurveyServicesTests(SimpleTestCase):
