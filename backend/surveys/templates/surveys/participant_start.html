@@ -1,0 +1,62 @@
+{% load static %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <title>Survey pre-screening - Alessar Solutions</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{% static 'surveys/css/participant.css' %}">
+</head>
+<body>
+  <header class="participant-header">
+    <a class="participant-brand" href="https://alessarsolutions.in/">
+      <span class="brand-dot" aria-hidden="true"></span>
+      <span><strong>Alessar Solutions</strong><small>Research Cloud</small></span>
+    </a>
+    <span class="secure-label">Secure survey</span>
+  </header>
+  <main class="participant-shell">
+    <section class="intro-card">
+      <p class="eyebrow">Before you begin</p>
+      <h1>A few questions to find the right study</h1>
+      <p>Your answers are used to check this study's eligibility. After submission, you will continue to the live survey.</p>
+      <div class="survey-meta"><span>Study reference</span><strong>{{ survey.survey_id }}</strong></div>
+    </section>
+
+    <form class="prescreener-card" method="post">
+      {% csrf_token %}
+      {% if form_error %}<div class="form-error" role="alert">{{ form_error }}</div>{% endif %}
+      {% if questions %}
+        <div class="question-stack">
+          {% for question in questions %}
+            <fieldset class="question-field">
+              <legend><span>{{ forloop.counter|stringformat:"02d" }}</span>{{ question.text|default:question.code }}</legend>
+              {% if question.options %}
+                <div class="answer-options">
+                  {% for option in question.options %}
+                    <label class="answer-option">
+                      <input type="{% if 'multi' in question.type|lower %}checkbox{% else %}radio{% endif %}" name="question_{{ question.id|default:forloop.parentloop.counter }}" value="{{ option.id }}"{% if 'multi' not in question.type|lower %} required{% endif %}>
+                      <span>{{ option.text }}</span>
+                    </label>
+                  {% endfor %}
+                </div>
+              {% else %}
+                <input class="text-answer" type="text" name="question_{{ question.id|default:forloop.counter }}" maxlength="300" required placeholder="Type your answer">
+              {% endif %}
+            </fieldset>
+          {% endfor %}
+        </div>
+      {% else %}
+        <div class="ready-state"><strong>You're ready to continue</strong><span>No additional eligibility questions are required for this study.</span></div>
+      {% endif %}
+      <label class="consent-row"><input type="checkbox" name="consent" value="yes" required><span>I agree to continue to the research study and provide truthful answers.</span></label>
+      <button class="continue-button" type="submit">Continue to survey <span>&rarr;</span></button>
+      <p class="privacy-note">Do not refresh or use the browser back button after the live study opens.</p>
+    </form>
+  </main>
+</body>
+</html>

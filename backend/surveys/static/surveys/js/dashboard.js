@@ -20,31 +20,6 @@
     const date = new Date(value);
     return Number.isNaN(date.getTime()) ? "Not supplied" : date.toLocaleString([], { year: "numeric", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit" });
   }
-  const ALPHANUMERIC = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  const RANDOM_ID_LENGTH = 24;
-  const generatedIds = new Set();
-
-  function randomAlphanumeric(length = RANDOM_ID_LENGTH) {
-    let value = "";
-    do {
-      const randomValues = new Uint32Array(length);
-      window.crypto.getRandomValues(randomValues);
-      value = Array.from(randomValues, (number) => ALPHANUMERIC[number % ALPHANUMERIC.length]).join("");
-    } while (generatedIds.has(value));
-    generatedIds.add(value);
-    return value;
-  }
-
-  function generatedSurveyUrl(url) {
-    let generatedUrl = url;
-    const placeholders = [/\[%%pid%%\]/g, /\[#vq_tid#\]/g, /\[#vq_tuid#\]/g];
-    placeholders.forEach((placeholder) => {
-      if (placeholder.test(generatedUrl)) generatedUrl = generatedUrl.replace(placeholder, randomAlphanumeric());
-      placeholder.lastIndex = 0;
-    });
-    return generatedUrl;
-  }
-
   function setOptions(select, values, label) {
     const current = select.value;
     const fragment = document.createDocumentFragment();
@@ -185,7 +160,7 @@
       const actionCell = document.createElement("td");
       const actions = document.createElement("div"); actions.className = "link-actions";
       const copy = document.createElement("button"); copy.type = "button"; copy.className = "copy-button"; copy.textContent = "Copy link";
-      copy.addEventListener("click", () => copyLink(survey.entry_url));
+      copy.addEventListener("click", () => copyLink(survey, copy));
       const questions = document.createElement("button"); questions.type = "button"; questions.className = "question-button";
       questions.setAttribute("aria-label", `View pre-screening questions for survey ${survey.survey_id}`); questions.title = "View questions";
       const eye = document.createElement("span"); eye.className = "eye-icon"; eye.setAttribute("aria-hidden", "true"); questions.appendChild(eye);
@@ -195,10 +170,31 @@
     });
   }
 
-  async function copyLink(url) {
-    const generatedUrl = generatedSurveyUrl(url);
-    try { await navigator.clipboard.writeText(generatedUrl); showToast("Link copied with unique random IDs"); }
-    catch (_) { showToast("Could not access the clipboard"); }
+  function csrfToken() {
+    const token = document.cookie.split(";").map((value) => value.trim()).find((value) => value.startsWith("csrftoken="));
+    return token ? decodeURIComponent(token.slice("csrftoken=".length)) : "";
+  }
+
+  async function copyLink(survey, button) {
+    const originalText = button.textContent;
+    button.disabled = true;
+    button.textContent = "Creating…";
+    try {
+      const response = await fetch("/api/surveys/launch-link/", {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json", "X-CSRFToken": csrfToken() },
+        body: JSON.stringify({ company: survey.company, survey_id: survey.survey_id })
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.message || "Could not create the survey link.");
+      await navigator.clipboard.writeText(payload.launch_url);
+      showToast(survey.company === "BioBrain" ? "Tracked pre-screener link copied" : "Link copied with a unique respondent ID");
+    } catch (error) {
+      showToast(error.message || "Could not access the clipboard");
+    } finally {
+      button.disabled = false;
+      button.textContent = originalText;
+    }
   }
 
   function showToast(message) {
