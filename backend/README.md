@@ -27,14 +27,14 @@ Optional settings:
 - `SURVEY_CACHE_SECONDS`: backend cache duration (default `12`).
 - `DJANGO_SECRET_KEY`, `DJANGO_DEBUG`, `DJANGO_ALLOWED_HOSTS`: standard deployment settings.
 
-InnovateMR **Copy link** and CSV links replace `[%%pid%%]` with a cryptographically random 24-character alphanumeric value. BioBrain links use the tracked Alessar start flow below; its two unique IDs are created server-side only when a respondent submits the pre-screener.
+By default, **Copy link** and CSV export return direct supplier URLs. InnovateMR `[%%pid%%]` and BioBrain `[#vq_tid#]` / `[#vq_tuid#]` placeholders are replaced server-side with distinct cryptographically random 24-character alphanumeric values.
 
 The eye action beside each survey link loads that survey's live InnovateMR targeting or BioBrain qualifications on demand. Question responses are cached briefly to keep the dashboard responsive.
 
 
-## BioBrain tracked respondent flow
+## Dormant BioBrain tracked respondent flow
 
-Dashboard `Copy link` creates a signed Alessar start URL for BioBrain studies. The public start page loads the live pre-screener, generates a unique 24-character `vq_token` and `vq_uid` when submitted, records the handoff in `SurveySession`, and redirects the respondent to BioBrain.
+This preserved flow is disabled by default. Set `SURVEY_TRACKED_FLOW_ENABLED=true` to reactivate the pre-screener, return pages, and Sessions navigation. When enabled, dashboard `Copy link` creates a signed Alessar start URL for BioBrain studies. The public start page loads the live pre-screener, generates a unique 24-character `vq_token` and `vq_uid` when submitted, records the handoff in `SurveySession`, and redirects the respondent to BioBrain.
 
 Configure these browser redirect URLs in the BioBrain supplier account:
 

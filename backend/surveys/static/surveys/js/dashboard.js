@@ -188,7 +188,7 @@
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.message || "Could not create the survey link.");
       await navigator.clipboard.writeText(payload.launch_url);
-      showToast(survey.company === "BioBrain" ? "Tracked pre-screener link copied" : "Link copied with a unique respondent ID");
+      showToast(payload.tracked ? "Tracked pre-screener link copied" : "Direct link copied with unique respondent IDs");
     } catch (error) {
       showToast(error.message || "Could not access the clipboard");
     } finally {

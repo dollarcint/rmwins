@@ -143,7 +143,7 @@ class SurveyViewsTests(TestCase):
         self.assertEqual(response.status_code, 302)
 
     @patch("surveys.views.get_surveys")
-    def test_biobrain_copy_link_returns_signed_public_start_url(self, get_surveys):
+    def test_biobrain_copy_link_returns_direct_url_with_two_unique_ids(self, get_surveys):
         self.client.force_login(self.user)
         get_surveys.return_value = (SAMPLE, datetime.now(timezone.utc), False)
         response = self.client.post(
@@ -152,10 +152,20 @@ class SurveyViewsTests(TestCase):
             content_type="application/json",
         )
         self.assertEqual(response.status_code, 200)
-        launch_url = response.json()["launch_url"]
-        self.assertIn("/survey/start/", launch_url)
-        self.assertNotIn("rf.voqall", launch_url)
+        payload = response.json()
+        launch_url = payload["launch_url"]
+        generated = re.findall(r"(?:vq_token|vq_uid)=([A-Za-z0-9]{24})", launch_url)
+        self.assertFalse(payload["tracked"])
+        self.assertIn("rf.voqall", launch_url)
+        self.assertEqual(len(generated), 2)
+        self.assertEqual(len(set(generated)), 2)
+        self.assertNotIn("[#vq_", launch_url)
 
+    def test_tracked_start_and_return_pages_are_disabled_by_default(self):
+        self.assertEqual(self.client.get("/survey/start/not-a-live-token/").status_code, 404)
+        self.assertEqual(self.client.get("/survey/return/s1/?token=x&vendor_user_id=y").status_code, 404)
+
+    @override_settings(SURVEY_TRACKED_FLOW_ENABLED=True)
     @patch("surveys.views.get_survey_questions")
     @patch("surveys.views.get_surveys")
     def test_public_start_page_creates_unique_tracked_session_and_hands_off(self, get_surveys, get_questions):
@@ -185,6 +195,7 @@ class SurveyViewsTests(TestCase):
         self.assertEqual(session.prescreener_answers["59"]["values"], ["1"])
         self.assertIn("gender=1", location)
 
+    @override_settings(SURVEY_TRACKED_FLOW_ENABLED=True)
     def test_all_four_return_urls_record_the_exact_status(self):
         status_map = {
             "s1": SurveySession.Status.COMPLETE,
@@ -211,6 +222,7 @@ class SurveyViewsTests(TestCase):
                 self.assertEqual(session.supplier_status_id, "88")
                 self.assertIsNotNone(session.returned_at)
 
+    @override_settings(SURVEY_TRACKED_FLOW_ENABLED=True)
     def test_return_url_requires_the_exact_token_and_user_pair(self):
         first = SurveySession.objects.create(
             client="BioBrain", survey_id="LMS-A", transaction_id="A" * 24, respondent_id="B" * 24,
@@ -226,17 +238,20 @@ class SurveyViewsTests(TestCase):
         self.assertEqual(first.status, SurveySession.Status.HANDED_OFF)
 
     @patch("surveys.views.get_surveys")
-    def test_csv_export_contains_all_rows_trimmed_cpi_and_tracked_biobrain_url(self, get_surveys):
+    def test_csv_export_contains_all_direct_urls_with_distinct_random_ids(self, get_surveys):
         self.client.force_login(self.user)
         get_surveys.return_value = (SAMPLE, datetime.now(timezone.utc), False)
         response = self.client.get("/api/surveys/export/?page_size=1")
         content = b"".join(response.streaming_content).decode("utf-8-sig")
+        generated = re.findall(r"(?:PID|vq_token|vq_uid)=([A-Za-z0-9]{24})", content)
         self.assertEqual(response["X-Exported-Count"], "2")
         self.assertIn("Client,Country,CPI,Updated", content)
         self.assertIn(",0.79,", content)
-        self.assertIn("/survey/start/", content)
-        self.assertRegex(content, r"PID=[A-Za-z0-9]{24}")
+        self.assertNotIn("/survey/start/", content)
+        self.assertEqual(len(generated), 3)
+        self.assertEqual(len(set(generated)), 3)
         self.assertNotIn("[#vq_", content)
+        self.assertNotIn("[%%pid%%]", content)
         self.assertNotIn("Survey name", content)
 
 

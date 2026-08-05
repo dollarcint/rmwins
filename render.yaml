@@ -28,6 +28,8 @@ services:
         sync: false
       - key: VOQALL_ACCESS_KEY
         sync: false
+      - key: SURVEY_TRACKED_FLOW_ENABLED
+        value: "false"
       - key: DATABASE_URL
         fromDatabase:
           name: alessar-postgres

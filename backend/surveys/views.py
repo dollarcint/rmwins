@@ -9,7 +9,7 @@ from django.conf import settings
 from django.contrib.auth.decorators import login_required
 from django.core import signing
 from django.db import IntegrityError, transaction
-from django.http import HttpResponse, JsonResponse, StreamingHttpResponse
+from django.http import Http404, HttpResponse, JsonResponse, StreamingHttpResponse
 from django.shortcuts import render
 from django.urls import reverse
 from django.utils import timezone
@@ -27,7 +27,11 @@ _RANDOM_ID_LENGTH = 24
 
 @login_required
 def dashboard(request):
-    return render(request, "surveys/dashboard.html")
+    return render(
+        request,
+        "surveys/dashboard.html",
+        {"tracked_flow_enabled": settings.SURVEY_TRACKED_FLOW_ENABLED},
+    )
 
 
 def _positive_int(value, default, maximum):
@@ -121,8 +125,12 @@ def _signed_start_url(request, survey):
     return request.build_absolute_uri(reverse("surveys:survey_start", args=(token,)))
 
 
+def _tracked_flow_for_survey(survey):
+    return settings.SURVEY_TRACKED_FLOW_ENABLED and survey["company"].casefold() == "biobrain"
+
+
 def _launch_url_for_survey(request, survey, used_ids=None):
-    if survey["company"].casefold() == "biobrain":
+    if _tracked_flow_for_survey(survey):
         return _signed_start_url(request, survey)
     return _direct_supplier_url(survey["entry_url"], used_ids)
 
@@ -221,7 +229,13 @@ def survey_launch_link(request):
         return JsonResponse({"status": "error", "message": str(exc)}, status=502)
     if survey is None:
         return JsonResponse({"status": "error", "message": "This survey is no longer available."}, status=404)
-    return JsonResponse({"status": "success", "launch_url": _launch_url_for_survey(request, survey)})
+    return JsonResponse(
+        {
+            "status": "success",
+            "launch_url": _launch_url_for_survey(request, survey),
+            "tracked": _tracked_flow_for_survey(survey),
+        }
+    )
 
 
 @login_required
@@ -353,6 +367,8 @@ def _create_session(survey, questions, answers):
 
 @require_http_methods(["GET", "POST"])
 def survey_start(request, token):
+    if not settings.SURVEY_TRACKED_FLOW_ENABLED:
+        raise Http404("Tracked survey flow is disabled.")
     try:
         payload = _launch_payload(token)
     except signing.SignatureExpired:
@@ -426,6 +442,8 @@ def _first_query_value(request, names):
 
 @require_GET
 def survey_return(request, status_code):
+    if not settings.SURVEY_TRACKED_FLOW_ENABLED:
+        raise Http404("Tracked survey flow is disabled.")
     mapped = RETURN_STATUSES.get(status_code.casefold())
     if mapped is None:
         return _render_launch_error(request, "This return status is not recognized.", status=404)
