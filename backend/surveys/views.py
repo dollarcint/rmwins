@@ -1,138 +1,829 @@
 import csv
 import json
-import math
-import secrets
-import string
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import quote
 
 from django.conf import settings
-from django.contrib.auth.decorators import login_required
-from django.core import signing
-from django.db import IntegrityError, transaction
-from django.http import Http404, HttpResponse, JsonResponse, StreamingHttpResponse
+from django.contrib.auth import get_user_model
+from django.db import transaction
+from django.db.models import Max, Min
+from django.http import HttpResponseRedirect, StreamingHttpResponse
 from django.shortcuts import render
 from django.urls import reverse
 from django.utils import timezone
-from django.utils.dateparse import parse_date, parse_datetime
-from django.views.decorators.http import require_GET, require_POST, require_http_methods
+from django.views.decorators.http import require_http_methods
+from django_filters.rest_framework import DjangoFilterBackend
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import OpenApiExample, OpenApiParameter, extend_schema, extend_schema_view
+from rest_framework import filters, permissions, status, viewsets
+from rest_framework.decorators import action
+from rest_framework.exceptions import APIException, PermissionDenied
+from rest_framework.response import Response
+from rest_framework.views import APIView
 
-from .models import SurveySession
-from .services import FeedError, get_survey_questions, get_surveys
+from accounts.access import (
+    HasFunctionPermission,
+    activity_visible_user_ids,
+    effective_permission_codes,
+    function_permission_required,
+    has_function_access,
+)
+from vendors.services import (
+    AllocationUnavailable,
+    finalize_attempt_capacity,
+    reserve_attempt_capacity,
+    resolve_vendor_survey_context,
+    scope_surveys_for_user,
+)
+from vendors.access import is_external_vendor_scope, vendor_scope_user_id
+
+from .filters import SurveyAttemptFilter, SurveyFilter
+from .integrations import InnovateMRAPIError, InnovateMRClient
+from .models import Survey, SurveyAttempt, SyncRun
+from .serializers import (
+    SurveyDetailSerializer,
+    SurveyListSerializer,
+    SurveyAttemptSerializer,
+    SurveyQuotaSerializer,
+    SyncRunSerializer,
+    SyncTriggerResponseSerializer,
+    TargetingQuestionSerializer,
+    UserHitsResponseSerializer,
+)
+from .pagination import SurveyPagination
+from .services import replace_survey_quotas, replace_survey_targeting, sync_surveys
+from .survey_flow import (
+    backfill_attempt_entry_audit,
+    build_outbound_url,
+    create_attempt,
+    get_request_client_data,
+    get_request_ip,
+    status_rid_from_request,
+)
+from .tasks import sync_innovatemr_surveys_task
+from .user_hits import aggregate_user_hits, user_hit_filter_options
 
 
-LAUNCH_SIGNING_SALT = "surveys.public-launch.v1"
-_ALPHANUMERIC = string.ascii_letters + string.digits
-_RANDOM_ID_LENGTH = 24
+class UpstreamUnavailable(APIException):
+    status_code = status.HTTP_502_BAD_GATEWAY
+    default_detail = "InnovateMR is temporarily unavailable and no cached survey detail exists."
+    default_code = "upstream_unavailable"
 
 
-@login_required
-def dashboard(request):
-    return render(
-        request,
-        "surveys/dashboard.html",
-        {"tracked_flow_enabled": settings.SURVEY_TRACKED_FLOW_ENABLED},
+PROJECT_COLUMN_PERMISSIONS = {
+    "project_id": "projects.column.project_id", "survey": "projects.column.survey",
+    "market": "projects.column.market", "completes": "projects.column.completes",
+    "cpi": "projects.column.cpi", "loi_ir": "projects.column.loi_ir",
+    "entry_link": "projects.column.entry_link", "modified": "projects.column.modified",
+    "actions": "projects.column.actions",
+}
+
+PROJECT_FILTER_PERMISSIONS = {
+    "search": "projects.filter.search", "country": "projects.filter.country",
+    "status": "projects.filter.status", "client": "projects.filter.client",
+    "cpi": "projects.filter.cpi", "date": "projects.filter.date",
+    "clear": "projects.filters.clear",
+}
+
+STUDY_COLUMN_PERMISSIONS = {
+    "project_id": "studies.column.project_id", "survey_id": "studies.column.survey_id",
+    "respondent_id": "studies.column.respondent_id", "user": "studies.column.user",
+    "device": "studies.column.device", "ip": "studies.column.ip", "loi": "studies.column.loi",
+    "status": "studies.column.status", "start": "studies.column.start", "end": "studies.column.end",
+}
+
+STUDY_FILTER_PERMISSIONS = {
+    "search": "studies.filter.search", "user": "studies.filter.user",
+    "status": "studies.filter.status", "date": "studies.filter.date",
+    "clear": "studies.filters.clear",
+}
+
+USER_HIT_COLUMN_PERMISSIONS = {
+    "branch": "user_hits.column.branch", "sub_branch": "user_hits.column.sub_branch",
+    "user": "user_hits.column.user", "date": "user_hits.column.date",
+    "hits": "user_hits.column.hits", "completes": "user_hits.column.completes",
+}
+
+USER_HIT_FILTER_PERMISSIONS = {
+    "search": "user_hits.filter.search", "branch": "user_hits.filter.branch",
+    "sub_branch": "user_hits.filter.sub_branch", "user": "user_hits.filter.user",
+    "date": "user_hits.filter.date", "clear": "user_hits.filters.clear",
+}
+
+
+def _project_columns_for_user(user):
+    codes = effective_permission_codes(user)
+    columns = [name for name, code in PROJECT_COLUMN_PERMISSIONS.items() if code in codes]
+    if "entry_link" in columns and "survey_links.copy" not in codes:
+        columns.remove("entry_link")
+    if "actions" in columns and "survey_details.view" not in codes:
+        columns.remove("actions")
+    return columns
+
+
+def _component_access(codes, permissions):
+    return {name: code in codes for name, code in permissions.items()}
+
+
+def _permitted_columns(codes, permissions):
+    return [name for name, code in permissions.items() if code in codes]
+
+
+def _enforce_query_permissions(request, permission_parameters):
+    for code, parameters in permission_parameters.items():
+        if any(request.query_params.get(parameter) not in {None, ""} for parameter in parameters):
+            if not has_function_access(request.user, code):
+                raise PermissionDenied(f"Your account cannot use the {code} filter.")
+
+
+@function_permission_required("dashboard.view")
+def dashboard_page(request):
+    return render(request, "surveys/dashboard.html", {"active_page": "dashboard"})
+
+
+@function_permission_required("projects.view")
+def projects_page(request):
+    codes = effective_permission_codes(request.user)
+    visible_surveys = scope_surveys_for_user(Survey.objects.all(), request.user)
+    countries = visible_surveys.exclude(country_code="").values_list("country_code", "country").distinct().order_by("country_code")
+    is_vendor_panel = bool(vendor_scope_user_id(request.user))
+    if is_vendor_panel:
+        companies = visible_surveys.filter(client__isnull=False).values_list("client__name", flat=True).distinct().order_by("client__name")
+    else:
+        companies = visible_surveys.exclude(company_name="").values_list("company_name", flat=True).distinct().order_by("company_name")
+    project_columns = _project_columns_for_user(request.user)
+    project_filters = _component_access(codes, PROJECT_FILTER_PERMISSIONS)
+    can_sort_cpi = project_filters["cpi"]
+    cpi_min, cpi_max = 0, 100
+    if can_sort_cpi:
+        cpi_bounds = visible_surveys.aggregate(minimum=Min("cpi"), maximum=Max("cpi"))
+        cpi_min = cpi_bounds["minimum"] or 0
+        cpi_max = cpi_bounds["maximum"] or 100
+        if cpi_max <= cpi_min:
+            cpi_max = cpi_min + 1
+    return render(request, "surveys/projects.html", {
+        "active_page": "projects", "countries": countries, "companies": companies,
+        "company_filter_label": "Client",
+        "company_filter_param": "client_name" if is_vendor_panel else "company",
+        "company_filter_default": "All clients",
+        "project_columns": project_columns, "project_column_count": max(1, len(project_columns)),
+        "project_filters": project_filters,
+        "can_sync": "sync.run" in codes,
+        "can_export_projects": "projects.export" in codes,
+        "can_change_project_page_size": "projects.control.page_size" in codes,
+        "can_paginate_projects": "projects.control.pagination" in codes,
+        "can_sort_cpi": can_sort_cpi, "cpi_min_bound": cpi_min, "cpi_max_bound": cpi_max,
+    })
+
+
+@function_permission_required("attempts.view")
+def studies_page(request):
+    codes = effective_permission_codes(request.user)
+    user_ids = activity_visible_user_ids(request.user)
+    if request.user.is_superuser:
+        tracked_users = get_user_model().objects.filter(survey_attempts__isnull=False)
+    else:
+        tracked_users = get_user_model().objects.filter(pk__in=user_ids, survey_attempts__isnull=False)
+    tracked_users = tracked_users.distinct().order_by("first_name", "last_name", "username")
+    return render(request, "surveys/studies.html", {
+        "active_page": "studies",
+        "tracked_users": tracked_users,
+        "attempt_statuses": [
+            ("initiated,redirected", "Initiated"),
+            (SurveyAttempt.Status.COMPLETED, "Completed"),
+            (SurveyAttempt.Status.TERMINATED, "Terminated"),
+            (SurveyAttempt.Status.OVER_QUOTA, "Over quota"),
+            (SurveyAttempt.Status.QUALITY_TERMINATED, "Quality terminated"),
+        ],
+        "study_filters": _component_access(codes, STUDY_FILTER_PERMISSIONS),
+        "study_columns": _permitted_columns(codes, STUDY_COLUMN_PERMISSIONS),
+        "study_column_count": max(1, len(_permitted_columns(codes, STUDY_COLUMN_PERMISSIONS))),
+        "can_export": "attempts.export" in codes,
+        "can_change_study_page_size": "studies.control.page_size" in codes,
+        "can_paginate_studies": "studies.control.pagination" in codes,
+    })
+
+
+@function_permission_required("user_hits.view")
+def user_hits_page(request):
+    codes = effective_permission_codes(request.user)
+    return render(request, "surveys/user_hits.html", {
+        "active_page": "user-hits",
+        "hit_filters": _component_access(codes, USER_HIT_FILTER_PERMISSIONS),
+        "hit_columns": _permitted_columns(codes, USER_HIT_COLUMN_PERMISSIONS),
+        "hit_column_count": max(1, len(_permitted_columns(codes, USER_HIT_COLUMN_PERMISSIONS))),
+        "can_view_hit_summary": "user_hits.summary" in codes,
+        "can_change_hit_page_size": "user_hits.control.page_size" in codes,
+        "can_paginate_hits": "user_hits.control.pagination" in codes,
+        **user_hit_filter_options(request.user),
+    })
+
+
+def workspace_home(request):
+    if not request.user.is_authenticated:
+        from django.contrib.auth.views import redirect_to_login
+        return redirect_to_login(request.get_full_path())
+    if has_function_access(request.user, "projects.view"):
+        return HttpResponseRedirect(reverse("projects"))
+    if has_function_access(request.user, "dashboard.view"):
+        return HttpResponseRedirect(reverse("dashboard"))
+    if has_function_access(request.user, "attempts.view"):
+        return HttpResponseRedirect(reverse("studies"))
+    if has_function_access(request.user, "user_hits.view"):
+        return HttpResponseRedirect(reverse("user-hits"))
+    if any(has_function_access(request.user, code) for code in ("vendors.view", "vendors.manage", "allocations.view", "allocations.manage")):
+        return HttpResponseRedirect(reverse("vendor-management"))
+    if any(has_function_access(request.user, code) for code in ("access.manage", "users.view", "users.create", "roles.view", "roles.create")):
+        return HttpResponseRedirect(reverse("access-control"))
+    from django.core.exceptions import PermissionDenied
+    raise PermissionDenied("No workspace page is assigned to this account.")
+
+
+def _prescreener_questions(survey, submitted_data=None):
+    prepared = []
+    for question in survey.targeting_questions.all():
+        lowered_type = question.question_type.lower()
+        options = []
+        age_ranges = []
+        for option in question.options:
+            option_id = option.get("OptionId")
+            if option.get("ageStart") is not None:
+                label = f"{option.get('ageStart')}–{option.get('ageEnd')}"
+                age_ranges.append(option)
+            else:
+                label = option.get("OptionText") or str(option_id or "Option")
+            options.append({"value": str(option_id or label), "label": label})
+        if "multi" in lowered_type:
+            input_kind = "checkbox"
+        elif "single" in lowered_type and options:
+            input_kind = "radio"
+        elif question.key.upper() == "AGE" or "numeric" in lowered_type:
+            input_kind = "number"
+        else:
+            input_kind = "text"
+        field_name = f"question_{question.pk}"
+        selected_values = submitted_data.getlist(field_name) if submitted_data is not None else []
+        for option in options:
+            option["selected"] = option["value"] in selected_values
+        prepared.append({
+            "model": question,
+            "field_name": field_name,
+            "input_kind": input_kind,
+            "options": options,
+            "current_value": selected_values[0] if selected_values else "",
+            "min_value": min((int(item["ageStart"]) for item in age_ranges), default=None),
+            "max_value": max((int(item["ageEnd"]) for item in age_ranges), default=None),
+        })
+    return prepared
+
+
+def _collect_prescreener_answers(request, survey):
+    answers = {}
+    errors = []
+    for prepared in _prescreener_questions(survey):
+        question = prepared["model"]
+        values = [value.strip() for value in request.POST.getlist(prepared["field_name"]) if value.strip()]
+        if not values:
+            errors.append(f"Please answer: {question.text or question.key}")
+            continue
+
+        valid_options = {item["value"] for item in prepared["options"]}
+        upstream_values = values.copy()
+        if prepared["input_kind"] in {"radio", "checkbox"}:
+            invalid = [value for value in values if value not in valid_options]
+            if invalid:
+                errors.append(f"Invalid answer for: {question.text or question.key}")
+                continue
+        elif prepared["input_kind"] == "number":
+            try:
+                numeric_value = int(values[0])
+            except ValueError:
+                errors.append(f"Enter a valid number for: {question.text or question.key}")
+                continue
+            matched = [
+                str(option.get("OptionId"))
+                for option in question.options
+                if option.get("ageStart") is not None
+                and int(option["ageStart"]) <= numeric_value <= int(option["ageEnd"])
+                and option.get("OptionId") is not None
+            ]
+            upstream_values = matched or [str(numeric_value)]
+
+        answers[str(question.pk)] = {
+            "question_id": question.question_id,
+            "question_key": question.key,
+            "question_text": question.text,
+            "values": values,
+            "upstream_values": upstream_values,
+        }
+    return answers, errors
+
+
+def _invalid_survey_link(request, message="This link is invalid or is no longer available.", status_code=400):
+    return render(request, "surveys/flow_error.html", {
+        "title": "Invalid survey link",
+        "message": message,
+    }, status=status_code)
+
+
+def _has_exact_query(request, expected_names):
+    """Reject duplicated or client-injected start-link parameters."""
+    return set(request.GET.keys()) == set(expected_names) and all(
+        len(request.GET.getlist(name)) == 1 for name in expected_names
     )
 
 
-def _positive_int(value, default, maximum):
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return min(max(parsed, 1), maximum)
+@require_http_methods(["GET", "POST"])
+def survey_start(request):
+    if request.method == "GET" and not request.GET.get("rid"):
+        required_params = {"surveyId", "supplierCode", "userId", "code"}
+        if not _has_exact_query(request, required_params):
+            return _invalid_survey_link(request)
+
+        survey_id = request.GET.get("surveyId", "").strip()
+        supplier_code = request.GET.get("supplierCode", "").strip()
+        internal_code = request.GET.get("code", "").strip()
+        user_id = request.GET.get("userId", "").strip()
+        if (
+            not survey_id.isdigit()
+            or not user_id.isdigit()
+            or not internal_code.isdigit()
+            or len(internal_code) != 14
+        ):
+            return _invalid_survey_link(request)
+
+        platform_user = get_user_model().objects.filter(pk=int(user_id), is_active=True).first()
+        if (
+            platform_user is None
+            or not has_function_access(platform_user, "projects.view")
+            or not has_function_access(platform_user, "survey_links.copy")
+        ):
+            return _invalid_survey_link(request)
+
+        survey = scope_surveys_for_user(Survey.objects.all(), platform_user).filter(
+            source_id=int(survey_id), local_id=internal_code, status=Survey.Status.LIVE
+        ).first()
+        if survey is None or not survey.entry_link:
+            return _invalid_survey_link(request)
+        expected_supplier_code = survey.integration.supplier_code if survey.integration_id else settings.PUBLIC_SUPPLIER_CODE
+        if supplier_code != expected_supplier_code:
+            return _invalid_survey_link(request)
+
+        stale = survey.targeting_synced_at is None or (
+            survey.source_modified_at and survey.targeting_synced_at < survey.source_modified_at
+        )
+        targeting_warning = ""
+        if stale:
+            try:
+                replace_survey_targeting(InnovateMRClient(integration=survey.integration), survey)
+            except InnovateMRAPIError:
+                if not survey.targeting_questions.exists():
+                    targeting_warning = "Pre-screening criteria are temporarily unavailable. You can still continue."
+        try:
+            with transaction.atomic():
+                allocation_context = resolve_vendor_survey_context(
+                    platform_user,
+                    survey,
+                    require_capacity=True,
+                    for_update=True,
+                )
+                attempt = create_attempt(
+                    survey,
+                    platform_user,
+                    get_request_ip(request),
+                    client_data=get_request_client_data(request),
+                )
+                if allocation_context:
+                    reserve_attempt_capacity(
+                        attempt,
+                        allocation_context.survey_allocation,
+                        client_allocation=allocation_context.client_allocation,
+                    )
+        except AllocationUnavailable as exc:
+            return _invalid_survey_link(request, str(exc), status_code=409)
+        if targeting_warning:
+            request.session[f"attempt_warning_{attempt.rid}"] = targeting_warning
+        return HttpResponseRedirect(f"{reverse('survey-start')}?rid={quote(attempt.rid)}")
+
+    if request.method == "GET" and not _has_exact_query(request, {"rid"}):
+        return _invalid_survey_link(request)
+
+    rid = (request.GET.get("rid", "") if request.method == "GET" else request.POST.get("rid", "")).strip()
+    if len(rid) != 10 or not rid.isalnum():
+        return _invalid_survey_link(request)
+    attempt = SurveyAttempt.objects.select_related("survey", "platform_user").filter(rid=rid).first()
+    if attempt is None or attempt.platform_user is None or not attempt.platform_user.is_active:
+        return _invalid_survey_link(request, status_code=404)
+    attempt = backfill_attempt_entry_audit(attempt, request)
+
+    if request.method == "POST":
+        answers, errors = _collect_prescreener_answers(request, attempt.survey)
+        if not errors:
+            with transaction.atomic():
+                locked = SurveyAttempt.objects.select_for_update().select_related("survey").get(pk=attempt.pk)
+                if locked.status != SurveyAttempt.Status.INITIATED:
+                    return HttpResponseRedirect(f"{reverse('survey-start')}?rid={quote(locked.rid)}")
+                outbound_url = build_outbound_url(locked.survey.entry_link, locked.rid, answers)
+                now = timezone.now()
+                locked.answers = answers
+                locked.submitted_at = now
+                locked.redirected_at = now
+                locked.outbound_url = outbound_url
+                locked.status = SurveyAttempt.Status.REDIRECTED
+                locked.save(update_fields=["answers", "submitted_at", "redirected_at", "outbound_url", "status", "updated_at"])
+            return HttpResponseRedirect(outbound_url)
+    else:
+        errors = []
+
+    if attempt.status != SurveyAttempt.Status.INITIATED:
+        return render(request, "surveys/status.html", {
+            "title": "Survey already initiated",
+            "message": "This RID has already been used to enter the survey.",
+            "tone": "info",
+            "status_label": attempt.get_status_display(),
+            "rid": attempt.rid,
+            "ip_address": attempt.callback_ip or attempt.initiation_ip,
+            "loi_seconds": attempt.loi_seconds,
+            "attempt_found": True,
+        })
+
+    return render(request, "surveys/prescreener.html", {
+        "attempt": attempt,
+        "survey": attempt.survey,
+        "questions": _prescreener_questions(attempt.survey, request.POST if request.method == "POST" else None),
+        "errors": errors,
+        "warning": request.session.pop(f"attempt_warning_{attempt.rid}", ""),
+    })
 
 
-def _updated_datetime(row):
-    value = row.get("updated_at")
-    return parse_datetime(value) if value else None
+STATUS_PAGES = {
+    "1": {"title": "Thank you for participating!", "message": "Your survey response has been completed successfully.", "tone": "success"},
+    "2": {"title": "Survey ended", "message": "Your profile did not match the remaining survey requirements.", "tone": "neutral"},
+    "3": {"title": "Quota already filled", "message": "The required quota was filled before your response could be completed.", "tone": "warning"},
+    "4": {"title": "Quality check unsuccessful", "message": "This response did not pass the survey's quality checks.", "tone": "danger"},
+}
 
 
-def _filter_and_sort_surveys(request, surveys):
-    country = request.GET.get("country", "").strip().casefold()
-    client = request.GET.get("company", "").strip().casefold()
-    search = request.GET.get("search", "").strip().casefold()
-    from_date = parse_date(request.GET.get("from_date", ""))
-    to_date = parse_date(request.GET.get("to_date", ""))
+@require_http_methods(["GET"])
+def survey_status(request):
+    status_code = request.GET.get("status", "").strip()
+    rid = status_rid_from_request(request)
+    page = STATUS_PAGES.get(status_code)
+    if page is None or not rid:
+        return render(request, "surveys/flow_error.html", {
+            "title": "Invalid survey status",
+            "message": "A valid status (1–4) and RID are required.",
+        }, status=400)
 
-    filtered = []
-    for row in surveys:
-        if country and row["country"].casefold() != country:
-            continue
-        if client and row["company"].casefold() != client:
-            continue
-        haystack = " ".join((row["survey_id"], row["company"], row["country"])).casefold()
-        if search and search not in haystack:
-            continue
-        updated = _updated_datetime(row)
-        if from_date and (updated is None or updated.date() < from_date):
-            continue
-        if to_date and (updated is None or updated.date() > to_date):
-            continue
-        filtered.append(row)
+    attempt = SurveyAttempt.objects.filter(rid=rid).first()
+    ip_address = get_request_ip(request)
+    if attempt:
+        with transaction.atomic():
+            attempt = SurveyAttempt.objects.select_for_update().get(pk=attempt.pk)
+            now = timezone.now()
+            exit_client_data = get_request_client_data(request)
+            if attempt.callback_at is None:
+                attempt.callback_at = now
+                attempt.callback_ip = ip_address
+                attempt.loi_seconds = attempt.calculate_loi_seconds(now)
+                attempt.status = status_code
+                attempt.exit_user_agent = exit_client_data.get("user_agent", "")
+                attempt.exit_browser = exit_client_data.get("browser", "")
+                attempt.exit_device = exit_client_data.get("device", "")
+                attempt.exit_os = exit_client_data.get("os", "")
+                attempt.exit_client_data = exit_client_data
+                attempt.status_source = "browser_callback"
+            attempt.last_callback_at = now
+            attempt.callback_count += 1
+            attempt.save(update_fields=[
+                "callback_at", "callback_ip", "loi_seconds", "status", "exit_user_agent", "exit_browser",
+                "exit_device", "exit_os", "exit_client_data", "status_source", "last_callback_at",
+                "callback_count", "updated_at"
+            ])
+            finalize_attempt_capacity(attempt)
+        status_label = attempt.get_status_display()
+    else:
+        status_label = "Unknown attempt"
 
-    sort_key = request.GET.get("sort", "updated_at")
-    sort_map = {
-        "survey_id": lambda item: item["survey_id"],
-        "company": lambda item: item["company"].casefold(),
-        "country": lambda item: item["country"].casefold(),
-        "payout": lambda item: item["payout"],
-        "updated_at": lambda item: (_updated_datetime(item).timestamp() if _updated_datetime(item) else 0),
-    }
-    direction = request.GET.get("direction", "desc")
-    filtered.sort(key=sort_map.get(sort_key, sort_map["updated_at"]), reverse=direction == "desc")
-    return filtered
-
-
-def _random_alphanumeric(length=_RANDOM_ID_LENGTH):
-    return "".join(secrets.choice(_ALPHANUMERIC) for _ in range(length))
-
-
-def _direct_supplier_url(entry_url, used_ids=None):
-    used_ids = used_ids if used_ids is not None else set()
-
-    def new_id():
-        while True:
-            value = _random_alphanumeric()
-            if value not in used_ids:
-                used_ids.add(value)
-                return value
-
-    generated_url = entry_url
-    for placeholder in ("[%%pid%%]", "[#vq_tid#]", "[#vq_tuid#]"):
-        if placeholder in generated_url:
-            generated_url = generated_url.replace(placeholder, new_id())
-    return generated_url
+    return render(request, "surveys/status.html", {
+        **page,
+        "status_label": status_label,
+        "rid": rid,
+        "ip_address": ip_address,
+        "loi_seconds": attempt.loi_seconds if attempt else None,
+        "attempt_found": bool(attempt),
+    }, status=200 if attempt else 404)
 
 
-def _find_current_survey(company, survey_id):
-    surveys, _, _ = get_surveys()
-    return next(
-        (
-            row
-            for row in surveys
-            if row["company"].casefold() == company.casefold() and row["survey_id"] == survey_id
+@extend_schema_view(
+    list=extend_schema(
+        tags=["Surveys"],
+        summary="List synchronized surveys",
+        description=(
+            "Returns locally stored surveys using page-number pagination. Search matches project ID, InnovateMR survey ID, "
+            "survey name, country and category. Date filters accept ISO-8601 timestamps."
         ),
-        None,
+        parameters=[
+            OpenApiParameter("search", OpenApiTypes.STR, description="Free-text search across survey identifiers and descriptive fields."),
+            OpenApiParameter("ordering", OpenApiTypes.STR, description="One of source_modified_at, source_created_at, cpi, sample_size, completes, created_at; prefix '-' for descending."),
+            OpenApiParameter("page", OpenApiTypes.INT, description="1-based result page."),
+            OpenApiParameter("page_size", OpenApiTypes.INT, description="Rows per page (1–100, default 20)."),
+        ],
+    ),
+    retrieve=extend_schema(
+        tags=["Surveys"],
+        summary="Get one survey",
+        description="Looks up a survey by the platform's immutable 14-digit local_id and embeds current quotas and targeting questions.",
+    ),
+)
+class SurveyViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = Survey.objects.select_related("client").all().prefetch_related("quotas", "targeting_questions")
+    lookup_field = "local_id"
+    filterset_class = SurveyFilter
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    search_fields = ["local_id", "=source_id", "name", "company_name", "country", "country_code", "job_category"]
+    ordering_fields = ["source_modified_at", "source_created_at", "cpi", "sample_size", "completes", "created_at"]
+    ordering = ["-source_modified_at", "-created_at"]
+    permission_classes = [HasFunctionPermission]
+
+    def get_queryset(self):
+        return scope_surveys_for_user(super().get_queryset(), self.request.user)
+
+    def get_required_function_permission(self):
+        if self.action == "export":
+            return "projects.export"
+        return "survey_details.view" if self.action in {"retrieve", "quotas", "targeting"} else "projects.view"
+
+    def filter_queryset(self, queryset):
+        _enforce_query_permissions(self.request, {
+            "projects.filter.search": ("search",),
+            "projects.filter.country": ("country",),
+            "projects.filter.status": ("status",),
+            "projects.filter.client": ("company",),
+            "projects.filter.date": ("created_from", "created_to", "modified_from", "modified_to"),
+        })
+        cpi_ordering = self.request.query_params.get("ordering", "").lstrip("-") == "cpi"
+        cpi_filtering = any(self.request.query_params.get(name) not in {None, ""} for name in ("min_cpi", "max_cpi"))
+        if (cpi_ordering or cpi_filtering) and not has_function_access(self.request.user, "projects.filter.cpi"):
+            raise PermissionDenied("Your account cannot filter or sort projects by CPI.")
+        return super().filter_queryset(queryset)
+
+    def get_serializer_class(self):
+        return SurveyDetailSerializer if self.action == "retrieve" else SurveyListSerializer
+
+    @extend_schema(
+        tags=["Surveys"],
+        summary="Export all filtered projects",
+        description=(
+            "Downloads every survey matching the current Projects filters and ordering. Pagination is ignored, "
+            "and CSV columns follow the requesting user's project-column and link-copy permissions."
+        ),
+        parameters=[
+            OpenApiParameter("search", OpenApiTypes.STR, description="Search project ID, survey ID, name, country or category."),
+            OpenApiParameter("country", OpenApiTypes.STR, description="Comma-separated country codes."),
+            OpenApiParameter("status", OpenApiTypes.STR, description="Comma-separated survey statuses."),
+            OpenApiParameter("company", OpenApiTypes.STR, description="Comma-separated client/company names."),
+            OpenApiParameter("created_from", OpenApiTypes.DATETIME, description="Source-created timestamp lower bound."),
+            OpenApiParameter("created_to", OpenApiTypes.DATETIME, description="Source-created timestamp upper bound."),
+            OpenApiParameter("modified_from", OpenApiTypes.DATETIME, description="Source-modified timestamp lower bound."),
+            OpenApiParameter("modified_to", OpenApiTypes.DATETIME, description="Source-modified timestamp upper bound."),
+            OpenApiParameter("min_cpi", OpenApiTypes.NUMBER, description="Minimum CPI, inclusive."),
+            OpenApiParameter("max_cpi", OpenApiTypes.NUMBER, description="Maximum CPI, inclusive."),
+            OpenApiParameter("ordering", OpenApiTypes.STR, description="Current Projects ordering, including cpi or -cpi."),
+        ],
+        responses={(200, "text/csv"): OpenApiTypes.BINARY},
     )
+    @action(detail=False, methods=["get"], url_path="export")
+    def export(self, request, *args, **kwargs):
+        if not has_function_access(request.user, "projects.view"):
+            raise PermissionDenied("Project visibility is required before projects can be exported.")
+        queryset = self.filter_queryset(self.get_queryset())
+        columns = [column for column in _project_columns_for_user(request.user) if column != "actions"]
+        local_now = timezone.localtime()
+        response = StreamingHttpResponse(
+            _survey_csv_rows(queryset, request, columns),
+            content_type="text/csv; charset=utf-8",
+        )
+        response["Content-Disposition"] = f'attachment; filename="projects-{local_now:%Y%m%d-%H%M%S}-IST.csv"'
+        response["X-Content-Type-Options"] = "nosniff"
+        return response
 
+    @staticmethod
+    def _refresh_if_stale(survey, detail_type):
+        synced_at = survey.quota_synced_at if detail_type == "quotas" else survey.targeting_synced_at
+        stale = synced_at is None or (
+            survey.source_modified_at is not None and synced_at < survey.source_modified_at
+        )
+        if stale:
+            refresh = replace_survey_quotas if detail_type == "quotas" else replace_survey_targeting
+            refresh(InnovateMRClient(integration=survey.integration), survey)
 
-def _signed_start_url(request, survey):
-    token = signing.dumps(
-        {"company": survey["company"], "survey_id": survey["survey_id"]},
-        salt=LAUNCH_SIGNING_SALT,
-        compress=True,
+    @extend_schema(
+        tags=["Survey details"],
+        summary="List a survey's quotas",
+        description="Returns the most recently synchronized getQuotaForSurvey result for this survey.",
+        responses={200: SurveyQuotaSerializer(many=True)},
     )
-    return request.build_absolute_uri(reverse("surveys:survey_start", args=(token,)))
+    @action(detail=True, methods=["get"])
+    def quotas(self, request, local_id=None):
+        survey = self.get_object()
+        try:
+            self._refresh_if_stale(survey, "quotas")
+        except InnovateMRAPIError as exc:
+            if survey.quota_synced_at is None:
+                raise UpstreamUnavailable(str(exc)) from exc
+        return Response(SurveyQuotaSerializer(survey.quotas.all(), many=True).data)
+
+    @extend_schema(
+        tags=["Survey details"],
+        summary="List pre-screening questions and accepted answers",
+        description="Returns the most recently synchronized getSurveyTargeting result. Options preserve InnovateMR's source structure.",
+        responses={200: TargetingQuestionSerializer(many=True)},
+    )
+    @action(detail=True, methods=["get"], url_path="targeting")
+    def targeting(self, request, local_id=None):
+        survey = self.get_object()
+        try:
+            self._refresh_if_stale(survey, "targeting")
+        except InnovateMRAPIError as exc:
+            if survey.targeting_synced_at is None:
+                raise UpstreamUnavailable(str(exc)) from exc
+        return Response(TargetingQuestionSerializer(survey.targeting_questions.all(), many=True).data)
 
 
-def _tracked_flow_for_survey(survey):
-    return settings.SURVEY_TRACKED_FLOW_ENABLED and survey["company"].casefold() == "biobrain"
+class SyncTriggerView(APIView):
+    permission_classes = [HasFunctionPermission]
+    required_function_permission = "sync.run"
+    @extend_schema(
+        tags=["Synchronization"],
+        summary="Start an InnovateMR inventory synchronization",
+        description=(
+            "By default queues the same Celery task that beat runs every minute. Use wait=true for operational testing to run in the HTTP process "
+            "and receive counters immediately. The sync fetches both full and cursor-paged inventory, deduplicates by surveyId using modifiedDate, "
+            "and refreshes quota/targeting only for new or changed surveys."
+        ),
+        parameters=[OpenApiParameter("wait", OpenApiTypes.BOOL, description="Run synchronously and return the completed run summary.")],
+        request=None,
+        responses={200: SyncTriggerResponseSerializer, 202: OpenApiTypes.OBJECT},
+        examples=[OpenApiExample("Synchronous result", value={"run_id": 42, "status": "success", "created": 3, "updated": 8, "unchanged": 110, "closed": 2, "detail_failures": 0}, response_only=True)],
+    )
+    def post(self, request):
+        wait = str(request.query_params.get("wait", "false")).lower() in {"1", "true", "yes"}
+        if wait:
+            try:
+                summary = sync_surveys()
+            except InnovateMRAPIError as exc:
+                raise UpstreamUnavailable(str(exc)) from exc
+            return Response(SyncTriggerResponseSerializer(summary.__dict__).data)
+        task = sync_innovatemr_surveys_task.delay()
+        return Response({"task_id": task.id, "status": "queued"}, status=status.HTTP_202_ACCEPTED)
 
 
-def _launch_url_for_survey(request, survey, used_ids=None):
-    if _tracked_flow_for_survey(survey):
-        return _signed_start_url(request, survey)
-    return _direct_supplier_url(survey["entry_url"], used_ids)
+class SyncRunViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = SyncRun.objects.all()
+    serializer_class = SyncRunSerializer
+    filter_backends = [DjangoFilterBackend, filters.OrderingFilter]
+    filterset_fields = ["status"]
+    ordering_fields = ["started_at", "finished_at", "created", "updated", "detail_failures"]
+    ordering = ["-started_at"]
+    permission_classes = [HasFunctionPermission]
+    required_function_permission = "sync.view"
+
+    @extend_schema(tags=["Synchronization"], summary="List synchronization audit runs")
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+
+    @extend_schema(tags=["Synchronization"], summary="Get one synchronization audit run")
+    def retrieve(self, request, *args, **kwargs):
+        return super().retrieve(request, *args, **kwargs)
+
+
+@extend_schema_view(
+    list=extend_schema(
+        tags=["Survey attempts"],
+        summary="List respondent survey attempts",
+        description="Staff-only audit data for initiated pre-screeners, redirects, callbacks, IPs and measured LOI.",
+    ),
+    retrieve=extend_schema(
+        tags=["Survey attempts"],
+        summary="Get one respondent attempt by RID",
+        description="Staff-only detail including captured answers and outbound supplier URL.",
+    ),
+)
+class SurveyAttemptViewSet(viewsets.ReadOnlyModelViewSet):
+    serializer_class = SurveyAttemptSerializer
+    permission_classes = [HasFunctionPermission]
+    lookup_field = "rid"
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_class = SurveyAttemptFilter
+    search_fields = [
+        "rid", "user_id", "survey__local_id", "=survey__source_id", "survey__name", "survey__company_name",
+        "platform_user__username", "platform_user__first_name", "platform_user__last_name", "platform_user__email",
+        "initiation_ip", "callback_ip", "entry_browser", "entry_device", "entry_os",
+    ]
+    ordering_fields = ["initiated_at", "callback_at", "loi_seconds", "status"]
+    ordering = ["-initiated_at"]
+
+    def get_required_function_permission(self):
+        return "attempts.export" if self.action == "export" else "attempts.view"
+
+    def get_queryset(self):
+        queryset = SurveyAttempt.objects.select_related(
+            "survey", "platform_user", "platform_user__employee_profile", "platform_user__employee_profile__role",
+            "vendor", "vendor__employee_profile", "client", "client_allocation", "survey_allocation",
+        ).all()
+        if self.request.user.is_superuser:
+            return queryset
+        visible_user_ids = activity_visible_user_ids(self.request.user)
+        return queryset.filter(platform_user_id__in=visible_user_ids)
+
+    def filter_queryset(self, queryset):
+        _enforce_query_permissions(self.request, {
+            "studies.filter.search": ("search",),
+            "studies.filter.user": ("user",),
+            "studies.filter.status": ("status",),
+            "studies.filter.date": ("initiated_from", "initiated_to", "callback_from", "callback_to"),
+        })
+        return super().filter_queryset(queryset)
+
+    @extend_schema(
+        tags=["Survey attempts"],
+        summary="Export all filtered survey attempt data",
+        description=(
+            "Downloads every field associated with the currently filtered attempts, including user and survey "
+            "identifiers, entry/exit network metadata, client metadata, timestamps, answers and callback audit data."
+        ),
+        parameters=[
+            OpenApiParameter("search", OpenApiTypes.STR, description="Search RID, user, survey, IP or client metadata."),
+            OpenApiParameter("user", OpenApiTypes.STR, description="Comma-separated platform user IDs."),
+            OpenApiParameter("status", OpenApiTypes.STR, description="Comma-separated attempt status codes."),
+            OpenApiParameter("company", OpenApiTypes.STR, description="Comma-separated survey company names."),
+            OpenApiParameter("survey_id", OpenApiTypes.INT, description="Exact upstream survey ID."),
+            OpenApiParameter("internal_id", OpenApiTypes.STR, description="Exact internal 14-digit project ID."),
+            OpenApiParameter("entry_ip", OpenApiTypes.STR, description="Exact entry IP address."),
+            OpenApiParameter("exit_ip", OpenApiTypes.STR, description="Exact exit IP address."),
+            OpenApiParameter("initiated_from", OpenApiTypes.DATETIME, description="Entry timestamp lower bound (ISO 8601)."),
+            OpenApiParameter("initiated_to", OpenApiTypes.DATETIME, description="Entry timestamp upper bound (ISO 8601)."),
+            OpenApiParameter("callback_from", OpenApiTypes.DATETIME, description="Exit timestamp lower bound (ISO 8601)."),
+            OpenApiParameter("callback_to", OpenApiTypes.DATETIME, description="Exit timestamp upper bound (ISO 8601)."),
+            OpenApiParameter("ordering", OpenApiTypes.STR, description="Sort by initiated_at, callback_at, loi_seconds or status; prefix - for descending."),
+        ],
+        responses={(200, "text/csv"): OpenApiTypes.BINARY},
+    )
+    @action(detail=False, methods=["get"], url_path="export")
+    def export(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+        local_now = timezone.localtime()
+        response = StreamingHttpResponse(
+            _attempt_csv_rows(queryset, request.user),
+            content_type="text/csv; charset=utf-8",
+        )
+        response["Content-Disposition"] = f'attachment; filename="studies-{local_now:%Y%m%d-%H%M%S}-IST.csv"'
+        response["X-Content-Type-Options"] = "nosniff"
+        return response
+
+
+class UserHitsAPIView(APIView):
+    permission_classes = [HasFunctionPermission]
+    required_function_permission = "user_hits.view"
+
+    @extend_schema(
+        tags=["User hits"],
+        summary="Aggregate user survey hits and completes by IST date and device",
+        description=(
+            "Returns one row per visible user and IST calendar date. Hits count initiated survey attempts; "
+            "completes count status 1 within those attempts. Device splits use entry-device audit data."
+        ),
+        parameters=[
+            OpenApiParameter("search", OpenApiTypes.STR, description="Search user, email, branch or sub-branch."),
+            OpenApiParameter("user", OpenApiTypes.STR, description="Comma-separated platform user IDs."),
+            OpenApiParameter("branch", OpenApiTypes.STR, description="Comma-separated branch/company labels."),
+            OpenApiParameter("sub_branch", OpenApiTypes.STR, description="Comma-separated sub-branch/department labels."),
+            OpenApiParameter("from_date", OpenApiTypes.DATE, description="Inclusive IST entry date."),
+            OpenApiParameter("to_date", OpenApiTypes.DATE, description="Inclusive IST entry date."),
+            OpenApiParameter("from_time", OpenApiTypes.TIME, description="Optional inclusive IST start time; requires from_date."),
+            OpenApiParameter("to_time", OpenApiTypes.TIME, description="Optional inclusive IST end time; requires to_date."),
+            OpenApiParameter("page", OpenApiTypes.INT, description="1-based aggregate result page."),
+            OpenApiParameter("page_size", OpenApiTypes.INT, description="Rows per page, 1–100."),
+        ],
+        responses={200: UserHitsResponseSerializer},
+    )
+    def get(self, request):
+        _enforce_query_permissions(request, {
+            "user_hits.filter.search": ("search",),
+            "user_hits.filter.user": ("user",),
+            "user_hits.filter.branch": ("branch",),
+            "user_hits.filter.sub_branch": ("sub_branch",),
+            "user_hits.filter.date": ("from_date", "from_time", "to_date", "to_time"),
+        })
+        try:
+            rows, summary = aggregate_user_hits(request.user, request.query_params)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        paginator = SurveyPagination()
+        page = paginator.paginate_queryset(rows, request, view=self)
+        response = paginator.get_paginated_response(page)
+        response.data["summary"] = summary
+        return response
 
 
 class _CsvEcho:
@@ -140,342 +831,106 @@ class _CsvEcho:
         return value
 
 
-@login_required
-@require_GET
-def survey_api(request):
-    try:
-        surveys, fetched_at, stale = get_surveys(force=request.GET.get("refresh") == "1")
-    except FeedError as exc:
-        return JsonResponse({"status": "error", "message": str(exc)}, status=502)
+def _csv_safe(value):
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    elif hasattr(value, "isoformat"):
+        value = timezone.localtime(value).isoformat() if timezone.is_aware(value) else value.isoformat()
+    else:
+        value = str(value)
+    return f"'{value}" if value.startswith(("=", "+", "-", "@")) else value
 
-    countries = sorted({row["country"] for row in surveys}, key=str.casefold)
-    clients = sorted({row["company"] for row in surveys}, key=str.casefold)
-    filtered = _filter_and_sort_surveys(request, surveys)
 
-    page_size = _positive_int(request.GET.get("page_size"), 20, 100)
-    total = len(filtered)
-    total_pages = max(1, math.ceil(total / page_size))
-    page = min(_positive_int(request.GET.get("page"), 1, total_pages), total_pages)
-    start = (page - 1) * page_size
-    page_rows = filtered[start : start + page_size]
-
-    cpis = [row["payout"] for row in filtered]
-    return JsonResponse(
-        {
-            "status": "success",
-            "surveys": page_rows,
-            "filters": {"countries": countries, "clients": clients},
-            "pagination": {
-                "page": page,
-                "page_size": page_size,
-                "total": total,
-                "total_pages": total_pages,
-                "start": start + 1 if total else 0,
-                "end": min(start + page_size, total),
-            },
-            "summary": {
-                "all_surveys": len(surveys),
-                "filtered_surveys": total,
-                "country_count": len({row["country"] for row in filtered}),
-                "client_count": len({row["company"] for row in filtered}),
-                "average_cpi": round(sum(cpis) / len(cpis), 3) if cpis else 0,
-            },
-            "live": {
-                "fetched_at": fetched_at.isoformat() if fetched_at else None,
-                "stale": stale,
-            },
+def _survey_csv_rows(queryset, request, columns):
+    headers_by_column = {
+        "project_id": ["Project ID"],
+        "survey": ["Survey ID", "Survey name", "Client"],
+        "market": ["Country code", "Country", "Language code", "Language"],
+        "completes": ["Sample size", "Completes", "Remaining", "Progress (%)"],
+        "cpi": ["CPI"],
+        "loi_ir": ["LOI (minutes)", "Incidence rate (%)"],
+        "entry_link": ["Entry link"],
+        "modified": ["Status", "Source created at", "Source modified at", "Record created at", "Record updated at"],
+    }
+    export_columns = [column for column in columns if column in headers_by_column]
+    headers = [header for column in export_columns for header in headers_by_column[column]]
+    writer = csv.writer(_CsvEcho())
+    yield "\ufeff" + writer.writerow(headers)
+    serializer_context = {"request": request}
+    for survey in queryset.iterator(chunk_size=500):
+        data = SurveyListSerializer(survey, context=serializer_context).data
+        values_by_column = {
+            "project_id": [data.get("local_id")],
+            "survey": [
+                data.get("source_id"), data.get("name"),
+                data.get("display_company_name") or data.get("client_name") or data.get("company_name"),
+            ],
+            "market": [data.get("country_code"), data.get("country"), data.get("language_code"), data.get("language")],
+            "completes": [data.get("sample_size"), data.get("completes"), data.get("remaining"), data.get("progress_percent")],
+            "cpi": [data.get("cpi")],
+            "loi_ir": [data.get("loi"), data.get("incidence_rate")],
+            "entry_link": [data.get("start_link")],
+            "modified": [
+                data.get("status"), data.get("source_created_at"), data.get("source_modified_at"),
+                data.get("created_at"), data.get("updated_at"),
+            ],
         }
-    )
+        values = [value for column in export_columns for value in values_by_column[column]]
+        yield writer.writerow([_csv_safe(value) for value in values])
 
 
-@login_required
-@require_GET
-def survey_questions(request):
-    company = request.GET.get("company", "").strip()
-    survey_id = request.GET.get("survey_id", "").strip()
-    if not company or not survey_id or len(company) > 80 or len(survey_id) > 160:
-        return JsonResponse({"status": "error", "message": "A valid client and survey ID are required."}, status=400)
-
-    try:
-        survey = _find_current_survey(company, survey_id)
-    except FeedError as exc:
-        return JsonResponse({"status": "error", "message": str(exc)}, status=502)
-    if survey is None:
-        return JsonResponse({"status": "error", "message": "This survey is no longer available."}, status=404)
-
-    try:
-        payload = get_survey_questions(survey, force=request.GET.get("refresh") == "1")
-    except FeedError as exc:
-        return JsonResponse({"status": "error", "message": str(exc)}, status=502)
-    return JsonResponse({"status": "success", **payload})
-
-
-@login_required
-@require_POST
-def survey_launch_link(request):
-    try:
-        body = json.loads(request.body or b"{}")
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return JsonResponse({"status": "error", "message": "Invalid request."}, status=400)
-    if not isinstance(body, dict):
-        return JsonResponse({"status": "error", "message": "Invalid request."}, status=400)
-    company = str(body.get("company", "")).strip()
-    survey_id = str(body.get("survey_id", "")).strip()
-    if not company or not survey_id or len(company) > 80 or len(survey_id) > 160:
-        return JsonResponse({"status": "error", "message": "A valid client and survey ID are required."}, status=400)
-    try:
-        survey = _find_current_survey(company, survey_id)
-    except FeedError as exc:
-        return JsonResponse({"status": "error", "message": str(exc)}, status=502)
-    if survey is None:
-        return JsonResponse({"status": "error", "message": "This survey is no longer available."}, status=404)
-    return JsonResponse(
-        {
-            "status": "success",
-            "launch_url": _launch_url_for_survey(request, survey),
-            "tracked": _tracked_flow_for_survey(survey),
-        }
-    )
-
-
-@login_required
-@require_GET
-def survey_export(request):
-    try:
-        surveys, _, _ = get_surveys(force=request.GET.get("refresh") == "1")
-    except FeedError as exc:
-        return JsonResponse({"status": "error", "message": str(exc)}, status=502)
-
-    filtered = _filter_and_sort_surveys(request, surveys)
-    writer = csv.writer(_CsvEcho(), lineterminator="\r\n")
-    generated_ids = set()
-
-    def csv_rows():
-        yield "\ufeff"
-        yield writer.writerow(["Survey ID", "Client", "Country", "CPI", "Updated", "Placement ID", "Entry URL"])
-        for survey in filtered:
-            yield writer.writerow(
-                [
-                    survey["survey_id"],
-                    survey["company"],
-                    survey["country"],
-                    f"{survey['payout']:.3f}".rstrip("0").rstrip("."),
-                    survey.get("updated_at") or "",
-                    survey["placement_id"],
-                    _launch_url_for_survey(request, survey, generated_ids),
-                ]
-            )
-
-    filename = f"surveys-{timezone.now().date().isoformat()}.csv"
-    response = StreamingHttpResponse(csv_rows(), content_type="text/csv; charset=utf-8")
-    response["Content-Disposition"] = f'attachment; filename="{filename}"'
-    response["X-Exported-Count"] = str(len(filtered))
-    return response
-
-
-def _launch_payload(token):
-    return signing.loads(
-        token,
-        salt=LAUNCH_SIGNING_SALT,
-        max_age=settings.SURVEY_LAUNCH_MAX_AGE_SECONDS,
-    )
-
-
-def _result_context(title, message, icon="!", tone="warning"):
-    return {"title": title, "message": message, "icon": icon, "tone": tone}
-
-
-def _render_launch_error(request, message, status=400):
-    return render(
-        request,
-        "surveys/participant_end.html",
-        {"result": _result_context("This survey link is unavailable", message), "session": None},
-        status=status,
-    )
-
-
-def _question_answers(request, questions):
-    answers = {}
-    for index, question in enumerate(questions, start=1):
-        question_key = str(question.get("id") or index)
-        values = [value.strip() for value in request.POST.getlist(f"question_{question_key}") if value.strip()]
-        if not values:
-            return None
-        answers[question_key] = {
-            "code": str(question.get("code") or ""),
-            "text": str(question.get("text") or ""),
-            "values": values,
-        }
-    return answers
-
-
-def _supplier_entry_url(survey, transaction_id, respondent_id, questions, answers):
-    entry_url = survey["entry_url"]
-    transaction_placeholders = ("[#vq_tid#]", "[%%token%%]")
-    respondent_placeholders = ("[#vq_tuid#]", "[%%vendor_user_id%%]")
-    for placeholder in transaction_placeholders:
-        entry_url = entry_url.replace(placeholder, transaction_id)
-    for placeholder in respondent_placeholders:
-        entry_url = entry_url.replace(placeholder, respondent_id)
-
-    parts = urlsplit(entry_url)
-    query = parse_qsl(parts.query, keep_blank_values=True)
-    existing_keys = {key.casefold() for key, _ in query}
-    if "vq_token" not in existing_keys:
-        query.append(("vq_token", transaction_id))
-    if "vq_uid" not in existing_keys:
-        query.append(("vq_uid", respondent_id))
-
-    question_map = {str(question.get("id") or index): question for index, question in enumerate(questions, start=1)}
-    for question_key, answer in answers.items():
-        values = answer["values"]
-        question = question_map.get(question_key, {})
-        code = str(question.get("code") or "").strip().upper()
-        if code == "AGE" and len(values) == 1 and values[0].isdigit():
-            query.append(("age", values[0]))
-        elif code in {"GENDER", "SEX"} and len(values) == 1:
-            query.append(("gender", values[0]))
-        elif code in {"ZIP", "ZIPCODE", "POSTCODE", "POSTALCODE"} and len(values) == 1:
-            query.append(("zip", values[0]))
-        elif question_key:
-            query.append((f"Q{question_key}", ",".join(values)))
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
-
-
-def _create_session(survey, questions, answers):
-    for _ in range(8):
-        transaction_id = _random_alphanumeric()
-        respondent_id = _random_alphanumeric()
-        if transaction_id == respondent_id:
-            continue
-        entry_url = _supplier_entry_url(survey, transaction_id, respondent_id, questions, answers)
-        try:
-            return SurveySession.objects.create(
-                client=survey["company"],
-                survey_id=survey["survey_id"],
-                transaction_id=transaction_id,
-                respondent_id=respondent_id,
-                entry_url=entry_url,
-                status=SurveySession.Status.HANDED_OFF,
-                prescreener_answers=answers,
-                handed_off_at=timezone.now(),
-            )
-        except IntegrityError:
-            continue
-    raise RuntimeError("Could not allocate a unique survey session.")
-
-
-@require_http_methods(["GET", "POST"])
-def survey_start(request, token):
-    if not settings.SURVEY_TRACKED_FLOW_ENABLED:
-        raise Http404("Tracked survey flow is disabled.")
-    try:
-        payload = _launch_payload(token)
-    except signing.SignatureExpired:
-        return _render_launch_error(request, "This link has expired. Please request a fresh survey link.", status=410)
-    except signing.BadSignature:
-        return _render_launch_error(request, "This link is invalid. Please request a fresh survey link.", status=400)
-
-    company = str(payload.get("company", ""))
-    survey_id = str(payload.get("survey_id", ""))
-    try:
-        survey = _find_current_survey(company, survey_id)
-    except FeedError:
-        return _render_launch_error(request, "The live study feed is temporarily unavailable. Please try again shortly.", status=503)
-    if survey is None:
-        return _render_launch_error(request, "This study is no longer accepting participants.", status=410)
-    if survey["company"].casefold() != "biobrain":
-        return _render_launch_error(request, "This tracked start page is only available for BioBrain studies.", status=400)
-
-    try:
-        question_payload = get_survey_questions(survey)
-        questions = question_payload.get("questions", [])
-    except FeedError:
-        return _render_launch_error(request, "Eligibility questions are temporarily unavailable. Please try again shortly.", status=503)
-
-    form_error = ""
-    if request.method == "POST":
-        answers = _question_answers(request, questions)
-        if request.POST.get("consent") != "yes" or answers is None:
-            form_error = "Please answer every question and confirm your consent before continuing."
-        else:
-            try:
-                session = _create_session(survey, questions, answers)
-            except RuntimeError:
-                return _render_launch_error(request, "A secure session could not be created. Please try again.", status=503)
-            return HttpResponse(status=303, headers={"Location": session.entry_url})
-    return render(
-        request,
-        "surveys/participant_start.html",
-        {"survey": survey, "questions": questions, "form_error": form_error},
-        status=400 if form_error else 200,
-    )
-
-
-RETURN_STATUSES = {
-    "s1": (
-        SurveySession.Status.COMPLETE,
-        _result_context("Survey complete", "Thank you. Your completed response has been recorded successfully.", "OK", "success"),
-    ),
-    "s2": (
-        SurveySession.Status.TERMINATE,
-        _result_context("Study not matched", "Thank you for your time. Your profile did not match this study's requirements.", "-", "warning"),
-    ),
-    "s3": (
-        SurveySession.Status.QUOTA_FULL,
-        _result_context("Quota already full", "Thank you for trying. This study reached its required number of participants.", "!", "warning"),
-    ),
-    "s4": (
-        SurveySession.Status.SECURITY_TERMINATE,
-        _result_context("Response could not be accepted", "The survey's security checks could not validate this response.", "X", "danger"),
-    ),
-}
-
-
-def _first_query_value(request, names):
-    for name in names:
-        value = request.GET.get(name, "").strip()
-        if value:
-            return value
-    return ""
-
-
-@require_GET
-def survey_return(request, status_code):
-    if not settings.SURVEY_TRACKED_FLOW_ENABLED:
-        raise Http404("Tracked survey flow is disabled.")
-    mapped = RETURN_STATUSES.get(status_code.casefold())
-    if mapped is None:
-        return _render_launch_error(request, "This return status is not recognized.", status=404)
-    status_value, result = mapped
-    transaction_id = _first_query_value(request, ("vq_token", "token", "vq_tid"))
-    respondent_id = _first_query_value(request, ("vq_uid", "vendor_user_id", "vq_tuid"))
-    if not transaction_id or not respondent_id:
-        return _render_launch_error(request, "The survey provider did not return the required session identifiers.", status=400)
-    if len(transaction_id) > 64 or len(respondent_id) > 64:
-        return _render_launch_error(request, "The returned session identifiers are invalid.", status=400)
-
-    with transaction.atomic():
-        session = (
-            SurveySession.objects.select_for_update()
-            .filter(transaction_id=transaction_id, respondent_id=respondent_id)
-            .first()
-        )
-        if session is None:
-            return _render_launch_error(request, "This survey session could not be matched.", status=404)
-        terminal_statuses = {
-            SurveySession.Status.COMPLETE,
-            SurveySession.Status.TERMINATE,
-            SurveySession.Status.QUOTA_FULL,
-            SurveySession.Status.SECURITY_TERMINATE,
-        }
-        if session.status not in terminal_statuses:
-            session.status = status_value
-            session.returned_at = timezone.now()
-            session.supplier_status_id = _first_query_value(request, ("status", "status_id"))[:80]
-            session.save(update_fields=("status", "returned_at", "supplier_status_id"))
-        else:
-            result = RETURN_STATUSES[
-                next(code for code, (saved_status, _) in RETURN_STATUSES.items() if saved_status == session.status)
-            ][1]
-    return render(request, "surveys/participant_end.html", {"result": result, "session": session})
+def _attempt_csv_rows(queryset, requesting_user=None):
+    headers = [
+        "Respondent ID (RID)", "Status code", "Status", "Status source", "Platform user ID", "Username", "Employee name",
+        "Email", "Employee ID", "Account type", "Role", "Vendor ID", "Vendor name", "Vendor account type",
+        "Client ID", "Client name", "Client allocation ID", "Survey allocation ID",
+        "Internal project ID", "Survey ID", "Survey name", "Company", "Country", "Language", "Supplier code",
+        "Current survey CPI", "Source CPI snapshot", "CPI cut snapshot (%)", "Payable CPI snapshot",
+        "CPI currency snapshot", "Expected LOI (minutes)",
+        "Actual LOI (seconds)", "Entry IP", "Exit IP", "Entry browser", "Exit browser", "Entry device",
+        "Exit device", "Entry OS", "Exit OS", "Entry user agent", "Exit user agent", "Entry referrer",
+        "Entry accept language", "Initiated at (IST)", "Pre-screener submitted at (IST)",
+        "Redirected at (IST)", "First callback at (IST)", "Last callback at (IST)", "Callback count",
+        "Verified", "Last upstream check (IST)", "Upstream transaction", "Pre-screener answers",
+        "Outbound supplier URL", "Entry client metadata", "Exit client metadata", "Record created at (IST)",
+        "Record updated at (IST)",
+    ]
+    writer = csv.writer(_CsvEcho())
+    yield "\ufeff" + writer.writerow(headers)
+    hide_source_cpi = is_external_vendor_scope(requesting_user)
+    for attempt in queryset.iterator(chunk_size=1000):
+        user = attempt.platform_user
+        profile = getattr(user, "employee_profile", None) if user else None
+        role = getattr(profile, "role", None) if profile else None
+        vendor = attempt.vendor
+        vendor_profile = getattr(vendor, "employee_profile", None) if vendor else None
+        survey = attempt.survey
+        values = [
+            attempt.rid, attempt.status,
+            "Initiated" if attempt.status in {SurveyAttempt.Status.INITIATED, SurveyAttempt.Status.REDIRECTED} else attempt.get_status_display(),
+            attempt.status_source, user.pk if user else attempt.user_id,
+            user.username if user else "", (user.get_full_name() or user.username) if user else "Deleted user",
+            user.email if user else "", getattr(profile, "employee_id", ""),
+            profile.get_account_type_display() if profile else "", role.name if role else "",
+            vendor.pk if vendor else "", (vendor.get_full_name() or vendor.username) if vendor else "",
+            vendor_profile.get_account_type_display() if vendor_profile else "",
+            attempt.client_id, attempt.client.name if attempt.client else "", attempt.client_allocation_id,
+            attempt.survey_allocation_id,
+            survey.local_id, survey.source_id, survey.name, survey.company_name, survey.country_code,
+            survey.language_code, attempt.supplier_code,
+            "" if hide_source_cpi else survey.cpi,
+            "" if hide_source_cpi else attempt.source_cpi_snapshot,
+            attempt.cpi_cut_percent_snapshot, attempt.payable_cpi_snapshot, attempt.cpi_currency_snapshot,
+            survey.loi, attempt.loi_seconds,
+            attempt.initiation_ip, attempt.callback_ip, attempt.entry_browser, attempt.exit_browser,
+            attempt.entry_device, attempt.exit_device, attempt.entry_os, attempt.exit_os,
+            attempt.entry_user_agent, attempt.exit_user_agent, attempt.entry_referrer,
+            attempt.entry_accept_language, attempt.initiated_at, attempt.submitted_at, attempt.redirected_at,
+            attempt.callback_at, attempt.last_callback_at, attempt.callback_count, attempt.is_verified,
+            attempt.upstream_checked_at, attempt.upstream_transaction_data, attempt.answers, attempt.outbound_url,
+            attempt.entry_client_data, attempt.exit_client_data,
+            attempt.created_at, attempt.updated_at,
+        ]
+        yield writer.writerow([_csv_safe(value) for value in values])

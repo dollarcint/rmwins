@@ -1,0 +1,17 @@
+[Unit]
+Description=Alessar React frontend on private port 8092
+After=network.target
+
+[Service]
+Type=simple
+User=aless4284
+Group=aless4284
+ExecStartPre=/usr/sbin/nginx -t -e stderr -c /home/alessarsolutions.in/alessarsolutions/deploy/cyberpanel/frontend-nginx.conf
+ExecStart=/usr/sbin/nginx -e stderr -c /home/alessarsolutions.in/alessarsolutions/deploy/cyberpanel/frontend-nginx.conf -g "daemon off;"
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

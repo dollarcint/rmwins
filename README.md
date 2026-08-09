@@ -33,6 +33,10 @@ Copy `frontend/.env.example` to `frontend/.env.local` when a different dashboard
 
 ## Deployment
 
-Create a Render Blueprint from the repository-level `render.yaml`. It provisions the frontend static site, Django web service, and PostgreSQL database. Set `DJANGO_SUPERUSER_PASSWORD`, `INNOVATEMR_ACCESS_TOKEN`, and `VOQALL_ACCESS_KEY` as secret environment variables during Blueprint creation. Connect `api.alessarsolutions.in` as the backend custom domain after the first successful deployment.
+Production uses one CyberPanel VPS and one public IP with two isolated website users:
 
-The dashboard combines the live InnovateMR and Voqall survey inventories. Voqall market codes are resolved from its `/collection/languages` endpoint so the country filter stays accurate. Supplier credentials must never be committed to Git.
+- `alessarsolutions.in`: React static build owned by the frontend website user.
+- `api.alessarsolutions.in`: Django, Gunicorn and Celery owned by the backend website user.
+- OpenLiteSpeed, MySQL/MariaDB and Redis are shared server services.
+
+Follow [the complete CyberPanel runbook](deploy/cyberpanel/README.md). Supplier credentials and production environment files must never be committed to Git. The repository-level `render.yaml` remains available as an optional Render deployment.

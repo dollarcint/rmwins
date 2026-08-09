@@ -1,46 +1,132 @@
-# SurveyBoard
+# Survey Workspace
 
-An authenticated Django dashboard that combines live InnovateMR and BioBrain inventory with client, full-country, CPI, updated-date, and text filters.
+Django-based internal survey workspace that synchronizes live InnovateMR Supplier API inventory, stores it locally, and exposes responsive Projects UI plus a documented REST API.
 
-## Run locally
+Hostinger Ubuntu VPS deployment with MySQL, Nginx, Gunicorn, Redis and Celery is covered in [`deploy/README.md`](deploy/README.md).
+
+## What is included
+
+- Dashboard placeholder and responsive Projects workspace matching the supplied table reference.
+- Full and cursor-paged InnovateMR inventory ingestion.
+- Deterministic merge by `surveyId`; the payload with the newest `modifiedDate` wins.
+- Immutable 14-digit project IDs in `YYYYMM########` format, for example `20260800000001`.
+- Quota and survey-targeting/pre-screening persistence with stale-data refresh.
+- Environment-configurable Celery Beat jobs (60-second defaults) for inventory and bounded detail refresh.
+- Search, multi-select company/market/status filters, date/CPI filters, ordering, pagination, and mobile survey cards.
+- Direct survey detail drawer with equal-width Pre-screening and Quota tabs.
+- Dynamic respondent pre-screener with 10-character RID, answer capture, supplier redirect, four callback outcomes, IP tracking and measured LOI.
+- Session login plus dynamic role/function access control with per-user allow and deny overrides.
+- UAT vendor operations workspace with internal/external policy, client visibility, quantity limits, CPI cuts and optional survey overrides.
+- Transactional allocation reservation at respondent start, terminal consume/release and scheduled abandoned-reservation expiry.
+- Swagger UI, ReDoc, downloadable OpenAPI schema, Django Admin, sync audit records, and automated tests.
+
+## Local setup
 
 ```powershell
 python -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+python manage.py migrate
 python manage.py runserver
 ```
 
-Open http://127.0.0.1:8000/. The browser refreshes the inventory every 30 seconds; the Django backend keeps a short 12-second cache to avoid duplicate upstream requests.
+Set `INNOVATEMR_API_TOKEN` in `.env` before synchronizing. The credential is only read by Django and is never returned to browser code.
 
-## Configuration
+Open:
 
-Set these supplier secrets in the environment:
+- Projects UI: `http://127.0.0.1:8000/projects/`
+- Dashboard: `http://127.0.0.1:8000/dashboard/`
+- Swagger: `http://127.0.0.1:8000/api/docs/`
+- ReDoc: `http://127.0.0.1:8000/api/redoc/`
+- Admin: `http://127.0.0.1:8000/admin/`
 
-- `INNOVATEMR_ACCESS_TOKEN`: InnovateMR supplier access token.
-- `VOQALL_ACCESS_KEY`: Voqall partner access key.
+Run one sync without Celery:
 
-Optional settings:
+```powershell
+python manage.py sync_surveys
+```
 
-- `INNOVATEMR_SURVEY_URL`, `VOQALL_SURVEY_URL`, `VOQALL_LANGUAGES_URL`: override supplier endpoints.
-- `SURVEY_FEED_TIMEOUT`: upstream timeout in seconds (default `15`).
-- `SURVEY_CACHE_SECONDS`: backend cache duration (default `12`).
-- `DJANGO_SECRET_KEY`, `DJANGO_DEBUG`, `DJANGO_ALLOWED_HOSTS`: standard deployment settings.
+## Scheduled jobs
 
-By default, **Copy link** and CSV export return direct supplier URLs. InnovateMR `[%%pid%%]` and BioBrain `[#vq_tid#]` / `[#vq_tuid#]` placeholders are replaced server-side with distinct cryptographically random 24-character alphanumeric values.
+Start Redis, then run these in separate terminals. On Windows, Celery's solo pool is the most reliable local option.
 
-The eye action beside each survey link loads that survey's live InnovateMR targeting or BioBrain qualifications on demand. Question responses are cached briefly to keep the dashboard responsive.
+```powershell
+celery -A config worker --loglevel=info --pool=solo
+celery -A config beat --loglevel=info
+```
 
+Beat schedules four independent jobs every minute by default:
 
-## Dormant BioBrain tracked respondent flow
+1. `surveys.sync_innovatemr_surveys` fetches both inventory endpoints, merges them, upserts current rows, and closes surveys no longer present.
+2. `surveys.refresh_stale_details` refreshes a bounded batch of quotas and targeting. `INNOVATEMR_DETAIL_REFRESH_BATCH` controls the batch size.
+3. `surveys.reconcile_pending_attempts` checks redirected attempts whose legacy client return URL has not called this application.
+4. `vendors.expire_allocation_reservations` releases capacity held by abandoned vendor attempts after the configured TTL.
 
-This preserved flow is disabled by default. Set `SURVEY_TRACKED_FLOW_ENABLED=true` to reactivate the pre-screener, return pages, and Sessions navigation. When enabled, dashboard `Copy link` creates a signed Alessar start URL for BioBrain studies. The public start page loads the live pre-screener, generates a unique 24-character `vq_token` and `vq_uid` when submitted, records the handoff in `SurveySession`, and redirects the respondent to BioBrain.
+Opening Quota or Pre-screening in the UI also refreshes that survey immediately when its cached details are older than its source `modifiedDate`. Cached details remain available during a temporary upstream outage.
 
-Configure these browser redirect URLs in the BioBrain supplier account:
+## REST API
 
-- Complete: `https://api.alessarsolutions.in/survey/return/s1/?vq_token=[%%token%%]&vq_uid=[%%vendor_user_id%%]&status_id=[%%status_id%%]`
-- Terminate: `https://api.alessarsolutions.in/survey/return/s2/?vq_token=[%%token%%]&vq_uid=[%%vendor_user_id%%]&status_id=[%%status_id%%]`
-- Overquota: `https://api.alessarsolutions.in/survey/return/s3/?vq_token=[%%token%%]&vq_uid=[%%vendor_user_id%%]&status_id=[%%status_id%%]`
-- Security terminate: `https://api.alessarsolutions.in/survey/return/s4/?vq_token=[%%token%%]&vq_uid=[%%vendor_user_id%%]&status_id=[%%status_id%%]`
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/v1/surveys/` | Paginated, searchable survey inventory |
+| `GET` | `/api/v1/surveys/{local_id}/` | One survey with stored quotas and targeting |
+| `GET` | `/api/v1/surveys/{local_id}/quotas/` | Current quota definitions |
+| `GET` | `/api/v1/surveys/{local_id}/targeting/` | Pre-screening questions and accepted options |
+| `POST` | `/api/v1/sync/` | Queue an inventory sync |
+| `POST` | `/api/v1/sync/?wait=true` | Run a synchronous operational sync |
+| `GET` | `/api/v1/sync-runs/` | Sync audit history |
+| `GET` | `/api/v1/survey-attempts/` | Staff-only RID, answers, status, IP and LOI audit |
+| CRUD | `/api/v1/vendors/commercial-profiles/` | Internal/external vendor CPI policy |
+| CRUD | `/api/v1/vendors/client-allocations/` | Vendor client visibility and total quantity |
+| CRUD | `/api/v1/vendors/survey-allocations/` | Optional per-survey limit or CPI override |
+| CRUD | `/api/v1/vendors/api-keys/` | Issue/revoke hashed external-vendor API credentials (plaintext returned once) |
+| `GET` | `/api/v1/vendors/reservations/` | Reservation lifecycle audit |
+| CRUD | `/api/v1/access/roles/` | Roles and their explicit function assignments |
+| CRUD | `/api/v1/access/functions/` | Function permission catalog |
+| CRUD | `/api/v1/access/users/` | Employee accounts, role and individual allow/deny overrides |
+| `GET` | `/api/schema/` | OpenAPI 3 schema |
 
-Tracked results are visible at `/admin/surveys/surveysession/`. The first terminal return wins, so a later callback cannot overwrite an already recorded result.
+The interactive docs describe every query parameter, response object, enum, pagination envelope, and nested detail shape.
+
+## Respondent pre-screener flow
+
+Create an attempt by opening a validated survey link:
+
+```text
+/survey/start?surveyId=32655971&userId=294&code=20260800000001
+```
+
+The server validates that `surveyId` and the 14-digit internal `code` identify the same live survey, creates a cryptographically random 10-character RID containing uppercase, lowercase and numeric characters, stores `initiated_at` plus the request IP, and redirects to the canonical `/survey/start?rid=...` form.
+
+The Projects table's **Copy link** button returns this platform pre-screener URL with a `[%%userId%%]` placeholder. The InnovateMR `entryLink` remains server-side redirect data and is used only after the pre-screener is submitted.
+
+On submit it stores question answers, takes the exact InnovateMR `entryLink`, replaces its PID with RID, adds `trackId=RID` and available `QuestionKey=OptionId` values, marks the attempt redirected, and sends the browser to InnovateMR.
+
+Configure these four return outcomes with InnovateMR (use the deployed HTTPS hostname in production):
+
+```text
+/survey?status=1&rid=%%pid%%   # Completed
+/survey?status=2&rid=%%pid%%   # Terminated
+/survey?status=3&rid=%%pid%%   # Over quota
+/survey?status=4&rid=%%pid%%   # Quality terminated
+```
+
+Each callback captures its first arrival time, callback IP, callback count and LOI in seconds from `initiated_at`. Browser callbacks remain `is_verified=false`; a trusted InnovateMR S2S notification or redirect hash must verify them before financial reconciliation.
+
+## Multi-client API integrations
+
+Open `/client-integrations/` with the `clients.view` permission. Managers can create clients and connections, save a write-only encrypted API token, configure the supplier code and one-minute-or-longer schedule, test credentials, and queue an immediate sync. Celery Beat dispatches only integrations that are due; survey identity is unique by `(integration, source_id)`.
+
+Set a stable `INTEGRATION_CREDENTIAL_ENCRYPTION_KEY` before storing UI credentials. Changing a token immediately clears supplier links and cached upstream data for that integration only; saving the same token preserves them. `credential_env_key` remains supported for legacy deployments.
+
+## Verification
+
+```powershell
+python manage.py check
+python manage.py test
+python manage.py spectacular --file schema.yml --validate
+python manage.py collectstatic --noinput
+```
+
+See [architecture](docs/architecture.md) and [synchronization runbook](docs/synchronization.md) for the internal design and operations contract.

@@ -1,324 +1,888 @@
-import json
-import re
-from datetime import datetime, timezone
-from unittest.mock import patch
-from urllib.parse import urlsplit
+import csv
+from datetime import datetime, time, timedelta
+from io import StringIO
+from unittest.mock import Mock, patch
+from urllib.parse import parse_qs, urlsplit
+from zoneinfo import ZoneInfo
 
+from django.test import TestCase, override_settings
 from django.contrib.auth import get_user_model
-from django.test import SimpleTestCase, TestCase, override_settings
+from django.urls import reverse
+from django.utils import timezone
+from rest_framework.test import APIClient
 
-from . import services
-from .models import SurveySession
-from .services import FeedError, normalize_innovatemr_question, normalize_innovatemr_survey, normalize_voqall_survey
+from accounts.models import AccessFunction, EmployeeProfile, Role, UserFunctionOverride
+from vendors.models import Client
 
-
-SAMPLE = [
-    {
-        "survey_id": "LMS-1",
-        "name": "Hidden survey name",
-        "payout": 0.79,
-        "description": "",
-        "entry_url": "https://rf.voqall.test/l?vq_sid=LMS-1&vq_vid=vendor-1&vq_token=[#vq_tid#]&vq_uid=[#vq_tuid#]",
-        "country": "United States",
-        "company": "BioBrain",
-        "language_id": "1",
-        "updated_at": "2026-08-01T10:00:00+00:00",
-        "placement_id": "abc",
-    },
-    {
-        "survey_id": "LMS-2",
-        "name": "Another hidden name",
-        "payout": 1.25,
-        "description": "",
-        "entry_url": "https://edgeapi.innovatemr.test/startSurvey?PID=[%%pid%%]",
-        "country": "United Kingdom",
-        "company": "InnovateMR",
-        "language_id": "EN",
-        "updated_at": "2026-08-02T10:00:00+00:00",
-        "placement_id": "def",
-    },
-]
-
-BIOBRAIN_QUESTIONS = {
-    "company": "BioBrain",
-    "survey_id": "LMS-1",
-    "questions": [
-        {
-            "id": "59",
-            "code": "GENDER",
-            "text": "What is your gender?",
-            "type": "Single select",
-            "category": "Demographic",
-            "options": [{"id": "1", "text": "Male"}, {"id": "2", "text": "Female"}],
-        }
-    ],
-    "fetched_at": datetime.now(timezone.utc).isoformat(),
-}
+from .credential_guard import reconcile_innovatemr_credential
+from .integrations import InnovateMRClient, InnovateMRNotFound, PagedSurveyResult
+from .models import IntegrationCredentialState, Survey, SurveyAttempt, SurveyQuota, SyncRun, TargetingQuestion
+from .services import (
+    merge_inventory,
+    parse_upstream_datetime,
+    reconcile_attempt_status,
+    replace_survey_details,
+    sync_surveys,
+)
 
 
-class SurveyViewsTests(TestCase):
+def survey_payload(survey_id=12632, modified="09/11/2017, 11:50:27 pm PST", **overrides):
+    payload = {
+        "surveyId": survey_id,
+        "surveyName": "Beverage habits",
+        "N": 100,
+        "supCmps": 3,
+        "remainingN": 97,
+        "LOI": 15,
+        "IR": 10,
+        "Country": "United States",
+        "CountryCode": "US",
+        "Language": "ENGLISH",
+        "LanguageCode": "EN",
+        "groupType": "Consumer",
+        "deviceType": "All",
+        "createdDate": "09/11/2017, 11:03:50 pm PST",
+        "modifiedDate": modified,
+        "entryLink": "https://example.test/start?pid=[%%pid%%]",
+        "CPI": "4.50",
+        "isQuota": True,
+        "numberOfStarts": 4,
+    }
+    payload.update(overrides)
+    return payload
+
+
+class FakeClient:
+    def __init__(self, full=None, paged=None):
+        self.full = full or []
+        self.paged = paged or []
+
+    def get_allocated_surveys(self):
+        return self.full
+
+    def get_allocated_surveys_paged(self):
+        return PagedSurveyResult(self.paged, 1)
+
+    def get_quota_for_survey(self, survey_id):
+        return [{"_id": "quota-a", "id": 780275, "quotaN": 10, "RemainingN": 9, "cmp": 1, "quotaStatus": "Open", "targeting": {"AGE": [{"ageStart": 18, "ageEnd": 35}]}}]
+
+    def get_survey_targeting(self, survey_id):
+        return [{"QuestionId": 2, "QuestionKey": "GENDER", "QuestionText": "What is your gender?", "QuestionType": "Single Punch", "QuestionCategory": "Demographic", "Options": [{"OptionId": 1, "OptionText": "Male"}]}]
+
+
+class MergeAndDateTests(TestCase):
+    def test_latest_modified_payload_wins_across_sources(self):
+        older = survey_payload(surveyName="Old name")
+        newer = survey_payload(modified="10/09/2017, 9:26:27 am PST", surveyName="New name")
+        self.assertEqual(merge_inventory([older], [newer])[12632]["surveyName"], "New name")
+
+    def test_pst_label_uses_pacific_daylight_saving_offset(self):
+        parsed = parse_upstream_datetime("09/11/2017, 11:50:27 pm PST")
+        self.assertEqual(parsed.utcoffset(), timedelta(0))
+        self.assertEqual(parsed.hour, 6)
+
+    def test_summer_completion_time_converts_to_exact_ist_end_time(self):
+        parsed = parse_upstream_datetime("08/08/2026, 3:46:24 am PST")
+        ist = parsed.astimezone(ZoneInfo("Asia/Kolkata"))
+        self.assertEqual((ist.hour, ist.minute, ist.second), (16, 16, 24))
+
+
+class SurveySyncTests(TestCase):
+    def test_sync_creates_one_deduplicated_survey_with_local_id(self):
+        full = survey_payload(surveyName="Older")
+        paged = survey_payload(modified="10/09/2017, 9:26:27 am PST", surveyName="Newest")
+        summary = sync_surveys(FakeClient([full], [paged]))
+        survey = Survey.objects.get(source_id=12632)
+        self.assertEqual(summary.created, 1)
+        self.assertEqual(survey.name, "Newest")
+        self.assertEqual(survey.client, Client.objects.get(code="innovatemr"))
+        self.assertEqual(len(survey.local_id), 14)
+        self.assertTrue(survey.local_id.isdigit())
+        self.assertEqual(survey.local_id[:6], timezone.localdate().strftime("%Y%m"))
+        self.assertEqual(SyncRun.objects.get(pk=summary.run_id).fetched_paged, 1)
+
+    def test_sync_updates_newer_record_and_closes_disappeared_survey(self):
+        sync_surveys(FakeClient([survey_payload(1), survey_payload(2)], []))
+        updated = survey_payload(1, modified="10/09/2017, 9:26:27 am PST", surveyName="Changed")
+        summary = sync_surveys(FakeClient([updated], [updated]))
+        self.assertEqual(summary.updated, 1)
+        self.assertEqual(summary.closed, 1)
+        self.assertEqual(Survey.objects.get(source_id=2).status, Survey.Status.CLOSED)
+
+    def test_detail_replacement_is_atomic_and_normalized(self):
+        survey = Survey.objects.create(source_id=12632, name="Test")
+        replace_survey_details(FakeClient(), survey)
+        self.assertEqual(SurveyQuota.objects.get().remaining, 9)
+        self.assertEqual(TargetingQuestion.objects.get().key, "GENDER")
+        survey.refresh_from_db()
+        self.assertIsNotNone(survey.detail_synced_at)
+        self.assertIsNotNone(survey.quota_synced_at)
+        self.assertIsNotNone(survey.targeting_synced_at)
+
+
+class CredentialGuardTests(TestCase):
     def setUp(self):
-        self.user = get_user_model().objects.create_user(username="tester", password="test-pass-123")
+        self.survey = Survey.objects.create(
+            source_id=9001,
+            entry_link="https://example.test/live?supCode=1150",
+            test_entry_link="https://example.test/test?supCode=1150",
+            raw_data={"entryLink": "https://example.test/live?supCode=1150"},
+            detail_synced_at=timezone.now(),
+            quota_synced_at=timezone.now(),
+            targeting_synced_at=timezone.now(),
+        )
 
-    def test_dashboard_requires_login(self):
-        response = self.client.get("/")
-        self.assertRedirects(response, "/login/?next=/")
+    def test_first_check_clears_unverified_links_and_stores_only_fingerprint(self):
+        result = reconcile_innovatemr_credential("token-a")
 
-    def test_branded_login_page_loads(self):
-        response = self.client.get("/login/")
+        self.assertTrue(result.initialized)
+        self.assertEqual(result.links_cleared, 1)
+        self.survey.refresh_from_db()
+        self.assertEqual(self.survey.entry_link, "")
+        self.assertEqual(self.survey.test_entry_link, "")
+        self.assertEqual(self.survey.raw_data, {})
+        state = IntegrationCredentialState.objects.get(provider="innovatemr")
+        self.assertNotEqual(state.credential_fingerprint, "token-a")
+        self.assertEqual(len(state.credential_fingerprint), 64)
+
+    def test_same_token_keeps_current_links(self):
+        reconcile_innovatemr_credential("token-a")
+        Survey.objects.filter(pk=self.survey.pk).update(
+            entry_link="https://example.test/current?supCode=508"
+        )
+
+        result = reconcile_innovatemr_credential("token-a")
+
+        self.assertFalse(result.changed)
+        self.assertEqual(result.links_cleared, 0)
+        self.survey.refresh_from_db()
+        self.assertIn("supCode=508", self.survey.entry_link)
+
+    def test_changed_token_clears_current_links_immediately(self):
+        reconcile_innovatemr_credential("token-a")
+        Survey.objects.filter(pk=self.survey.pk).update(
+            entry_link="https://example.test/current?supCode=508"
+        )
+
+        result = reconcile_innovatemr_credential("token-b")
+
+        self.assertTrue(result.changed)
+        self.assertEqual(result.links_cleared, 1)
+        self.survey.refresh_from_db()
+        self.assertEqual(self.survey.entry_link, "")
+
+
+class InnovateMRClientTests(TestCase):
+    @override_settings(INNOVATEMR_API_TOKEN="secret-test-token", INNOVATEMR_MAX_PAGES=5)
+    def test_paged_client_follows_cursor_without_leaking_token_to_query(self):
+        first = Mock()
+        first.raise_for_status.return_value = None
+        first.json.return_value = {"apiStatus": "success", "result": [{"surveyId": 1}], "paging": {"next": "abc"}}
+        second = Mock()
+        second.raise_for_status.return_value = None
+        second.json.return_value = {"apiStatus": "success", "result": [{"surveyId": 2}], "paging": {}}
+        session = Mock()
+        session.get.side_effect = [first, second]
+        result = InnovateMRClient(session=session).get_allocated_surveys_paged()
+        self.assertEqual([row["surveyId"] for row in result.surveys], [1, 2])
+        self.assertEqual(session.get.call_args_list[1].kwargs["params"]["next"], "abc")
+        self.assertEqual(session.get.call_args_list[0].kwargs["headers"]["x-access-token"], "secret-test-token")
+
+    @override_settings(INNOVATEMR_API_TOKEN="secret-test-token")
+    def test_transaction_lookup_uses_survey_and_rid_as_pid(self):
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"apiStatus": "success", "result": [{"status": "Completed"}]}
+        session = Mock()
+        session.get.return_value = response
+        result = InnovateMRClient(session=session).get_survey_transactions_by_pid(15978952, "Aa1Bb2Cc3D")
+        self.assertEqual(result[0]["status"], "Completed")
+        self.assertTrue(session.get.call_args.args[0].endswith("/supply/getSurveyTransactionsByCond/15978952/Aa1Bb2Cc3D"))
+
+
+class SurveyAPITests(TestCase):
+    def setUp(self):
+        self.api = APIClient()
+        self.user = get_user_model().objects.create_user(username="employee", password="test-password")
+        self.api.force_authenticate(self.user)
+        self.client.force_login(self.user)
+        self.survey = Survey.objects.create(
+            source_id=9876,
+            name="Mobile banking survey",
+            country="United States",
+            country_code="US",
+            language_code="EN",
+            status=Survey.Status.LIVE,
+            sample_size=50,
+            completes=10,
+            entry_link="https://edgeapi.innovatemr.net/startSurvey?survNum=test&supCode=1150&PID=[%%pid%%]",
+            source_modified_at=timezone.now() - timedelta(hours=2),
+            detail_synced_at=timezone.now(),
+            quota_synced_at=timezone.now(),
+            targeting_synced_at=timezone.now(),
+        )
+        SurveyQuota.objects.create(survey=self.survey, source_key="q1", quota_id=1, sample_size=20, remaining=10)
+        TargetingQuestion.objects.create(survey=self.survey, question_id=2, key="GENDER", text="Gender?", options=[])
+
+    def test_list_filter_and_search(self):
+        response = self.api.get(reverse("survey-list"), {"country": "US", "search": "banking"})
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "Alessar Research Cloud")
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["results"][0]["local_id"], self.survey.local_id)
+        self.assertEqual(response.data["results"][0]["company_name"], "InnovateMR")
+        self.assertIn("source_modified_display", response.data["results"][0])
+        self.assertEqual(
+            response.data["results"][0]["start_link"],
+            f"http://testserver/survey/start?surveyId=9876&supplierCode=1000&userId={self.user.pk}&code={self.survey.local_id}",
+        )
 
-    def test_dashboard_uses_client_cpi_and_date_labels_without_survey_name(self):
-        self.client.force_login(self.user)
-        response = self.client.get("/")
+    def test_multi_value_filters_use_or_within_each_filter(self):
+        Survey.objects.create(
+            source_id=9877,
+            company_name="Sample Partner",
+            name="India finance survey",
+            country="India",
+            country_code="IN",
+            status=Survey.Status.CLOSED,
+        )
+        response = self.api.get(reverse("survey-list"), {
+            "country": "US,IN",
+            "status": "live,closed",
+            "company": "InnovateMR,Sample Partner",
+        })
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, "CPI order")
-        self.assertContains(response, "From date")
-        self.assertContains(response, "Client")
-        self.assertNotContains(response, "Survey name")
-        self.assertNotContains(response, "Unique random IDs")
+        self.assertEqual(response.data["count"], 2)
 
-    def test_questions_endpoint_requires_login(self):
-        response = self.client.get("/api/surveys/questions/?company=InnovateMR&survey_id=LMS-2")
-        self.assertEqual(response.status_code, 302)
-
-    @patch("surveys.views.get_survey_questions")
-    @patch("surveys.views.get_surveys")
-    def test_questions_endpoint_returns_current_survey_questions(self, get_surveys, get_questions):
-        self.client.force_login(self.user)
-        get_surveys.return_value = (SAMPLE, datetime.now(timezone.utc), False)
-        get_questions.return_value = {
-            "company": "InnovateMR",
-            "survey_id": "LMS-2",
-            "questions": [{"id": "2", "code": "GENDER", "text": "What is your gender?", "type": "Single Punch", "category": "Demographic", "options": []}],
-            "fetched_at": datetime.now(timezone.utc).isoformat(),
-        }
-        response = self.client.get("/api/surveys/questions/?company=InnovateMR&survey_id=LMS-2")
+    def test_cpi_range_and_sort_are_applied_server_side(self):
+        UserFunctionOverride.objects.create(
+            user=self.user,
+            function=AccessFunction.objects.get(code="projects.filter.cpi"),
+            effect=UserFunctionOverride.Effect.ALLOW,
+        )
+        self.survey.cpi = "2.50"
+        self.survey.save(update_fields=["cpi"])
+        higher = Survey.objects.create(source_id=9878, name="Higher CPI", cpi="7.25")
+        response = self.api.get(reverse("survey-list"), {
+            "min_cpi": "3.00", "max_cpi": "8.00", "ordering": "-cpi",
+        })
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["questions"][0]["code"], "GENDER")
+        self.assertEqual([item["local_id"] for item in response.data["results"]], [higher.local_id])
 
-    @patch("surveys.views.get_surveys")
-    def test_api_filters_by_client_and_full_country_name(self, get_surveys):
-        self.client.force_login(self.user)
-        get_surveys.return_value = (SAMPLE, datetime.now(timezone.utc), False)
-        response = self.client.get("/api/surveys/?company=BioBrain&country=United%20States")
-        payload = response.json()
-        self.assertEqual(payload["pagination"]["total"], 1)
-        self.assertEqual(payload["surveys"][0]["survey_id"], "LMS-1")
-        self.assertEqual(payload["filters"]["clients"], ["BioBrain", "InnovateMR"])
-
-    @patch("surveys.views.get_surveys")
-    def test_api_defaults_to_latest_updated_first(self, get_surveys):
-        self.client.force_login(self.user)
-        get_surveys.return_value = (SAMPLE, datetime.now(timezone.utc), False)
-        response = self.client.get("/api/surveys/")
-        self.assertEqual(response.json()["surveys"][0]["survey_id"], "LMS-2")
-
-    @patch("surveys.views.get_surveys")
-    def test_api_sorts_cpi_both_directions(self, get_surveys):
-        self.client.force_login(self.user)
-        get_surveys.return_value = (SAMPLE, datetime.now(timezone.utc), False)
-        high = self.client.get("/api/surveys/?sort=payout&direction=desc").json()["surveys"]
-        low = self.client.get("/api/surveys/?sort=payout&direction=asc").json()["surveys"]
-        self.assertEqual([row["payout"] for row in high], [1.25, 0.79])
-        self.assertEqual([row["payout"] for row in low], [0.79, 1.25])
-
-    @patch("surveys.views.get_surveys")
-    def test_api_filters_updated_date_range(self, get_surveys):
-        self.client.force_login(self.user)
-        get_surveys.return_value = (SAMPLE, datetime.now(timezone.utc), False)
-        payload = self.client.get("/api/surveys/?from_date=2026-08-02&to_date=2026-08-02").json()
-        self.assertEqual(payload["pagination"]["total"], 1)
-        self.assertEqual(payload["surveys"][0]["survey_id"], "LMS-2")
-
-    @patch("surveys.views.get_surveys")
-    def test_launch_link_requires_login(self, get_surveys):
-        get_surveys.return_value = (SAMPLE, datetime.now(timezone.utc), False)
-        response = self.client.post(
-            "/api/surveys/launch-link/",
-            data=json.dumps({"company": "BioBrain", "survey_id": "LMS-1"}),
-            content_type="application/json",
+    def test_project_export_uses_filters_and_column_permissions(self):
+        UserFunctionOverride.objects.create(
+            user=self.user,
+            function=AccessFunction.objects.get(code="projects.filter.cpi"),
+            effect=UserFunctionOverride.Effect.ALLOW,
         )
-        self.assertEqual(response.status_code, 302)
-
-    @patch("surveys.views.get_surveys")
-    def test_biobrain_copy_link_returns_direct_url_with_two_unique_ids(self, get_surveys):
-        self.client.force_login(self.user)
-        get_surveys.return_value = (SAMPLE, datetime.now(timezone.utc), False)
-        response = self.client.post(
-            "/api/surveys/launch-link/",
-            data=json.dumps({"company": "BioBrain", "survey_id": "LMS-1"}),
-            content_type="application/json",
-        )
+        self.survey.cpi = "2.50"
+        self.survey.save(update_fields=["cpi"])
+        excluded = Survey.objects.create(source_id=9879, name="Excluded high CPI", cpi="8.00")
+        response = self.api.get(reverse("survey-export"), {"max_cpi": "3.00", "ordering": "-cpi"})
         self.assertEqual(response.status_code, 200)
-        payload = response.json()
-        launch_url = payload["launch_url"]
-        generated = re.findall(r"(?:vq_token|vq_uid)=([A-Za-z0-9]{24})", launch_url)
-        self.assertFalse(payload["tracked"])
-        self.assertIn("rf.voqall", launch_url)
-        self.assertEqual(len(generated), 2)
-        self.assertEqual(len(set(generated)), 2)
-        self.assertNotIn("[#vq_", launch_url)
+        self.assertIn("projects-", response["Content-Disposition"])
+        rows = list(csv.reader(StringIO(b"".join(response.streaming_content).decode("utf-8-sig"))))
+        self.assertIn("Project ID", rows[0])
+        self.assertIn("CPI", rows[0])
+        self.assertIn(str(self.survey.source_id), rows[1])
+        self.assertNotIn(str(excluded.source_id), str(rows))
 
-    def test_tracked_start_and_return_pages_are_disabled_by_default(self):
-        self.assertEqual(self.client.get("/survey/start/not-a-live-token/").status_code, 404)
-        self.assertEqual(self.client.get("/survey/return/s1/?token=x&vendor_user_id=y").status_code, 404)
-
-    @override_settings(SURVEY_TRACKED_FLOW_ENABLED=True)
-    @patch("surveys.views.get_survey_questions")
-    @patch("surveys.views.get_surveys")
-    def test_public_start_page_creates_unique_tracked_session_and_hands_off(self, get_surveys, get_questions):
-        self.client.force_login(self.user)
-        get_surveys.return_value = (SAMPLE, datetime.now(timezone.utc), False)
-        get_questions.return_value = BIOBRAIN_QUESTIONS
-        launch_response = self.client.post(
-            "/api/surveys/launch-link/",
-            data=json.dumps({"company": "BioBrain", "survey_id": "LMS-1"}),
-            content_type="application/json",
+        UserFunctionOverride.objects.create(
+            user=self.user,
+            function=AccessFunction.objects.get(code="projects.column.cpi"),
+            effect=UserFunctionOverride.Effect.DENY,
         )
-        launch_path = urlsplit(launch_response.json()["launch_url"]).path
-        self.client.logout()
+        denied_response = self.api.get(reverse("survey-export"), {"max_cpi": "3.00"})
+        denied_rows = list(csv.reader(StringIO(b"".join(denied_response.streaming_content).decode("utf-8-sig"))))
+        self.assertNotIn("CPI", denied_rows[0])
 
-        page = self.client.get(launch_path)
-        self.assertEqual(page.status_code, 200)
-        self.assertContains(page, "What is your gender?")
-        response = self.client.post(launch_path, {"question_59": "1", "consent": "yes"})
-        self.assertEqual(response.status_code, 303)
-        location = response["Location"]
-        generated = re.findall(r"(?:vq_token|vq_uid)=([A-Za-z0-9]{24})", location)
-        self.assertEqual(len(generated), 2)
-        self.assertEqual(len(set(generated)), 2)
-        self.assertNotIn("[#vq_", location)
-        session = SurveySession.objects.get()
-        self.assertEqual(session.status, SurveySession.Status.HANDED_OFF)
-        self.assertEqual(session.prescreener_answers["59"]["values"], ["1"])
-        self.assertIn("gender=1", location)
+    def test_detail_actions_return_cached_data(self):
+        quota = self.api.get(reverse("survey-quotas", kwargs={"local_id": self.survey.local_id}))
+        targeting = self.api.get(reverse("survey-targeting", kwargs={"local_id": self.survey.local_id}))
+        self.assertEqual(quota.status_code, 200)
+        self.assertEqual(quota.data[0]["quota_id"], 1)
+        self.assertEqual(targeting.data[0]["key"], "GENDER")
 
-    @override_settings(SURVEY_TRACKED_FLOW_ENABLED=True)
-    def test_all_four_return_urls_record_the_exact_status(self):
-        status_map = {
-            "s1": SurveySession.Status.COMPLETE,
-            "s2": SurveySession.Status.TERMINATE,
-            "s3": SurveySession.Status.QUOTA_FULL,
-            "s4": SurveySession.Status.SECURITY_TERMINATE,
-        }
-        for index, (code, expected_status) in enumerate(status_map.items(), start=1):
-            with self.subTest(code=code):
-                session = SurveySession.objects.create(
-                    client="BioBrain",
-                    survey_id=f"LMS-{index}",
-                    transaction_id=f"Token{index:019d}",
-                    respondent_id=f"User{index:020d}",
-                    entry_url="https://rf.voqall.test/l",
-                    status=SurveySession.Status.HANDED_OFF,
-                )
-                response = self.client.get(
-                    f"/survey/return/{code}/?token={session.transaction_id}&vendor_user_id={session.respondent_id}&status=88"
-                )
-                self.assertEqual(response.status_code, 200)
-                session.refresh_from_db()
-                self.assertEqual(session.status, expected_status)
-                self.assertEqual(session.supplier_status_id, "88")
-                self.assertIsNotNone(session.returned_at)
+    def test_missing_upstream_quota_is_an_empty_successful_result(self):
+        self.survey.quota_synced_at = None
+        self.survey.save(update_fields=["quota_synced_at"])
+        upstream = Mock()
+        upstream.get_quota_for_survey.side_effect = InnovateMRNotFound("no quota")
+        with patch("surveys.views.InnovateMRClient", return_value=upstream):
+            response = self.api.get(reverse("survey-quotas", kwargs={"local_id": self.survey.local_id}))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, [])
+        self.survey.refresh_from_db()
+        self.assertIsNotNone(self.survey.quota_synced_at)
 
-    @override_settings(SURVEY_TRACKED_FLOW_ENABLED=True)
-    def test_return_url_requires_the_exact_token_and_user_pair(self):
-        first = SurveySession.objects.create(
-            client="BioBrain", survey_id="LMS-A", transaction_id="A" * 24, respondent_id="B" * 24,
-            entry_url="https://rf.voqall.test/l", status=SurveySession.Status.HANDED_OFF,
+    def test_projects_and_dashboard_render(self):
+        projects = self.client.get(reverse("projects"))
+        self.assertContains(projects, "Survey inventory")
+        self.assertContains(projects, "Pre-screening questions")
+        self.assertContains(projects, 'id="fromDateTime"')
+        self.assertContains(projects, 'id="toDateTime"')
+        self.assertNotContains(projects, 'id="fromTime"')
+        self.assertContains(projects, 'id="exportProjects"')
+        self.assertContains(projects, 'placeholder="Search country')
+        self.assertContains(projects, 'placeholder="Search client')
+        self.assertContains(projects, 'id="companyLabel">Client')
+        self.assertNotContains(projects, 'id="cpiFilterTrigger"')
+        self.assertNotContains(projects, "Quest")
+        self.assertContains(self.client.get(reverse("dashboard")), "dashboard is ready")
+
+        profile = self.user.employee_profile
+        profile.role = Role.objects.get(slug="admin")
+        profile.save(update_fields=["role"])
+        admin_projects = self.client.get(reverse("projects"))
+        self.assertContains(admin_projects, 'id="cpiFilterTrigger"')
+        self.assertContains(admin_projects, "CPI: highest to lowest")
+        self.assertContains(admin_projects, 'id="cpiMinRange"')
+        self.assertContains(admin_projects, 'id="cpiMaxRange"')
+
+
+class SurveyFlowTests(TestCase):
+    def setUp(self):
+        now = timezone.now()
+        self.platform_user = get_user_model().objects.create_user(
+            id=294, username="respondent", password="test-password"
         )
-        second = SurveySession.objects.create(
-            client="BioBrain", survey_id="LMS-B", transaction_id="C" * 24, respondent_id="D" * 24,
-            entry_url="https://rf.voqall.test/l", status=SurveySession.Status.HANDED_OFF,
+        self.survey = Survey.objects.create(
+            source_id=32655971,
+            name="Financial services",
+            status=Survey.Status.LIVE,
+            company_name="InnovateMR",
+            country_code="US",
+            language_code="EN",
+            loi=12,
+            entry_link="https://edgeapi.innovatemr.net/startSurvey?survNum=v8wdQrgP&supCode=1150&PID=[%%pid%%]",
+            source_modified_at=now - timedelta(hours=1),
+            targeting_synced_at=now,
         )
-        response = self.client.get(f"/survey/return/s1/?token={first.transaction_id}&vendor_user_id={second.respondent_id}")
+        self.question = TargetingQuestion.objects.create(
+            survey=self.survey,
+            question_id=2,
+            key="GENDER",
+            text="What is your gender?",
+            question_type="Single Punch",
+            category="Demographic",
+            options=[{"OptionId": 1, "OptionText": "Male"}, {"OptionId": 2, "OptionText": "Female"}],
+        )
+
+    def test_full_prescreener_redirect_and_status_lifecycle(self):
+        start = self.client.get(reverse("survey-start"), {
+            "surveyId": self.survey.source_id,
+            "supplierCode": "1000",
+            "userId": "294",
+            "code": self.survey.local_id,
+        }, REMOTE_ADDR="10.10.10.10", HTTP_USER_AGENT="Mozilla/5.0 (Windows NT 10.0) Chrome/126.0.0.0")
+        self.assertEqual(start.status_code, 302)
+        rid = parse_qs(urlsplit(start["Location"]).query)["rid"][0]
+        self.assertEqual(len(rid), 10)
+        self.assertTrue(any(char.isupper() for char in rid))
+        self.assertTrue(any(char.islower() for char in rid))
+        self.assertTrue(any(char.isdigit() for char in rid))
+
+        form = self.client.get(reverse("survey-start"), {"rid": rid})
+        self.assertContains(form, "What is your gender?")
+
+        submit = self.client.post(reverse("survey-start"), {
+            "rid": rid,
+            f"question_{self.question.pk}": "2",
+        })
+        self.assertEqual(submit.status_code, 302)
+        outbound = urlsplit(submit["Location"])
+        params = parse_qs(outbound.query)
+        self.assertEqual(params["PID"], [rid])
+        self.assertEqual(params["trackId"], [rid])
+        self.assertEqual(params["GENDER"], ["2"])
+        self.assertEqual(params["supCode"], ["1150"])
+
+        callback = self.client.get(
+            reverse("survey-status"), {"status": "1", "rid": rid}, REMOTE_ADDR="20.20.20.20",
+            HTTP_USER_AGENT="Mozilla/5.0 (Linux; Android 14; Mobile) Chrome/126.0.0.0",
+        )
+        self.assertEqual(callback.status_code, 200)
+        self.assertContains(callback, "Thank you for participating!")
+        attempt = SurveyAttempt.objects.get(rid=rid)
+        self.assertEqual(attempt.status, SurveyAttempt.Status.COMPLETED)
+        self.assertEqual(attempt.platform_user, self.platform_user)
+        self.assertEqual(attempt.user_id, "294")
+        self.assertEqual(attempt.supplier_code, "1150")
+        self.assertEqual(attempt.initiation_ip, "10.10.10.10")
+        self.assertEqual(attempt.callback_ip, "20.20.20.20")
+        self.assertEqual(attempt.entry_browser, "Chrome 126.0.0.0")
+        self.assertEqual(attempt.entry_device, "Desktop")
+        self.assertEqual(attempt.exit_device, "Mobile")
+        self.assertEqual(attempt.exit_os, "Android 14")
+        self.assertIsNotNone(attempt.loi_seconds)
+
+    def test_status_requires_known_rid(self):
+        response = self.client.get(reverse("survey-status"), {"status": "3", "rid": "Aa1Bb2Cc3D"})
         self.assertEqual(response.status_code, 404)
-        first.refresh_from_db()
-        self.assertEqual(first.status, SurveySession.Status.HANDED_OFF)
+        self.assertContains(response, "could not be attached", status_code=404)
 
-    @patch("surveys.views.get_surveys")
-    def test_csv_export_contains_all_direct_urls_with_distinct_random_ids(self, get_surveys):
-        self.client.force_login(self.user)
-        get_surveys.return_value = (SAMPLE, datetime.now(timezone.utc), False)
-        response = self.client.get("/api/surveys/export/?page_size=1")
-        content = b"".join(response.streaming_content).decode("utf-8-sig")
-        generated = re.findall(r"(?:PID|vq_token|vq_uid)=([A-Za-z0-9]{24})", content)
-        self.assertEqual(response["X-Exported-Count"], "2")
-        self.assertIn("Client,Country,CPI,Updated", content)
-        self.assertIn(",0.79,", content)
-        self.assertNotIn("/survey/start/", content)
-        self.assertEqual(len(generated), 3)
-        self.assertEqual(len(set(generated)), 3)
-        self.assertNotIn("[#vq_", content)
-        self.assertNotIn("[%%pid%%]", content)
-        self.assertNotIn("Survey name", content)
+    def test_loi_includes_prescreener_time(self):
+        now = timezone.now()
+        attempt = SurveyAttempt.objects.create(
+            rid="Aa1Bb2Cc3D",
+            survey=self.survey,
+            platform_user=self.platform_user,
+            user_id=str(self.platform_user.pk),
+            status=SurveyAttempt.Status.REDIRECTED,
+            initiated_at=now - timedelta(minutes=65),
+            submitted_at=now - timedelta(minutes=5),
+            redirected_at=now - timedelta(minutes=5),
+        )
+
+        response = self.client.get(reverse("survey-status"), {"status": "1", "rid": attempt.rid})
+
+        self.assertEqual(response.status_code, 200)
+        attempt.refresh_from_db()
+        self.assertGreaterEqual(attempt.loi_seconds, 3900)
+        self.assertLess(attempt.loi_seconds, 3910)
+
+    @override_settings(TRUST_X_FORWARDED_FOR=True)
+    def test_trusted_proxy_records_public_entry_and_exit_ips(self):
+        start = self.client.get(reverse("survey-start"), {
+            "surveyId": self.survey.source_id,
+            "supplierCode": "1000",
+            "userId": self.platform_user.pk,
+            "code": self.survey.local_id,
+        }, REMOTE_ADDR="127.0.0.1", HTTP_X_FORWARDED_FOR="8.8.8.8, 127.0.0.1")
+        rid = parse_qs(urlsplit(start["Location"]).query)["rid"][0]
+        callback = self.client.get(
+            reverse("survey-status"), {"status": "2", "rid": rid}, REMOTE_ADDR="127.0.0.1",
+            HTTP_X_REAL_IP="1.1.1.1",
+        )
+        self.assertEqual(callback.status_code, 200)
+        attempt = SurveyAttempt.objects.get(rid=rid)
+        self.assertEqual(attempt.initiation_ip, "8.8.8.8")
+        self.assertEqual(attempt.callback_ip, "1.1.1.1")
+        self.assertEqual(attempt.status_source, "browser_callback")
+
+    def test_direct_localhost_is_not_saved_as_respondent_network_ip(self):
+        start = self.client.get(reverse("survey-start"), {
+            "surveyId": self.survey.source_id,
+            "supplierCode": "1000",
+            "userId": self.platform_user.pk,
+            "code": self.survey.local_id,
+        }, REMOTE_ADDR="127.0.0.1")
+        rid = parse_qs(urlsplit(start["Location"]).query)["rid"][0]
+        self.assertIsNone(SurveyAttempt.objects.get(rid=rid).initiation_ip)
+
+    @override_settings(TRUST_X_FORWARDED_FOR=True)
+    def test_rid_page_backfills_missing_entry_client_audit(self):
+        start = self.client.get(reverse("survey-start"), {
+            "surveyId": self.survey.source_id,
+            "supplierCode": "1000",
+            "userId": self.platform_user.pk,
+            "code": self.survey.local_id,
+        })
+        rid = parse_qs(urlsplit(start["Location"]).query)["rid"][0]
+        SurveyAttempt.objects.filter(rid=rid).update(
+            initiation_ip=None,
+            entry_user_agent="",
+            entry_browser="",
+            entry_device="",
+            entry_os="",
+            entry_referrer="",
+            entry_accept_language="",
+            entry_client_data={},
+        )
+
+        response = self.client.get(
+            reverse("survey-start"),
+            {"rid": rid},
+            REMOTE_ADDR="127.0.0.1",
+            HTTP_X_FORWARDED_FOR="8.8.8.8, 127.0.0.1",
+            HTTP_USER_AGENT="Mozilla/5.0 (Windows NT 10.0) Chrome/126.0.0.0",
+            HTTP_ACCEPT_LANGUAGE="en-IN,en;q=0.9",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        attempt = SurveyAttempt.objects.get(rid=rid)
+        self.assertEqual(attempt.initiation_ip, "8.8.8.8")
+        self.assertEqual(attempt.entry_browser, "Chrome 126.0.0.0")
+        self.assertEqual(attempt.entry_device, "Desktop")
+        self.assertEqual(attempt.entry_os, "Windows 10.0")
+        self.assertEqual(attempt.entry_accept_language, "en-IN,en;q=0.9")
+        self.assertTrue(attempt.entry_user_agent.startswith("Mozilla/5.0"))
+        self.assertEqual(attempt.entry_client_data["browser"], "Chrome 126.0.0.0")
+
+    def test_invalid_start_values_never_create_attempt_or_show_questions(self):
+        valid = {
+            "surveyId": str(self.survey.source_id),
+            "supplierCode": "1000",
+            "userId": str(self.platform_user.pk),
+            "code": self.survey.local_id,
+        }
+        invalid_variants = [
+            {**valid, "userId": "999999"},
+            {**valid, "code": "20260800000000"},
+            {**valid, "supplierCode": "9999"},
+            {**valid, "unexpected": "injected"},
+        ]
+
+        for query in invalid_variants:
+            with self.subTest(query=query):
+                response = self.client.get(reverse("survey-start"), query)
+                self.assertIn(response.status_code, {400, 404})
+                self.assertContains(response, "Invalid survey link", status_code=response.status_code)
+                self.assertNotContains(response, "What is your gender?", status_code=response.status_code)
+
+        self.assertEqual(SurveyAttempt.objects.count(), 0)
+
+    def test_canonical_rid_rejects_extra_params_and_inactive_user(self):
+        start = self.client.get(reverse("survey-start"), {
+            "surveyId": self.survey.source_id,
+            "supplierCode": "1000",
+            "userId": self.platform_user.pk,
+            "code": self.survey.local_id,
+        })
+        rid = parse_qs(urlsplit(start["Location"]).query)["rid"][0]
+
+        injected = self.client.get(reverse("survey-start"), {"rid": rid, "userId": self.platform_user.pk})
+        self.assertContains(injected, "Invalid survey link", status_code=400)
+
+        self.platform_user.is_active = False
+        self.platform_user.save(update_fields=["is_active"])
+        inactive = self.client.get(reverse("survey-start"), {"rid": rid})
+        self.assertContains(inactive, "Invalid survey link", status_code=404)
 
 
-class SurveyServicesTests(SimpleTestCase):
+class StudiesTrackingTests(TestCase):
     def setUp(self):
-        services._cache.update(data=None, fetched_at=None, monotonic=0.0, stale=False)
-        services._supplier_cache.update(InnovateMR=None, BioBrain=None)
-        services._voqall_language_cache = {}
-        services._voqall_qualification_catalog_cache = {}
-        services._voqall_question_detail_cache.clear()
-        services._question_cache.clear()
-
-    tearDown = setUp
-
-    def test_innovatemr_schema_is_normalized(self):
-        survey = normalize_innovatemr_survey(
-            {
-                "surveyId": 12632,
-                "surveyName": "Hidden name",
-                "CPI": "0.790",
-                "CountryCode": "US",
-                "Country": "United States",
-                "modifiedDate": "08/02/2026, 03:30:00 pm PST",
-                "entryLink": "https://supplier.test/start?PID=[%%pid%%]",
-            }
+        self.owner = get_user_model().objects.create_superuser(
+            username="owner", email="owner@example.test", password="test-password"
         )
-        self.assertEqual(survey["company"], "InnovateMR")
-        self.assertEqual(survey["country"], "United States")
-        self.assertEqual(survey["payout"], 0.79)
-        self.assertEqual(survey["updated_at"], "2026-08-02T23:30:00+00:00")
-
-    def test_voqall_schema_uses_biobrain_full_country_and_updated_date(self):
-        survey = normalize_voqall_survey(
-            {
-                "SurveyId": 77,
-                "Name": "VoqQ_7855498",
-                "Revenue": 1.75,
-                "LanguageId": 114,
-                "LastUpdatedOnUTC": "2026-08-02T12:15:22Z",
-                "SurveyUrl": "https://supplier.test/start?vq_uid=[#vq_tuid#]&vq_token=[#vq_tid#]",
-            },
-            {"114": "JM"},
+        self.kanik = get_user_model().objects.create_user(
+            username="kanik", first_name="Kanik", last_name="Sharma", email="kanik@example.test"
         )
-        self.assertEqual(survey["company"], "BioBrain")
-        self.assertEqual(survey["country"], "Jamaica")
-        self.assertEqual(survey["updated_at"], "2026-08-02T12:15:22+00:00")
-
-    def test_innovatemr_question_schema_is_normalized(self):
-        question = normalize_innovatemr_question(
-            {"QuestionId": 2, "QuestionKey": "GENDER", "QuestionText": "What is your gender?", "QuestionType": "Single Punch", "QuestionCategory": "Demographic", "Options": [{"OptionId": 1, "OptionText": "Male"}]}
+        self.other = get_user_model().objects.create_user(username="other", first_name="Other")
+        self.survey = Survey.objects.create(
+            source_id=555123,
+            name="Consumer finance",
+            company_name="InnovateMR",
+            country_code="US",
+            language_code="EN",
+            cpi="2.50",
+            loi=10,
         )
-        self.assertEqual(question["options"], [{"id": "1", "text": "Male"}])
-
-    def test_voqall_question_uses_language_detail_and_allowed_options(self):
-        question = services._normalize_voqall_question(
-            {"QualificationId": 59, "OptionIds": [1]},
-            {"Id": 59, "Code": "GENDER", "QuestionText": "What is your gender?", "TypeName": "Single select", "Options": [{"OptionCode": 1, "OptionText": "Male"}, {"OptionCode": 2, "OptionText": "Female"}]},
-            {},
+        common = {
+            "survey": self.survey,
+            "supplier_code": "1150",
+            "initiation_ip": "10.0.0.1",
+            "callback_ip": "20.0.0.1",
+            "entry_browser": "Chrome 126",
+            "entry_device": "Desktop",
+            "entry_os": "Windows 10",
+        }
+        self.complete = SurveyAttempt.objects.create(
+            rid="Aa1Bb2Cc3D", platform_user=self.kanik, user_id=str(self.kanik.pk),
+            status=SurveyAttempt.Status.COMPLETED, loi_seconds=82, callback_at=timezone.now(), **common,
         )
-        self.assertEqual(question["options"], [{"id": "1", "text": "Male"}])
+        SurveyAttempt.objects.create(
+            rid="Ee4Ff5Gg6H", platform_user=self.other, user_id=str(self.other.pk),
+            status=SurveyAttempt.Status.TERMINATED, **common,
+        )
+        self.api = APIClient()
+        self.api.force_authenticate(self.owner)
 
-    @override_settings(SURVEY_CACHE_SECONDS=0)
-    @patch("surveys.services._fetch_voqall_surveys")
-    @patch("surveys.services._fetch_innovatemr_surveys")
-    def test_one_supplier_failure_does_not_hide_the_other(self, innovate_fetch, voqall_fetch):
-        innovate_fetch.return_value = [SAMPLE[1]]
-        voqall_fetch.side_effect = FeedError("BioBrain unavailable")
-        surveys, _, stale = services.get_surveys(force=True)
-        self.assertEqual(surveys, [SAMPLE[1]])
-        self.assertTrue(stale)
+    def test_studies_page_and_filtered_api_show_compact_tracking_data(self):
+        self.client.force_login(self.owner)
+        page = self.client.get(reverse("studies"))
+        self.assertContains(page, "Respondent activity")
+        self.assertContains(page, 'id="studyFromDateTime"')
+        self.assertContains(page, 'id="studyToDateTime"')
+        self.assertNotContains(page, 'id="studyFromTime"')
+        self.assertContains(page, "Export full CSV")
+        self.assertContains(page, "Kanik Sharma")
+        self.assertContains(page, "<th>Device</th>", html=True)
+        self.assertContains(page, "<th>Start</th>", html=True)
+        self.assertContains(page, "<th>End</th>", html=True)
+
+        response = self.api.get(reverse("survey-attempt-list"), {
+            "user": self.kanik.pk,
+            "status": SurveyAttempt.Status.COMPLETED,
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 1)
+        result = response.data["results"][0]
+        self.assertEqual(result["rid"], self.complete.rid)
+        self.assertEqual(result["user_name"], "Kanik Sharma")
+        self.assertEqual(result["entry_ip"], "10.0.0.1")
+        self.assertEqual(result["exit_ip"], "20.0.0.1")
+        self.assertEqual(result["entry_device"], "Desktop")
+        self.assertIsNotNone(result["initiated_at"])
+        self.assertIsNotNone(result["callback_at"])
+
+    def test_filtered_csv_contains_full_backend_record_not_only_ui_columns(self):
+        response = self.api.get(reverse("survey-attempt-export"), {
+            "user": self.kanik.pk,
+            "status": SurveyAttempt.Status.COMPLETED,
+        })
+        self.assertEqual(response.status_code, 200)
+        content = b"".join(response.streaming_content).decode("utf-8")
+        self.assertIn("Entry user agent", content)
+        self.assertIn("Pre-screener answers", content)
+        self.assertIn("Outbound supplier URL", content)
+        self.assertIn("Payable CPI snapshot", content)
+        self.assertIn("Kanik Sharma", content)
+        self.assertIn(self.complete.rid, content)
+        self.assertNotIn("Ee4Ff5Gg6H", content)
+
+    def test_view_permission_is_scoped_and_does_not_grant_csv_export(self):
+        viewer = get_user_model().objects.create_user(username="viewer", first_name="Scoped")
+        UserFunctionOverride.objects.create(
+            user=viewer,
+            function=AccessFunction.objects.get(code="attempts.view"),
+            effect=UserFunctionOverride.Effect.ALLOW,
+        )
+        own_attempt = SurveyAttempt.objects.create(
+            rid="Ii7Jj8Kk9L", survey=self.survey, platform_user=viewer, user_id=str(viewer.pk),
+            status=SurveyAttempt.Status.INITIATED,
+        )
+        scoped_api = APIClient()
+        scoped_api.force_authenticate(viewer)
+        listing = scoped_api.get(reverse("survey-attempt-list"))
+        self.assertEqual(listing.status_code, 200)
+        self.assertEqual(listing.data["count"], 1)
+        self.assertEqual(listing.data["results"][0]["rid"], own_attempt.rid)
+        self.assertEqual(scoped_api.get(reverse("survey-attempt-export")).status_code, 403)
+
+        self.client.force_login(viewer)
+        page = self.client.get(reverse("studies"))
+        self.assertEqual(page.status_code, 200)
+        self.assertNotContains(page, "Export full CSV")
+        self.assertNotContains(page, 'id="studySearch"')
+        self.assertNotContains(page, "<th>Status</th>", html=True)
+        self.assertEqual(scoped_api.get(reverse("survey-attempt-list"), {"status": "1"}).status_code, 403)
+
+    def test_team_lead_sees_lower_rank_employee_activity_in_same_branch_only(self):
+        team_lead = get_user_model().objects.create_user(
+            username="tracking-lead", first_name="Tracking", last_name="Lead"
+        )
+        employee = get_user_model().objects.create_user(
+            username="tracking-employee", first_name="Branch", last_name="Employee"
+        )
+        other_branch_employee = get_user_model().objects.create_user(
+            username="other-branch-employee", first_name="Other", last_name="Branch"
+        )
+        manager = get_user_model().objects.create_user(
+            username="tracking-manager", first_name="Branch", last_name="Manager"
+        )
+        profiles = [
+            (team_lead, "team-lead", "Delhi", "Operations"),
+            (employee, "employee", "Delhi", "Operations"),
+            (other_branch_employee, "employee", "Mumbai", "Operations"),
+            (manager, "manager", "Delhi", "Operations"),
+        ]
+        for platform_user, role_slug, company, department in profiles:
+            EmployeeProfile.objects.filter(user=platform_user).update(
+                role=Role.objects.get(slug=role_slug),
+                created_by=self.owner,
+                company_name=company,
+                department=department,
+            )
+
+        visible_attempt = SurveyAttempt.objects.create(
+            rid="Tl1Ee2Aa3D", survey=self.survey, platform_user=employee, user_id=str(employee.pk),
+            status=SurveyAttempt.Status.COMPLETED, entry_device="Desktop",
+        )
+        SurveyAttempt.objects.create(
+            rid="Tl4Oo5Bb6M", survey=self.survey, platform_user=other_branch_employee,
+            user_id=str(other_branch_employee.pk), status=SurveyAttempt.Status.COMPLETED, entry_device="Mobile",
+        )
+        SurveyAttempt.objects.create(
+            rid="Tl7Mm8Cc9R", survey=self.survey, platform_user=manager, user_id=str(manager.pk),
+            status=SurveyAttempt.Status.COMPLETED, entry_device="Tablet",
+        )
+
+        lead_api = APIClient()
+        lead_api.force_authenticate(team_lead)
+        studies = lead_api.get(reverse("survey-attempt-list"))
+        self.assertEqual(studies.status_code, 200)
+        self.assertEqual(studies.data["count"], 1)
+        self.assertEqual(studies.data["results"][0]["rid"], visible_attempt.rid)
+
+        hits = lead_api.get(reverse("user-hits-api"))
+        self.assertEqual(hits.status_code, 200)
+        self.assertEqual(hits.data["count"], 1)
+        self.assertEqual(hits.data["results"][0]["user_id"], employee.pk)
+
+        self.client.force_login(team_lead)
+        page = self.client.get(reverse("studies"))
+        self.assertContains(page, "Branch Employee")
+        self.assertNotContains(page, "Other Branch")
+        self.assertNotContains(page, "Branch Manager")
+
+    def test_upstream_transaction_reconciles_legacy_redirect_status_ip_and_loi(self):
+        initiated_at = timezone.now() - timedelta(minutes=63)
+        redirected_at = timezone.now() - timedelta(minutes=3)
+        attempt = SurveyAttempt.objects.create(
+            rid="Mm1Nn2Oo3P", survey=self.survey, platform_user=self.kanik, user_id=str(self.kanik.pk),
+            status=SurveyAttempt.Status.REDIRECTED,
+            initiated_at=initiated_at,
+            redirected_at=redirected_at,
+            initiation_ip="127.0.0.1",
+        )
+        upstream_time = timezone.now()
+        client = Mock()
+        client.get_survey_transactions_by_pid.return_value = [{
+            "PID": attempt.rid,
+            "trackId": attempt.rid,
+            "status": "Completed",
+            "ip": "8.8.4.4",
+            "completeDateTime": upstream_time.isoformat(),
+            "verifyToken": "Valid",
+        }]
+        self.assertTrue(reconcile_attempt_status(client, attempt))
+        attempt.refresh_from_db()
+        self.assertEqual(attempt.status, SurveyAttempt.Status.COMPLETED)
+        self.assertEqual(attempt.status_source, "innovatemr_transaction")
+        self.assertEqual(attempt.initiation_ip, "8.8.4.4")
+        self.assertEqual(attempt.callback_ip, "8.8.4.4")
+        self.assertGreaterEqual(attempt.loi_seconds, 3779)
+        self.assertLess(attempt.loi_seconds, 3790)
+        self.assertTrue(attempt.is_verified)
+        self.assertEqual(attempt.upstream_transaction_data["trackId"], attempt.rid)
+
+    def test_upstream_pre_survey_statuses_collapse_into_five_ui_outcomes(self):
+        cases = [("Pre-Survey Termination", "2"), ("Pre-Survey Over Quota", "3"), ("Pre-Survey Quality Term", "4")]
+        for index, (upstream_status, expected) in enumerate(cases):
+            attempt = SurveyAttempt.objects.create(
+                rid=f"Qq{index}Rr{index}Ss{index}T", survey=self.survey, platform_user=self.kanik,
+                user_id=str(self.kanik.pk), status=SurveyAttempt.Status.REDIRECTED,
+            )
+            client = Mock()
+            client.get_survey_transactions_by_pid.return_value = [{
+                "PID": attempt.rid, "status": upstream_status, "ip": "9.9.9.9",
+            }]
+            reconcile_attempt_status(client, attempt)
+            attempt.refresh_from_db()
+            self.assertEqual(attempt.status, expected)
+
+
+class UserHitsTests(TestCase):
+    def setUp(self):
+        self.owner = get_user_model().objects.create_superuser(
+            username="hits-owner", email="hits-owner@example.test", password="test-password"
+        )
+        self.kanik = get_user_model().objects.create_user(
+            username="kanik-hits", first_name="Kanik", last_name="Gupta", email="kanik-hits@example.test"
+        )
+        self.other = get_user_model().objects.create_user(
+            username="other-hits", first_name="Other", last_name="User", email="other-hits@example.test"
+        )
+        EmployeeProfile.objects.filter(user=self.kanik).update(
+            company_name="Gurgaon", department="Operations", created_by=self.owner
+        )
+        EmployeeProfile.objects.filter(user=self.other).update(
+            company_name="Mumbai", department="Research", created_by=self.owner
+        )
+        self.survey = Survey.objects.create(source_id=909090, name="User hit metrics")
+        today = timezone.localdate()
+        yesterday = today - timedelta(days=1)
+        self.today = today
+        today_at_ten = timezone.make_aware(datetime.combine(today, time(10, 0)))
+        yesterday_at_ten = timezone.make_aware(datetime.combine(yesterday, time(10, 0)))
+
+        SurveyAttempt.objects.create(
+            rid="Dh1Aa2Bb3C", survey=self.survey, platform_user=self.kanik, user_id=str(self.kanik.pk),
+            status=SurveyAttempt.Status.COMPLETED, entry_device="Desktop", initiated_at=today_at_ten,
+        )
+        SurveyAttempt.objects.create(
+            rid="Mh2Cc3Dd4E", survey=self.survey, platform_user=self.kanik, user_id=str(self.kanik.pk),
+            status=SurveyAttempt.Status.TERMINATED, entry_device="Mobile", initiated_at=today_at_ten,
+        )
+        SurveyAttempt.objects.create(
+            rid="Th3Ee4Ff5G", survey=self.survey, platform_user=self.kanik, user_id=str(self.kanik.pk),
+            status=SurveyAttempt.Status.COMPLETED, entry_device="Tablet", initiated_at=yesterday_at_ten,
+        )
+        SurveyAttempt.objects.create(
+            rid="Dh4Gg5Hh6I", survey=self.survey, platform_user=self.other, user_id=str(self.other.pk),
+            status=SurveyAttempt.Status.COMPLETED, entry_device="Desktop", initiated_at=today_at_ten,
+        )
+        self.api = APIClient()
+        self.api.force_authenticate(self.owner)
+
+    def test_page_and_api_aggregate_user_day_device_counts(self):
+        self.client.force_login(self.owner)
+        page = self.client.get(reverse("user-hits"))
+        self.assertEqual(page.status_code, 200)
+        self.assertContains(page, "User activity")
+        self.assertContains(page, "Gurgaon")
+        self.assertContains(page, "Operations")
+        self.assertContains(page, 'id="hitFromDateTime"')
+        self.assertContains(page, 'id="hitToDateTime"')
+        self.assertNotContains(page, 'id="hitFromTime"')
+
+        response = self.api.get(reverse("user-hits-api"), {
+            "user": self.kanik.pk,
+            "from_date": self.today.isoformat(),
+            "to_date": self.today.isoformat(),
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 1)
+        result = response.data["results"][0]
+        self.assertEqual(result["branch"], "Gurgaon")
+        self.assertEqual(result["sub_branch"], "Operations")
+        self.assertEqual(result["hits"], {
+            "total": 2, "desktop": 1, "mobile": 1, "tablet": 0, "unclassified": 0,
+        })
+        self.assertEqual(result["completes"], {
+            "total": 1, "desktop": 1, "mobile": 0, "tablet": 0, "unclassified": 0,
+        })
+        self.assertEqual(response.data["summary"]["conversion_rate"], 50.0)
+
+    def test_time_filters_narrow_ist_date_boundaries(self):
+        response = self.api.get(reverse("user-hits-api"), {
+            "from_date": self.today.isoformat(),
+            "from_time": "10:01",
+            "to_date": self.today.isoformat(),
+            "to_time": "23:59",
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 0)
+
+        invalid = self.api.get(reverse("user-hits-api"), {"from_time": "10:00"})
+        self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(invalid.data["detail"], "from_time requires from_date.")
+
+    def test_branch_filter_and_all_date_rows(self):
+        response = self.api.get(reverse("user-hits-api"), {"branch": "Gurgaon"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 2)
+        self.assertTrue(all(row["user_id"] == self.kanik.pk for row in response.data["results"]))
+        self.assertEqual(response.data["summary"]["hits"]["tablet"], 1)
+
+    def test_permission_and_visibility_are_scoped_to_user_hierarchy(self):
+        viewer = get_user_model().objects.create_user(
+            username="hits-viewer", first_name="Scoped", email="hits-viewer@example.test"
+        )
+        UserFunctionOverride.objects.create(
+            user=viewer,
+            function=AccessFunction.objects.get(code="user_hits.view"),
+            effect=UserFunctionOverride.Effect.ALLOW,
+        )
+        SurveyAttempt.objects.create(
+            rid="Vh5Ii6Jj7K", survey=self.survey, platform_user=viewer, user_id=str(viewer.pk),
+            status=SurveyAttempt.Status.INITIATED, entry_device="Mobile",
+        )
+        scoped_api = APIClient()
+        scoped_api.force_authenticate(viewer)
+        response = scoped_api.get(reverse("user-hits-api"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["results"][0]["user_id"], viewer.pk)
+        self.assertEqual(scoped_api.get(reverse("user-hits-api"), {"branch": "Gurgaon"}).status_code, 403)
+        self.client.force_login(viewer)
+        viewer_page = self.client.get(reverse("user-hits"))
+        self.assertNotContains(viewer_page, 'id="hitBranchLabel"')
+        self.assertNotContains(viewer_page, "<th>Hits</th>", html=True)
+
+        no_access = get_user_model().objects.create_user(username="hits-no-access")
+        denied_api = APIClient()
+        denied_api.force_authenticate(no_access)
+        self.assertEqual(denied_api.get(reverse("user-hits-api")).status_code, 403)
+        self.client.force_login(no_access)
+        self.assertEqual(self.client.get(reverse("user-hits")).status_code, 403)

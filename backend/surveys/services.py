@@ -1,490 +1,345 @@
+import hashlib
 import json
-import re
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta, timezone
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timezone as dt_timezone
 from decimal import Decimal, InvalidOperation
-from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, quote, urlparse
-from urllib.request import Request, urlopen
+from typing import Any
+from zoneinfo import ZoneInfo
 
-import pycountry
-from django.conf import settings
+from dateutil import parser as date_parser
+from django.db import transaction
+from django.utils import timezone
 
+from vendors.models import ClientIntegration
 
-class FeedError(Exception):
-    """Raised when an upstream survey feed cannot be used."""
+from .integrations import InnovateMRAPIError, InnovateMRClient, InnovateMRNotFound
+from .models import Survey, SurveyAttempt, SurveyQuota, SyncRun, TargetingQuestion
+from .survey_flow import normalize_client_ip
 
-
-_cache = {"data": None, "fetched_at": None, "monotonic": 0.0, "stale": False}
-_supplier_cache = {"InnovateMR": None, "BioBrain": None}
-_voqall_language_cache = {}
-_voqall_qualification_catalog_cache = {}
-_voqall_question_detail_cache = {}
-_question_cache = {}
-_cache_lock = threading.Lock()
-_question_cache_lock = threading.Lock()
+logger = logging.getLogger(__name__)
+INNOVATEMR_TIMEZONE = ZoneInfo("America/Los_Angeles")
 
 
-def _clean_payout(value):
+def _integer(value: Any, default: int = 0) -> int:
     try:
-        return float(Decimal(str(value)).quantize(Decimal("0.001")))
-    except (InvalidOperation, TypeError, ValueError):
-        return 0.0
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
-_TIMEZONE_OFFSETS = {
-    "UTC": 0,
-    "GMT": 0,
-    "PST": -8,
-    "PDT": -7,
-    "MST": -7,
-    "MDT": -6,
-    "CST": -6,
-    "CDT": -5,
-    "EST": -5,
-    "EDT": -4,
-}
-
-
-def _country_name(code, fallback=None):
-    normalized_code = str(code or "").strip().upper()
-    fallback_value = str(fallback or "").strip()
-    if fallback_value and len(fallback_value) > 3 and fallback_value.casefold() != "unknown":
-        return fallback_value
-    country = pycountry.countries.get(alpha_2=normalized_code) if len(normalized_code) == 2 else None
-    return country.name if country else (fallback_value or normalized_code or "Unknown")
-
-
-def _normalize_updated_at(value):
-    raw_value = str(value or "").strip()
-    if not raw_value:
+def _decimal(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
         return None
 
+
+def _stable_question_id(item: dict[str, Any]) -> int:
+    parsed = _integer(item.get("QuestionId"), -1)
+    if parsed >= 0:
+        return parsed
+    digest = hashlib.sha256(json.dumps(item, sort_keys=True, default=str).encode()).hexdigest()
+    return -int(digest[:12], 16)
+
+
+def parse_upstream_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
     try:
-        parsed = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
-    except ValueError:
-        timezone_match = re.search(r"\s+(UTC|GMT|PST|PDT|MST|MDT|CST|CDT|EST|EDT)$", raw_value, re.IGNORECASE)
-        timezone_name = timezone_match.group(1).upper() if timezone_match else "UTC"
-        value_without_timezone = raw_value[: timezone_match.start()].strip() if timezone_match else raw_value
-        parsed = None
-        for date_format in ("%m/%d/%Y, %I:%M:%S %p", "%m/%d/%Y %I:%M:%S %p", "%Y-%m-%d %H:%M:%S"):
-            try:
-                parsed = datetime.strptime(value_without_timezone, date_format)
-                break
-            except ValueError:
-                continue
-        if parsed is None:
-            return None
-        parsed = parsed.replace(tzinfo=timezone(timedelta(hours=_TIMEZONE_OFFSETS[timezone_name])))
-
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc).isoformat()
-
-
-def _first(raw, *keys, default=None):
-    for key in keys:
-        value = raw.get(key)
-        if value is not None and value != "":
-            return value
-    return default
-
-
-def _query_value(entry_url, *keys):
-    query = parse_qs(urlparse(entry_url).query)
-    folded = {key.casefold(): values for key, values in query.items()}
-    for key in keys:
-        values = folded.get(key.casefold())
-        if values:
-            return str(values[0]).strip()
-    return ""
-
-
-def _description(raw):
-    parts = []
-    loi = _first(raw, "LOI", "Loi", "loi", "LengthOfInterview", "lengthOfInterview")
-    ir = _first(raw, "IR", "Ir", "ir", "IncidentRate", "incidentRate")
-    if loi not in (None, ""):
-        parts.append(f"LOI: {loi} min")
-    if ir not in (None, ""):
-        parts.append(f"IR: {ir}%")
-    return " · ".join(parts)
-
-
-def normalize_innovatemr_survey(raw):
-    entry_url = str(_first(raw, "entryLink", "entry_url", "entryUrl", default=""))
-    country_code = _first(raw, "CountryCode", "countryCode", "country")
-    return {
-        "survey_id": str(_first(raw, "surveyId", "survey_id", "id", default="")).strip(),
-        "name": str(_first(raw, "surveyName", "name", "title", default="Untitled survey")).strip(),
-        "payout": _clean_payout(_first(raw, "CPI", "cpi", "supplierCPI", "supplierCpi", default=0)),
-        "description": _description(raw),
-        "entry_url": entry_url,
-        "country": _country_name(country_code, _first(raw, "Country")),
-        "company": "InnovateMR",
-        "language_id": str(_first(raw, "LanguageCode", "languageCode", default="")).strip(),
-        "updated_at": _normalize_updated_at(_first(raw, "modifiedDate", "ModifiedDate", "updatedAt", "updated_at", "createdDate")),
-        "placement_id": str(_first(raw, "placementId", "placement_id", default="")).strip()
-        or _query_value(entry_url, "placement_id"),
-    }
-
-
-def normalize_voqall_survey(raw, languages=None):
-    languages = languages or {}
-    entry_url = str(_first(raw, "SurveyUrl", "surveyUrl", "entryLink", "entry_url", "url", default=""))
-    language_id = str(_first(raw, "LanguageId", "languageId", default="")).strip()
-    country_code = _first(raw, "CountryCode", "countryCode", "country", "Country")
-    if not country_code and language_id:
-        country_code = languages.get(language_id)
-
-    return {
-        "survey_id": str(_first(raw, "SurveyId", "surveyId", "survey_id", "id", default="")).strip(),
-        "name": str(_first(raw, "Name", "surveyName", "survey_name", "name", default="Untitled survey")).strip(),
-        "payout": _clean_payout(_first(raw, "Revenue", "revenue", "Cpi", "CPI", "cpi", default=0)),
-        "description": _description(raw),
-        "entry_url": entry_url,
-        "country": _country_name(country_code),
-        "company": "BioBrain",
-        "language_id": language_id,
-        "updated_at": _normalize_updated_at(_first(raw, "LastUpdatedOnUTC", "lastUpdatedOnUTC", "updatedAt", "updated_at", "StartDate")),
-        "placement_id": str(_first(raw, "PlacementId", "placementId", "placement_id", default="")).strip()
-        or _query_value(entry_url, "placement_id"),
-    }
-
-
-def _request_json(url, headers, provider, timeout=None):
-    request = Request(
-        url,
-        headers={
-            "Accept": "application/json",
-            "User-Agent": "AlessarSurveyBoard/2.0",
-            **headers,
-        },
-    )
-    try:
-        with urlopen(request, timeout=timeout or settings.SURVEY_FEED_TIMEOUT) as response:
-            return json.loads(response.read().decode("utf-8-sig"))
-    except (HTTPError, URLError, TimeoutError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise FeedError(f"{provider} is temporarily unavailable.") from exc
-
-
-def _extract_rows(payload, keys, provider):
-    if isinstance(payload, list):
-        return payload
-    if not isinstance(payload, dict):
-        raise FeedError(f"{provider} returned an unexpected response.")
-    if payload.get("hasError") is True or str(payload.get("apiStatus", "success")).casefold() in {"error", "failed", "failure"}:
-        raise FeedError(f"{provider} rejected the inventory request.")
-
-    folded = {str(key).casefold(): value for key, value in payload.items()}
-    for key in keys:
-        rows = folded.get(key.casefold())
-        if isinstance(rows, list):
-            return rows
-    raise FeedError(f"{provider} returned an unexpected response.")
-
-
-def _fetch_innovatemr_surveys():
-    token = settings.INNOVATEMR_ACCESS_TOKEN.strip()
-    if not token:
-        raise FeedError("InnovateMR is not configured.")
-    payload = _request_json(
-        settings.INNOVATEMR_SURVEY_URL,
-        {"x-access-token": token},
-        "InnovateMR",
-    )
-    rows = _extract_rows(payload, ("result", "surveys", "data"), "InnovateMR")
-    surveys = [normalize_innovatemr_survey(row) for row in rows if isinstance(row, dict)]
-    return [survey for survey in surveys if survey["survey_id"] and survey["entry_url"]]
-
-
-def _fetch_voqall_languages(access_key):
-    global _voqall_language_cache
-    if _voqall_language_cache:
-        return _voqall_language_cache
-    try:
-        payload = _request_json(
-            settings.VOQALL_LANGUAGES_URL,
-            {"EQ-PARTNER-ACCESS-KEY": access_key},
-            "BioBrain markets",
+        parsed = date_parser.parse(
+            str(value),
+            fuzzy=True,
+            tzinfos={
+                "PST": INNOVATEMR_TIMEZONE,
+                "PDT": INNOVATEMR_TIMEZONE,
+                "UTC": dt_timezone.utc,
+                "GMT": dt_timezone.utc,
+            },
         )
-        rows = _extract_rows(payload, ("Languages", "languages", "data"), "BioBrain markets")
-        languages = {}
-        for row in rows:
-            if not isinstance(row, dict):
+        if timezone.is_naive(parsed):
+            parsed = timezone.make_aware(parsed, INNOVATEMR_TIMEZONE)
+        return parsed.astimezone(dt_timezone.utc)
+    except (ValueError, TypeError, OverflowError):
+        logger.warning("Could not parse InnovateMR datetime %r", value)
+        return None
+
+
+def payload_modified_at(payload: dict[str, Any]) -> datetime:
+    return parse_upstream_datetime(payload.get("modifiedDate")) or parse_upstream_datetime(payload.get("createdDate")) or datetime.min.replace(tzinfo=dt_timezone.utc)
+
+
+def merge_inventory(*inventories: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    """Deduplicate by surveyId; latest modifiedDate wins (later source wins ties)."""
+    merged: dict[int, dict[str, Any]] = {}
+    for inventory in inventories:
+        for payload in inventory:
+            source_id = _integer(payload.get("surveyId"), -1)
+            if source_id < 0:
+                logger.warning("Ignoring survey payload without a valid surveyId")
                 continue
-            language_id = str(_first(row, "Id", "id", "LanguageId", default="")).strip()
-            country = str(_first(row, "CountryCode", "countryCode", "Name", "name", default="")).strip().upper()
-            if language_id and country:
-                languages[language_id] = country
-        if languages:
-            _voqall_language_cache = languages
-    except FeedError:
-        pass
-    return _voqall_language_cache
+            current = merged.get(source_id)
+            if current is None or payload_modified_at(payload) >= payload_modified_at(current):
+                merged[source_id] = payload
+    return merged
 
 
-def _fetch_voqall_surveys():
-    access_key = settings.VOQALL_ACCESS_KEY.strip()
-    if not access_key:
-        raise FeedError("BioBrain is not configured.")
-    payload = _request_json(
-        settings.VOQALL_SURVEY_URL,
-        {"EQ-PARTNER-ACCESS-KEY": access_key},
-        "BioBrain",
-    )
-    rows = _extract_rows(payload, ("Surveys", "surveys", "result", "data"), "BioBrain")
-    languages = _fetch_voqall_languages(access_key)
-    surveys = [normalize_voqall_survey(row, languages) for row in rows if isinstance(row, dict)]
-    return [survey for survey in surveys if survey["survey_id"] and survey["entry_url"]]
-
-
-def _normalize_question_option(raw):
-    if not isinstance(raw, dict):
-        value = str(raw).strip()
-        return {"id": value, "text": value}
-    option_id = str(_first(raw, "OptionId", "optionId", "Id", "id", "OptionCode", "optionCode", default="")).strip()
-    text = _first(raw, "OptionText", "optionText", "Text", "text", "Name", "name")
-    if text in (None, ""):
-        age_start = _first(raw, "ageStart", "AgeStart")
-        age_end = _first(raw, "ageEnd", "AgeEnd")
-        if age_start not in (None, "") or age_end not in (None, ""):
-            text = f"{age_start or ''}–{age_end or ''}".strip("–")
-        else:
-            text = option_id
-    return {"id": option_id, "text": str(text).strip()}
-
-
-def normalize_innovatemr_question(raw):
-    question_id = str(_first(raw, "QuestionId", "questionId", "id", default="")).strip()
-    code = str(_first(raw, "QuestionKey", "questionKey", "Code", "code", default="")).strip()
-    text = str(_first(raw, "QuestionText", "questionText", "text", default=code or f"Question {question_id}")).strip()
-    options = [_normalize_question_option(option) for option in (_first(raw, "Options", "options", default=[]) or [])]
+def _survey_values(payload: dict[str, Any], seen_at: datetime) -> dict[str, Any]:
     return {
-        "id": question_id,
-        "code": code,
-        "text": text,
-        "type": str(_first(raw, "QuestionType", "questionType", "TypeName", default="")).strip(),
-        "category": str(_first(raw, "QuestionCategory", "questionCategory", "Category", default="")).strip(),
-        "options": [option for option in options if option["text"]],
+        "company_name": "InnovateMR",
+        "name": str(payload.get("surveyName") or ""),
+        "status": Survey.Status.LIVE,
+        "sample_size": max(0, _integer(payload.get("N"))),
+        "completes": max(0, _integer(payload.get("supCmps"))),
+        "remaining": max(0, _integer(payload.get("remainingN"))),
+        "starts": max(0, _integer(payload.get("numberOfStarts"))),
+        "cpi": _decimal(payload.get("CPI")),
+        "loi": max(0, _integer(payload.get("LOI"))) if payload.get("LOI") is not None else None,
+        "incidence_rate": _decimal(payload.get("IR")),
+        "country": str(payload.get("Country") or ""),
+        "country_code": str(payload.get("CountryCode") or "").upper(),
+        "language": str(payload.get("Language") or ""),
+        "language_code": str(payload.get("LanguageCode") or "").upper(),
+        "group_type": str(payload.get("groupType") or ""),
+        "device_type": str(payload.get("deviceType") or ""),
+        "entry_link": str(payload.get("entryLink") or ""),
+        "test_entry_link": str(payload.get("testEntryLink") or ""),
+        "job_category": str(payload.get("jobCategory") or ""),
+        "has_quota": bool(payload.get("isQuota")),
+        "is_pii_required": bool(payload.get("isPIIRequired")),
+        "is_recontact": bool(payload.get("reContact")),
+        "source_created_at": parse_upstream_datetime(payload.get("createdDate")),
+        "source_modified_at": parse_upstream_datetime(payload.get("modifiedDate")),
+        "last_seen_at": seen_at,
+        "raw_data": payload,
     }
 
 
-def _fetch_innovatemr_questions(survey_id):
-    token = settings.INNOVATEMR_ACCESS_TOKEN.strip()
-    if not token:
-        raise FeedError("InnovateMR is not configured.")
-    url = f"{settings.INNOVATEMR_TARGETING_URL.rstrip('/')}/{quote(str(survey_id), safe='')}"
-    payload = _request_json(
-        url,
-        {"x-access-token": token},
-        "InnovateMR targeting",
-        timeout=settings.SURVEY_QUESTION_TIMEOUT,
-    )
-    rows = _extract_rows(payload, ("result", "targeting", "questions", "data"), "InnovateMR targeting")
-    return [normalize_innovatemr_question(row) for row in rows if isinstance(row, dict)]
+def _detail_changed(existing: Survey, incoming: dict[str, Any]) -> bool:
+    incoming_modified = payload_modified_at(incoming)
+    existing_modified = existing.source_modified_at or existing.source_created_at or datetime.min.replace(tzinfo=dt_timezone.utc)
+    if incoming_modified > existing_modified:
+        return True
+    comparable_existing = json.dumps(existing.raw_data, sort_keys=True, default=str)
+    comparable_incoming = json.dumps(incoming, sort_keys=True, default=str)
+    return comparable_existing != comparable_incoming or existing.status != Survey.Status.LIVE
 
 
-def _fetch_voqall_qualification_catalog(access_key):
-    global _voqall_qualification_catalog_cache
-    if _voqall_qualification_catalog_cache:
-        return _voqall_qualification_catalog_cache
+def replace_survey_quotas(client: InnovateMRClient, survey: Survey) -> None:
     try:
-        payload = _request_json(
-            settings.VOQALL_QUALIFICATION_CATALOG_URL,
-            {"EQ-PARTNER-ACCESS-KEY": access_key},
-            "BioBrain qualification catalog",
-            timeout=settings.SURVEY_QUESTION_TIMEOUT,
-        )
-        rows = _extract_rows(payload, ("Qualifications", "qualifications", "data"), "BioBrain qualification catalog")
-        catalog = {}
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            qualification_id = str(_first(row, "Id", "id", "QualificationId", default="")).strip()
-            if qualification_id:
-                catalog[qualification_id] = row
-        if catalog:
-            _voqall_qualification_catalog_cache = catalog
-    except FeedError:
-        pass
-    return _voqall_qualification_catalog_cache
-
-
-def _fetch_voqall_question_detail(access_key, language_id, qualification_id):
-    cache_key = (str(language_id), str(qualification_id))
-    with _question_cache_lock:
-        cached = _voqall_question_detail_cache.get(cache_key)
-    if cached is not None:
-        return cached
-
-    url = settings.VOQALL_QUALIFICATION_DETAIL_URL.format(
-        language_id=quote(str(language_id), safe=""),
-        qualification_id=quote(str(qualification_id), safe=""),
-    )
-    payload = _request_json(
-        url,
-        {"EQ-PARTNER-ACCESS-KEY": access_key},
-        "BioBrain qualification detail",
-        timeout=settings.SURVEY_QUESTION_TIMEOUT,
-    )
-    detail = payload.get("Qualification") if isinstance(payload, dict) else None
-    if not isinstance(detail, dict):
-        raise FeedError("BioBrain qualification detail returned an unexpected response.")
-    with _question_cache_lock:
-        _voqall_question_detail_cache[cache_key] = detail
-    return detail
-
-
-def _allowed_voqall_options(raw, detail):
-    allowed_values = {
-        str(value).strip()
-        for value in ((_first(raw, "OptionIds", "optionIds", default=[]) or []) + (_first(raw, "OptionCodes", "optionCodes", default=[]) or []))
-        if str(value).strip()
-    }
-    detail_options = _first(detail, "Options", "options", default=[]) or []
-    normalized = []
-    for option in detail_options:
-        if not isinstance(option, dict):
-            continue
-        identifiers = {
-            str(value).strip()
-            for value in (
-                _first(option, "Id", "id"),
-                _first(option, "OptionId", "optionId"),
-                _first(option, "OptionCode", "optionCode"),
+        quotas = client.get_quota_for_survey(survey.source_id)
+    except InnovateMRNotFound:
+        quotas = []
+    with transaction.atomic():
+        survey.quotas.all().delete()
+        SurveyQuota.objects.bulk_create([
+            SurveyQuota(
+                survey=survey,
+                source_key=str(item.get("_id") or item.get("id") or hashlib.sha256(json.dumps(item, sort_keys=True, default=str).encode()).hexdigest()),
+                quota_id=_integer(item.get("id"), 0) or None,
+                title=str(item.get("title") or ""),
+                name=str(item.get("quotaName") or ""),
+                sample_size=max(0, _integer(item.get("quotaN"))),
+                remaining=max(0, _integer(item.get("RemainingN"))),
+                completes=max(0, _integer(item.get("cmp"))),
+                clicks=max(0, _integer(item.get("clk"))),
+                status=str(item.get("quotaStatus") or ""),
+                targeting=item.get("targeting") if isinstance(item.get("targeting"), dict) else {},
+                raw_data=item,
             )
-            if value not in (None, "")
-        }
-        if allowed_values and identifiers.isdisjoint(allowed_values):
-            continue
-        normalized.append(_normalize_question_option(option))
-    if not normalized and allowed_values:
-        normalized = [{"id": value, "text": value} for value in sorted(allowed_values)]
-    return normalized
+            for item in quotas
+        ])
+        survey.quota_synced_at = timezone.now()
+        survey.save(update_fields=["quota_synced_at", "updated_at"])
 
 
-def _normalize_voqall_question(raw, detail, catalog):
-    qualification_id = str(_first(raw, "QualificationId", "qualificationId", "Id", default="")).strip()
-    fallback = catalog.get(qualification_id, {})
-    source = detail or fallback
-    code = str(_first(source, "Code", "code", default=f"Qualification {qualification_id}")).strip()
-    return {
-        "id": qualification_id,
-        "code": code,
-        "text": str(_first(source, "QuestionText", "questionText", default=code)).strip(),
-        "type": str(_first(source, "TypeName", "typeName", default="")).strip(),
-        "category": "Qualification",
-        "options": _allowed_voqall_options(raw, detail or {}),
-    }
+def replace_survey_targeting(client: InnovateMRClient, survey: Survey) -> None:
+    try:
+        targeting = client.get_survey_targeting(survey.source_id)
+    except InnovateMRNotFound:
+        targeting = []
+    with transaction.atomic():
+        survey.targeting_questions.all().delete()
+        TargetingQuestion.objects.bulk_create([
+            TargetingQuestion(
+                survey=survey,
+                question_id=_stable_question_id(item),
+                key=str(item.get("QuestionKey") or ""),
+                text=str(item.get("QuestionText") or ""),
+                question_type=str(item.get("QuestionType") or ""),
+                category=str(item.get("QuestionCategory") or ""),
+                options=item.get("Options") if isinstance(item.get("Options"), list) else [],
+                raw_data=item,
+            )
+            for item in targeting
+        ])
+        survey.targeting_synced_at = timezone.now()
+        survey.save(update_fields=["targeting_synced_at", "updated_at"])
 
 
-def _fetch_voqall_questions(survey_id, language_id):
-    access_key = settings.VOQALL_ACCESS_KEY.strip()
-    if not access_key:
-        raise FeedError("BioBrain is not configured.")
-    url = f"{settings.VOQALL_SURVEY_QUALIFICATIONS_URL.rstrip('/')}/{quote(str(survey_id), safe='')}"
-    payload = _request_json(
-        url,
-        {"EQ-PARTNER-ACCESS-KEY": access_key},
-        "BioBrain qualifications",
-        timeout=settings.SURVEY_QUESTION_TIMEOUT,
+def replace_survey_details(client: InnovateMRClient, survey: Survey) -> None:
+    """Refresh both collections independently, preserving any successful side."""
+    errors: list[InnovateMRAPIError] = []
+    for refresh in (replace_survey_quotas, replace_survey_targeting):
+        try:
+            refresh(client, survey)
+        except InnovateMRAPIError as exc:
+            errors.append(exc)
+    survey.refresh_from_db(fields=["quota_synced_at", "targeting_synced_at"])
+    if survey.quota_synced_at and survey.targeting_synced_at:
+        survey.detail_synced_at = min(survey.quota_synced_at, survey.targeting_synced_at)
+        survey.save(update_fields=["detail_synced_at", "updated_at"])
+    if errors:
+        raise errors[0]
+
+
+def _transaction_status(value: Any) -> str | None:
+    normalized = "".join(character for character in str(value or "").lower() if character.isalnum())
+    if normalized in {"1", "complete", "completed", "success", "qualified"}:
+        return SurveyAttempt.Status.COMPLETED
+    if normalized in {"4", "8"} or "quality" in normalized or "qualterm" in normalized:
+        return SurveyAttempt.Status.QUALITY_TERMINATED
+    if normalized in {"3", "7"} or "quota" in normalized:
+        return SurveyAttempt.Status.OVER_QUOTA
+    if normalized in {"2", "5"} or "fail" in normalized or "term" in normalized:
+        return SurveyAttempt.Status.TERMINATED
+    return None
+
+
+def _attempt_transaction(attempt: SurveyAttempt, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    for row in rows:
+        identifiers = {str(row.get(key) or "") for key in ("trackId", "PID", "pid")}
+        if attempt.rid in identifiers:
+            return row
+    if not rows:
+        return {}
+    return max(
+        rows,
+        key=lambda row: parse_upstream_datetime(
+            row.get("completeDateTime") or row.get("st_date_time") or row.get("clkDateTime")
+        ) or datetime.min.replace(tzinfo=dt_timezone.utc),
     )
-    rows = _extract_rows(payload, ("Qualifications", "qualifications", "result", "data"), "BioBrain qualifications")
-    rows = [row for row in rows if isinstance(row, dict)]
-    catalog = _fetch_voqall_qualification_catalog(access_key)
-
-    details = {}
-    qualification_ids = {
-        str(_first(row, "QualificationId", "qualificationId", "Id", default="")).strip()
-        for row in rows
-    }
-    qualification_ids.discard("")
-    if language_id and qualification_ids:
-        with ThreadPoolExecutor(max_workers=min(8, len(qualification_ids))) as executor:
-            futures = {
-                executor.submit(_fetch_voqall_question_detail, access_key, language_id, qualification_id): qualification_id
-                for qualification_id in qualification_ids
-            }
-            for future in as_completed(futures):
-                qualification_id = futures[future]
-                try:
-                    details[qualification_id] = future.result()
-                except FeedError:
-                    continue
-
-    return [
-        _normalize_voqall_question(
-            row,
-            details.get(str(_first(row, "QualificationId", "qualificationId", "Id", default="")).strip(), {}),
-            catalog,
-        )
-        for row in rows
-    ]
 
 
-def get_survey_questions(survey, force=False):
-    company = str(survey.get("company", "")).strip()
-    survey_id = str(survey.get("survey_id", "")).strip()
-    cache_key = (company.casefold(), survey_id)
-    now = time.monotonic()
-    with _question_cache_lock:
-        cached = _question_cache.get(cache_key)
-        if cached and not force and now - cached["monotonic"] < settings.SURVEY_QUESTION_CACHE_SECONDS:
-            return cached["data"]
+def reconcile_attempt_status(client: InnovateMRClient, attempt: SurveyAttempt) -> bool:
+    """Reconcile one redirected attempt when legacy redirect URLs bypass our callback."""
+    rows = client.get_survey_transactions_by_pid(attempt.survey.source_id, attempt.rid)
+    upstream = _attempt_transaction(attempt, rows)
+    checked_at = timezone.now()
+    terminal_status = _transaction_status(upstream.get("status")) if upstream else None
 
-    if company.casefold() == "innovatemr":
-        questions = _fetch_innovatemr_questions(survey_id)
-    elif company.casefold() == "biobrain":
-        questions = _fetch_voqall_questions(survey_id, str(survey.get("language_id", "")).strip())
-    else:
-        raise FeedError("Question data is not supported for this supplier.")
+    with transaction.atomic():
+        locked = SurveyAttempt.objects.select_for_update().get(pk=attempt.pk)
+        locked.upstream_checked_at = checked_at
+        locked.upstream_transaction_data = upstream
+        update_fields = ["upstream_checked_at", "upstream_transaction_data", "updated_at"]
 
-    result = {
-        "company": company,
-        "survey_id": survey_id,
-        "questions": questions,
-        "fetched_at": datetime.now(timezone.utc).isoformat(),
-    }
-    with _question_cache_lock:
-        _question_cache[cache_key] = {"data": result, "monotonic": now}
-    return result
+        upstream_ip = normalize_client_ip(upstream.get("ip")) if upstream else None
+        if upstream_ip and not normalize_client_ip(locked.initiation_ip):
+            locked.initiation_ip = upstream_ip
+            update_fields.append("initiation_ip")
+
+        if terminal_status and locked.callback_at is None and locked.status in {
+            SurveyAttempt.Status.INITIATED,
+            SurveyAttempt.Status.REDIRECTED,
+        }:
+            completed_at = parse_upstream_datetime(
+                upstream.get("completeDateTime") or upstream.get("st_date_time")
+            ) or checked_at
+            if completed_at < locked.loi_started_at:
+                completed_at = checked_at
+            locked.status = terminal_status
+            locked.status_source = "innovatemr_transaction"
+            locked.callback_at = completed_at
+            locked.last_callback_at = completed_at
+            locked.callback_ip = upstream_ip
+            locked.loi_seconds = locked.calculate_loi_seconds(completed_at)
+            locked.is_verified = str(upstream.get("verifyToken") or "").lower() == "valid"
+            update_fields.extend([
+                "status", "status_source", "callback_at", "last_callback_at", "callback_ip", "loi_seconds",
+                "is_verified",
+            ])
+
+        locked.save(update_fields=list(dict.fromkeys(update_fields)))
+        if terminal_status:
+            from vendors.services import finalize_attempt_capacity
+
+            finalize_attempt_capacity(locked)
+    return bool(terminal_status)
 
 
-def get_surveys(force=False):
-    """Return both supplier inventories with short caching and per-supplier fallback."""
-    now = time.monotonic()
-    with _cache_lock:
-        age = now - _cache["monotonic"]
-        if not force and _cache["data"] is not None and age < settings.SURVEY_CACHE_SECONDS:
-            return _cache["data"], _cache["fetched_at"], _cache["stale"]
+@dataclass
+class SyncSummary:
+    run_id: int
+    status: str
+    created: int
+    updated: int
+    unchanged: int
+    closed: int
+    detail_failures: int
 
-        combined = []
-        failed = []
-        live_suppliers = 0
-        for name, fetcher in (
-            ("InnovateMR", _fetch_innovatemr_surveys),
-            ("BioBrain", _fetch_voqall_surveys),
-        ):
-            try:
-                rows = fetcher()
-                _supplier_cache[name] = rows
-                combined.extend(rows)
-                live_suppliers += 1
-            except FeedError:
-                failed.append(name)
-                cached_rows = _supplier_cache.get(name)
-                if cached_rows is not None:
-                    combined.extend(cached_rows)
 
-        if live_suppliers == 0 and not combined:
-            if _cache["data"] is not None:
-                return _cache["data"], _cache["fetched_at"], True
-            raise FeedError("No live supplier feed could be reached. Check the supplier API environment variables.")
+def sync_surveys(client: InnovateMRClient | None = None, integration: ClientIntegration | None = None) -> SyncSummary:
+    if integration is None:
+        integration = ClientIntegration.objects.filter(is_active=True, client__is_active=True).order_by("id").first()
+    client = client or InnovateMRClient(integration=integration)
+    run = SyncRun.objects.create(integration=integration)
+    now = timezone.now()
 
-        fetched_at = datetime.now(timezone.utc)
-        stale = bool(failed)
-        _cache.update(data=combined, fetched_at=fetched_at, monotonic=now, stale=stale)
-        return combined, fetched_at, stale
+    try:
+        full_inventory = client.get_allocated_surveys()
+        paged = client.get_allocated_surveys_paged()
+        merged = merge_inventory(full_inventory, paged.surveys)
+        run.fetched_full = len(full_inventory)
+        run.fetched_paged = len(paged.surveys)
+        run.unique_surveys = len(merged)
+
+        with transaction.atomic():
+            source_client = integration.client if integration else None
+            for source_id, payload in merged.items():
+                lookup = Survey.objects.filter(source_id=source_id)
+                lookup = lookup.filter(integration=integration) if integration else lookup.filter(integration__isnull=True)
+                existing = lookup.first()
+                values = _survey_values(payload, now)
+                values["client"] = source_client
+                values["integration"] = integration
+                if existing is None:
+                    survey = Survey.objects.create(source_id=source_id, **values)
+                    run.created += 1
+                elif _detail_changed(existing, payload):
+                    for field, value in values.items():
+                        setattr(existing, field, value)
+                    existing.save()
+                    run.updated += 1
+                else:
+                    existing.last_seen_at = now
+                    existing.save(update_fields=["last_seen_at"])
+                    run.unchanged += 1
+
+            closed = Survey.objects.filter(status=Survey.Status.LIVE, integration=integration)
+            closed = closed.exclude(source_id__in=merged.keys())
+            run.closed = closed.update(status=Survey.Status.CLOSED, updated_at=now)
+
+        # Detail endpoints are refreshed separately in bounded batches. This
+        # keeps a large initial inventory import inside its one-minute window.
+        run.status = SyncRun.Status.SUCCESS
+    except Exception as exc:
+        run.status = SyncRun.Status.FAILED
+        run.error = str(exc)[:10000]
+        logger.exception("InnovateMR survey sync failed")
+        raise
+    finally:
+        run.finished_at = timezone.now()
+        run.save()
+
+    return SyncSummary(
+        run_id=run.id,
+        status=run.status,
+        created=run.created,
+        updated=run.updated,
+        unchanged=run.unchanged,
+        closed=run.closed,
+        detail_failures=run.detail_failures,
+    )

@@ -1,8 +1,7 @@
 import { LogIn, Menu, X } from 'lucide-react';
 import { useState } from 'react';
 
-const dashboardLoginUrl =
-  import.meta.env.VITE_DASHBOARD_LOGIN_URL || 'https://api.alessarsolutions.in/login/';
+const dashboardLoginUrl = '/login';
 
 const links = [
   { id: 'home', label: 'Home' },

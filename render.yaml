@@ -10,8 +10,8 @@ services:
     runtime: python
     rootDir: backend
     plan: free
-    buildCommand: bash build.sh
-    startCommand: bash start.sh
+    buildCommand: pip install -r requirements.txt && python manage.py collectstatic --no-input
+    startCommand: python manage.py migrate --no-input && gunicorn config.wsgi:application --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 60
     healthCheckPath: /login/
     envVars:
       - key: PYTHON_VERSION
@@ -20,10 +20,14 @@ services:
         generateValue: true
       - key: DJANGO_DEBUG
         value: "false"
+      - key: DJANGO_BEHIND_HTTPS_PROXY
+        value: "true"
       - key: DJANGO_ALLOWED_HOSTS
         value: api.alessarsolutions.in,.onrender.com
       - key: DJANGO_CSRF_TRUSTED_ORIGINS
-        value: https://api.alessarsolutions.in
+        value: https://api.alessarsolutions.in,https://alessarsolutions.in,https://www.alessarsolutions.in,https://alessar-solutions.onrender.com
+      - key: DJANGO_CORS_ALLOWED_ORIGINS
+        value: https://alessarsolutions.in,https://www.alessarsolutions.in,https://alessar-solutions.onrender.com
       - key: INNOVATEMR_ACCESS_TOKEN
         sync: false
       - key: VOQALL_ACCESS_KEY
@@ -48,8 +52,8 @@ services:
     buildCommand: npm ci && npm run build
     staticPublishPath: ./dist
     envVars:
-      - key: VITE_DASHBOARD_LOGIN_URL
-        value: https://api.alessarsolutions.in/login/
+      - key: VITE_DASHBOARD_URL
+        value: https://api.alessarsolutions.in
     routes:
       - type: rewrite
         source: /*
