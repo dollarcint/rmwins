@@ -1,9 +1,12 @@
 import csv
+import os
+import zipfile
 from datetime import datetime, time, timedelta
-from io import StringIO
+from io import BytesIO, StringIO
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
+from xml.etree import ElementTree
 
 from django.test import TestCase, override_settings
 from django.contrib.auth import get_user_model
@@ -12,11 +15,10 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from accounts.models import AccessFunction, EmployeeProfile, Role, UserFunctionOverride
-from vendors.models import Client
+from vendors.models import Client, ClientIntegration, OrganizationUnit
 
-from .credential_guard import reconcile_innovatemr_credential
 from .integrations import InnovateMRClient, InnovateMRNotFound, PagedSurveyResult
-from .models import IntegrationCredentialState, Survey, SurveyAttempt, SurveyQuota, SyncRun, TargetingQuestion
+from .models import Survey, SurveyAttempt, SurveyQuota, SyncLease, SyncRun, TargetingQuestion
 from .services import (
     merge_inventory,
     parse_upstream_datetime,
@@ -24,6 +26,23 @@ from .services import (
     replace_survey_details,
     sync_surveys,
 )
+from .survey_flow import create_attempt
+
+
+def xlsx_rows(response, sheet_number=1):
+    content = b"".join(response.streaming_content)
+    with zipfile.ZipFile(BytesIO(content)) as workbook:
+        root = ElementTree.fromstring(workbook.read(f"xl/worksheets/sheet{sheet_number}.xml"))
+    namespace = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    rows = []
+    for row in root.findall(".//x:sheetData/x:row", namespace):
+        values = []
+        for cell in row.findall("x:c", namespace):
+            inline = cell.find("x:is/x:t", namespace)
+            numeric = cell.find("x:v", namespace)
+            values.append(inline.text if inline is not None else numeric.text if numeric is not None else "")
+        rows.append(values)
+    return rows
 
 
 def survey_payload(survey_id=12632, modified="09/11/2017, 11:50:27 pm PST", **overrides):
@@ -40,6 +59,7 @@ def survey_payload(survey_id=12632, modified="09/11/2017, 11:50:27 pm PST", **ov
         "Language": "ENGLISH",
         "LanguageCode": "EN",
         "groupType": "Consumer",
+        "BuyerId": 3690,
         "deviceType": "All",
         "createdDate": "09/11/2017, 11:03:50 pm PST",
         "modifiedDate": modified,
@@ -95,6 +115,8 @@ class SurveySyncTests(TestCase):
         survey = Survey.objects.get(source_id=12632)
         self.assertEqual(summary.created, 1)
         self.assertEqual(survey.name, "Newest")
+        self.assertEqual(survey.buyer_id, "3690")
+        self.assertEqual(survey.survey_type, "B2C")
         self.assertEqual(survey.client, Client.objects.get(code="innovatemr"))
         self.assertEqual(len(survey.local_id), 14)
         self.assertTrue(survey.local_id.isdigit())
@@ -119,57 +141,108 @@ class SurveySyncTests(TestCase):
         self.assertIsNotNone(survey.quota_synced_at)
         self.assertIsNotNone(survey.targeting_synced_at)
 
+    @override_settings(
+        CLIENT_INTEGRATION_INNOVATEMR_SYNC_INTERVAL_SECONDS=150,
+        CLIENT_INTEGRATION_RFG_SYNC_INTERVAL_SECONDS=60,
+    )
+    @patch("surveys.tasks.sync_client_integration_task.delay")
+    def test_dispatcher_automates_innovatemr_and_verified_rfg_at_fixed_intervals(self, delay):
+        from .tasks import dispatch_due_integrations_task
 
-class CredentialGuardTests(TestCase):
-    def setUp(self):
-        self.survey = Survey.objects.create(
-            source_id=9001,
-            entry_link="https://example.test/live?supCode=1150",
-            test_entry_link="https://example.test/test?supCode=1150",
-            raw_data={"entryLink": "https://example.test/live?supCode=1150"},
-            detail_synced_at=timezone.now(),
-            quota_synced_at=timezone.now(),
-            targeting_synced_at=timezone.now(),
+        ClientIntegration.objects.all().delete()
+        now = timezone.now()
+        innovate_client = Client.objects.create(code="auto-innovate", name="Auto Innovate", provider_code="innovatemr")
+        rfg_client = Client.objects.create(code="auto-rfg", name="Auto RFG", provider_code="rfg")
+        custom_client = Client.objects.create(code="manual-custom", name="Manual Custom", provider_code="custom")
+        innovate = ClientIntegration.objects.create(
+            client=innovate_client, name="Innovate automatic", provider_code="innovatemr",
+            base_url="https://supplier.innovatemr.net/api/v2", sync_interval_seconds=999,
+            scheduled_sync_enabled=False, last_sync_started_at=now - timedelta(seconds=151),
+        )
+        rfg = ClientIntegration.objects.create(
+            client=rfg_client, name="RFG automatic", provider_code="rfg",
+            base_url="https://api.researchforgood.com/API", sync_interval_seconds=999,
+            scheduled_sync_enabled=False, last_test_status="success",
+            last_sync_started_at=now - timedelta(seconds=61),
+        )
+        ClientIntegration.objects.create(
+            client=custom_client, name="Custom manual", provider_code="custom",
+            base_url="https://example.test/api", sync_interval_seconds=60,
+            scheduled_sync_enabled=False, last_sync_started_at=now - timedelta(days=1),
+        )
+        ClientIntegration.objects.create(
+            client=rfg_client, name="RFG unverified", provider_code="rfg",
+            base_url="https://api.researchforgood.com/API", sync_interval_seconds=60,
+            scheduled_sync_enabled=False, last_test_status="",
+            last_sync_started_at=now - timedelta(days=1),
         )
 
-    def test_first_check_clears_unverified_links_and_stores_only_fingerprint(self):
-        result = reconcile_innovatemr_credential("token-a")
+        result = dispatch_due_integrations_task()
 
-        self.assertTrue(result.initialized)
-        self.assertEqual(result.links_cleared, 1)
-        self.survey.refresh_from_db()
-        self.assertEqual(self.survey.entry_link, "")
-        self.assertEqual(self.survey.test_entry_link, "")
-        self.assertEqual(self.survey.raw_data, {})
-        state = IntegrationCredentialState.objects.get(provider="innovatemr")
-        self.assertNotEqual(state.credential_fingerprint, "token-a")
-        self.assertEqual(len(state.credential_fingerprint), 64)
-
-    def test_same_token_keeps_current_links(self):
-        reconcile_innovatemr_credential("token-a")
-        Survey.objects.filter(pk=self.survey.pk).update(
-            entry_link="https://example.test/current?supCode=508"
+        self.assertEqual(result["count"], 2)
+        self.assertEqual({call.args[0] for call in delay.call_args_list}, {innovate.pk, rfg.pk})
+        self.assertEqual(
+            set(ClientIntegration.objects.filter(last_sync_status="queued").values_list("pk", flat=True)),
+            {innovate.pk, rfg.pk},
         )
 
-        result = reconcile_innovatemr_credential("token-a")
 
-        self.assertFalse(result.changed)
-        self.assertEqual(result.links_cleared, 0)
-        self.survey.refresh_from_db()
-        self.assertIn("supCode=508", self.survey.entry_link)
+    @patch("surveys.tasks.sync_client_integration_task.delay")
+    def test_hidden_biobrain_is_queued_only_after_its_api_key_exists(self, delay):
+        from .tasks import dispatch_due_integrations_task
 
-    def test_changed_token_clears_current_links_immediately(self):
-        reconcile_innovatemr_credential("token-a")
-        Survey.objects.filter(pk=self.survey.pk).update(
-            entry_link="https://example.test/current?supCode=508"
+        client = Client.objects.create(
+            code="auto-biobrain", name="BioBrain", provider_code="biobrain", is_active=False
         )
+        integration = ClientIntegration.objects.create(
+            client=client, name="BioBrain automatic", provider_code="biobrain",
+            base_url="https://partner-api.voqall.com/api/v1/surveys",
+            credential_env_key="TEST_BIOBRAIN_API_KEY", scheduled_sync_enabled=True,
+            sync_interval_seconds=60, last_sync_started_at=timezone.now() - timedelta(seconds=61),
+        )
+        with patch.dict(os.environ, {"TEST_BIOBRAIN_API_KEY": ""}):
+            self.assertNotIn(integration.pk, dispatch_due_integrations_task()["queued"])
+        with patch.dict(os.environ, {"TEST_BIOBRAIN_API_KEY": "bio-secret"}):
+            self.assertIn(integration.pk, dispatch_due_integrations_task()["queued"])
 
-        result = reconcile_innovatemr_credential("token-b")
+    @patch("surveys.tasks.sync_client_integration_task.delay")
+    def test_dispatcher_does_not_requeue_an_integration_with_an_active_lease(self, delay):
+        from .tasks import dispatch_due_integrations_task
 
-        self.assertTrue(result.changed)
-        self.assertEqual(result.links_cleared, 1)
-        self.survey.refresh_from_db()
-        self.assertEqual(self.survey.entry_link, "")
+        ClientIntegration.objects.all().delete()
+        client = Client.objects.create(
+            code="leased-cint", name="Leased Cint", provider_code="cint"
+        )
+        integration = ClientIntegration.objects.create(
+            client=client, name="Cint running", provider_code="cint",
+            base_url="https://api.samplicio.us", supplier_code="50",
+            last_test_status="success", last_sync_started_at=timezone.now() - timedelta(minutes=2),
+        )
+        self.assertTrue(SyncLease.acquire(f"integration-{integration.pk}-sync", seconds=300))
+
+        result = dispatch_due_integrations_task()
+
+        self.assertNotIn(integration.pk, result["queued"])
+        delay.assert_not_called()
+
+    @patch("surveys.tasks.sync_surveys")
+    def test_successful_biobrain_inventory_publishes_hidden_client(self, sync_mock):
+        from types import SimpleNamespace
+        from .tasks import sync_client_integration_task
+
+        client = Client.objects.create(
+            code="publish-biobrain", name="BioBrain", provider_code="biobrain", is_active=False
+        )
+        integration = ClientIntegration.objects.create(
+            client=client, name="BioBrain publish", provider_code="biobrain",
+            base_url="https://partner-api.voqall.com/api/v1/surveys",
+            credential_env_key="TEST_BIOBRAIN_PUBLISH_KEY", scheduled_sync_enabled=True,
+        )
+        sync_mock.return_value = SimpleNamespace(created=1, updated=0, unchanged=0, closed=0)
+        with patch.dict(os.environ, {"TEST_BIOBRAIN_PUBLISH_KEY": "bio-secret"}):
+            sync_client_integration_task(integration.pk)
+        client.refresh_from_db()
+        self.assertTrue(client.is_active)
 
 
 class InnovateMRClientTests(TestCase):
@@ -253,6 +326,20 @@ class SurveyAPITests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["count"], 2)
 
+    def test_buyer_and_survey_type_filters_are_server_side(self):
+        self.survey.buyer_id = "3690"
+        self.survey.group_type = "Consumer"
+        self.survey.survey_type = "B2C"
+        self.survey.save(update_fields=["buyer_id", "group_type", "survey_type"])
+        Survey.objects.create(source_id=9880, buyer_id="4417", group_type="Business", survey_type="B2B")
+
+        response = self.api.get(reverse("survey-list"), {"buyer_id": "3690", "survey_type": "B2C"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["results"][0]["buyer_id"], "3690")
+        self.assertEqual(response.data["results"][0]["survey_type"], "B2C")
+
     def test_cpi_range_and_sort_are_applied_server_side(self):
         UserFunctionOverride.objects.create(
             user=self.user,
@@ -280,7 +367,8 @@ class SurveyAPITests(TestCase):
         response = self.api.get(reverse("survey-export"), {"max_cpi": "3.00", "ordering": "-cpi"})
         self.assertEqual(response.status_code, 200)
         self.assertIn("projects-", response["Content-Disposition"])
-        rows = list(csv.reader(StringIO(b"".join(response.streaming_content).decode("utf-8-sig"))))
+        self.assertIn(".xlsx", response["Content-Disposition"])
+        rows = xlsx_rows(response)
         self.assertIn("Project ID", rows[0])
         self.assertIn("CPI", rows[0])
         self.assertIn(str(self.survey.source_id), rows[1])
@@ -292,7 +380,7 @@ class SurveyAPITests(TestCase):
             effect=UserFunctionOverride.Effect.DENY,
         )
         denied_response = self.api.get(reverse("survey-export"), {"max_cpi": "3.00"})
-        denied_rows = list(csv.reader(StringIO(b"".join(denied_response.streaming_content).decode("utf-8-sig"))))
+        denied_rows = xlsx_rows(denied_response)
         self.assertNotIn("CPI", denied_rows[0])
 
     def test_detail_actions_return_cached_data(self):
@@ -314,7 +402,7 @@ class SurveyAPITests(TestCase):
         self.survey.refresh_from_db()
         self.assertIsNotNone(self.survey.quota_synced_at)
 
-    def test_projects_and_dashboard_render(self):
+    def test_projects_render_and_employee_dashboard_is_restricted(self):
         projects = self.client.get(reverse("projects"))
         self.assertContains(projects, "Survey inventory")
         self.assertContains(projects, "Pre-screening questions")
@@ -327,7 +415,8 @@ class SurveyAPITests(TestCase):
         self.assertContains(projects, 'id="companyLabel">Client')
         self.assertNotContains(projects, 'id="cpiFilterTrigger"')
         self.assertNotContains(projects, "Quest")
-        self.assertContains(self.client.get(reverse("dashboard")), "dashboard is ready")
+        dashboard = self.client.get(reverse("dashboard"))
+        self.assertEqual(dashboard.status_code, 403)
 
         profile = self.user.employee_profile
         profile.role = Role.objects.get(slug="admin")
@@ -414,6 +503,36 @@ class SurveyFlowTests(TestCase):
         self.assertEqual(attempt.exit_device, "Mobile")
         self.assertEqual(attempt.exit_os, "Android 14")
         self.assertIsNotNone(attempt.loi_seconds)
+
+    def test_repeated_submission_keeps_the_first_redirect_immutable(self):
+        start = self.client.get(reverse("survey-start"), {
+            "surveyId": self.survey.source_id,
+            "supplierCode": "1000",
+            "userId": self.platform_user.pk,
+            "code": self.survey.local_id,
+        })
+        rid = parse_qs(urlsplit(start["Location"]).query)["rid"][0]
+        first = self.client.post(reverse("survey-start"), {
+            "rid": rid,
+            f"question_{self.question.pk}": "1",
+        })
+        self.assertEqual(first.status_code, 302)
+        first_outbound = first["Location"]
+
+        repeated = self.client.post(reverse("survey-start"), {
+            "rid": rid,
+            f"question_{self.question.pk}": "2",
+        })
+
+        self.assertRedirects(
+            repeated,
+            f"{reverse('survey-start')}?rid={rid}",
+            fetch_redirect_response=False,
+        )
+        attempt = SurveyAttempt.objects.get(rid=rid)
+        self.assertEqual(attempt.status, SurveyAttempt.Status.REDIRECTED)
+        self.assertEqual(attempt.outbound_url, first_outbound)
+        self.assertEqual(attempt.answers[str(self.question.pk)]["values"], ["1"])
 
     def test_status_requires_known_rid(self):
         response = self.client.get(reverse("survey-status"), {"status": "3", "rid": "Aa1Bb2Cc3D"})
@@ -559,12 +678,16 @@ class StudiesTrackingTests(TestCase):
         )
         self.other = get_user_model().objects.create_user(username="other", first_name="Other")
         self.survey = Survey.objects.create(
+            client=Client.objects.create(code="tracking-client", name="Tracking Client"),
             source_id=555123,
             name="Consumer finance",
             company_name="InnovateMR",
+            country="United States",
             country_code="US",
             language_code="EN",
             cpi="2.50",
+            buyer_id="3690",
+            survey_type="B2C",
             loi=10,
         )
         common = {
@@ -578,7 +701,8 @@ class StudiesTrackingTests(TestCase):
         }
         self.complete = SurveyAttempt.objects.create(
             rid="Aa1Bb2Cc3D", platform_user=self.kanik, user_id=str(self.kanik.pk),
-            status=SurveyAttempt.Status.COMPLETED, loi_seconds=82, callback_at=timezone.now(), **common,
+            status=SurveyAttempt.Status.COMPLETED, loi_seconds=82, callback_at=timezone.now(),
+            source_cpi_snapshot="2.50", payable_cpi_snapshot="2.50", cpi_currency_snapshot="USD", **common,
         )
         SurveyAttempt.objects.create(
             rid="Ee4Ff5Gg6H", platform_user=self.other, user_id=str(self.other.pk),
@@ -587,18 +711,44 @@ class StudiesTrackingTests(TestCase):
         self.api = APIClient()
         self.api.force_authenticate(self.owner)
 
+
     def test_studies_page_and_filtered_api_show_compact_tracking_data(self):
+        get_user_model().objects.create_user(
+            username="idle-studies", first_name="Idle", last_name="Studies", email="idle-studies@example.test"
+        )
+        Survey.objects.create(
+            source_id=555999, name="Unused Canada inventory", company_name="InnovateMR",
+            country="Canada", country_code="CA", cpi="1.00",
+        )
         self.client.force_login(self.owner)
         page = self.client.get(reverse("studies"))
+        self.assertContains(page, "Traffic Reports")
         self.assertContains(page, "Respondent activity")
         self.assertContains(page, 'id="studyFromDateTime"')
         self.assertContains(page, 'id="studyToDateTime"')
         self.assertNotContains(page, 'id="studyFromTime"')
-        self.assertContains(page, "Export full CSV")
+        self.assertContains(page, 'id="exportStudies"')
+        self.assertNotContains(page, "Export full CSV")
         self.assertContains(page, "Kanik Sharma")
-        self.assertContains(page, "<th>Device</th>", html=True)
-        self.assertContains(page, "<th>Start</th>", html=True)
-        self.assertContains(page, "<th>End</th>", html=True)
+        self.assertContains(page, "Idle Studies")
+        self.assertContains(page, "Canada · CA")
+        self.assertContains(page, '<th class="study-col-cpi">CPI</th>', html=True)
+        self.assertContains(page, 'data-multi-filter="branch"')
+        self.assertContains(page, 'data-multi-filter="sub_branch"')
+        self.assertContains(page, 'data-multi-filter="shift"')
+        self.assertContains(page, 'aria-label="Search users"')
+        self.assertContains(page, 'aria-label="Search countries"')
+        self.assertContains(page, 'data-multi-filter="country"')
+        self.assertContains(page, 'data-multi-filter="client"')
+        self.assertContains(page, 'data-multi-filter="buyer_id"')
+        self.assertContains(page, "Device</th>")
+        self.assertContains(page, "Start</th>")
+        self.assertContains(page, "End</th>")
+        self.assertContains(page, 'id="studyMetricTotal"')
+        self.assertContains(page, 'id="studyMetricConversion"')
+        self.assertContains(page, 'id="studyMetricRevenue"')
+        self.assertContains(page, 'class="sidebar-docs"')
+        self.assertNotContains(page, 'class="topbar"')
 
         response = self.api.get(reverse("survey-attempt-list"), {
             "user": self.kanik.pk,
@@ -612,29 +762,154 @@ class StudiesTrackingTests(TestCase):
         self.assertEqual(result["entry_ip"], "10.0.0.1")
         self.assertEqual(result["exit_ip"], "20.0.0.1")
         self.assertEqual(result["entry_device"], "Desktop")
+        self.assertEqual(result["country_code"], "US")
+        self.assertEqual(result["country"], "United States")
+        self.assertEqual(result["termination_reason"], "")
+        self.assertEqual(str(result["source_cpi_snapshot"]), "2.50")
         self.assertIsNotNone(result["initiated_at"])
         self.assertIsNotNone(result["callback_at"])
+        self.assertEqual(response.data["summary"]["total"], 1)
+        self.assertEqual(response.data["summary"]["completed"], 1)
+        self.assertEqual(response.data["summary"]["conversion_rate"], 100.0)
+        self.assertEqual(response.data["summary"]["completed_devices"]["desktop"], 1)
+        self.assertEqual(response.data["summary"]["completed_devices"]["mobile"], 0)
+        self.assertEqual(float(response.data["summary"]["total_revenue"]), 2.50)
+        self.assertEqual(response.data["summary"]["revenue_currency"], "USD")
 
-    def test_filtered_csv_contains_full_backend_record_not_only_ui_columns(self):
+    def test_client_buyer_and_project_deep_link_filters(self):
+        response = self.api.get(reverse("survey-attempt-list"), {
+            "client": str(self.survey.client_id),
+            "buyer_id": "3690",
+            "internal_id": self.survey.local_id,
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 2)
+        self.client.force_login(self.owner)
+        page = self.client.get(reverse("studies"), {"internal_id": self.survey.local_id})
+        self.assertContains(page, "Project filter")
+        self.assertContains(page, self.survey.local_id)
+
+    def test_traffic_report_api_exposes_clean_provider_termination_reason(self):
+        self.complete.status = SurveyAttempt.Status.TERMINATED
+        self.complete.upstream_transaction_data = [{
+            "trackId": self.complete.rid,
+            "status": "Pre Survey Termination",
+            "termReason": "Off hours",
+        }]
+        self.complete.save(update_fields=["status", "upstream_transaction_data", "updated_at"])
+        response = self.api.get(reverse("survey-attempt-list"), {"search": self.complete.rid})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["results"][0]["termination_reason"], "Off hours")
+
+    def test_country_filter_and_hit_time_cpi_snapshot_are_stable(self):
+        created = create_attempt(self.survey, self.kanik, "10.10.10.10")
+        self.assertEqual(str(created.source_cpi_snapshot), "2.50")
+        self.assertEqual(created.cpi_currency_snapshot, "USD")
+
+        self.survey.cpi = "9.99"
+        self.survey.save(update_fields=["cpi"])
+        created.refresh_from_db()
+        self.assertEqual(str(created.source_cpi_snapshot), "2.50")
+
+        canada = Survey.objects.create(
+            source_id=555124, name="Canada study", company_name="InnovateMR",
+            country="Canada", country_code="CA", cpi="4.00",
+        )
+        SurveyAttempt.objects.create(
+            rid="Cc1Aa2Nn3D", survey=canada, platform_user=self.kanik,
+            user_id=str(self.kanik.pk), status=SurveyAttempt.Status.INITIATED,
+            source_cpi_snapshot="4.00", cpi_currency_snapshot="USD",
+        )
+        response = self.api.get(reverse("survey-attempt-list"), {"country": "CA"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["results"][0]["country_code"], "CA")
+
+    def test_team_lead_cpi_percentage_masks_study_snapshot_and_revenue(self):
+        role = Role.objects.get(slug="team-lead")
+        role.cpi_visibility_percent = "70.00"
+        role.save(update_fields=["cpi_visibility_percent"])
+        EmployeeProfile.objects.filter(user=self.kanik).update(role=role)
+        UserFunctionOverride.objects.create(
+            user=self.kanik,
+            function=AccessFunction.objects.get(code="studies.card.revenue"),
+            effect=UserFunctionOverride.Effect.ALLOW,
+        )
+        self.kanik = get_user_model().objects.get(pk=self.kanik.pk)
+        scoped_api = APIClient()
+        scoped_api.force_authenticate(self.kanik)
+
+        response = scoped_api.get(reverse("survey-attempt-list"), {"status": SurveyAttempt.Status.COMPLETED})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(str(response.data["results"][0]["source_cpi_snapshot"]), "1.75")
+        self.assertEqual(str(response.data["summary"]["total_revenue"]), "1.75")
+
+    def test_summary_tracks_all_outcomes_and_completed_device_types(self):
+        SurveyAttempt.objects.create(
+            rid="Mm1Oo2Bb3L", survey=self.survey, platform_user=self.kanik, user_id=str(self.kanik.pk),
+            status=SurveyAttempt.Status.COMPLETED, entry_device="Mobile phone",
+        )
+        SurveyAttempt.objects.create(
+            rid="Tt1Aa2Bb3C", survey=self.survey, platform_user=self.kanik, user_id=str(self.kanik.pk),
+            status=SurveyAttempt.Status.COMPLETED, entry_device="Tablet",
+        )
+        SurveyAttempt.objects.create(
+            rid="Ii1Nn2Ii3T", survey=self.survey, platform_user=self.kanik, user_id=str(self.kanik.pk),
+            status=SurveyAttempt.Status.REDIRECTED, entry_device="Desktop",
+        )
+        SurveyAttempt.objects.create(
+            rid="Qq1Uu2Oo3T", survey=self.survey, platform_user=self.kanik, user_id=str(self.kanik.pk),
+            status=SurveyAttempt.Status.OVER_QUOTA, entry_device="Desktop",
+        )
+        SurveyAttempt.objects.create(
+            rid="Ss1Ee2Cc3U", survey=self.survey, platform_user=self.kanik, user_id=str(self.kanik.pk),
+            status=SurveyAttempt.Status.QUALITY_TERMINATED, entry_device="Desktop",
+        )
+        response = self.api.get(reverse("survey-attempt-list"), {"user": self.kanik.pk})
+        self.assertEqual(response.status_code, 200)
+        summary = response.data["summary"]
+        self.assertEqual(summary["total"], 6)
+        self.assertEqual(summary["initiated"], 1)
+        self.assertEqual(summary["completed"], 3)
+        self.assertEqual(summary["over_quota"], 1)
+        self.assertEqual(summary["security_terminated"], 1)
+        self.assertEqual(summary["conversion_rate"], 50.0)
+        self.assertEqual(summary["incidence_rate"], 100.0)
+        self.assertEqual(summary["completed_devices"], {"desktop": 1, "mobile": 1, "tablet": 1, "unclassified": 0})
+
+    def test_filtered_excel_uses_exact_operational_columns(self):
         response = self.api.get(reverse("survey-attempt-export"), {
             "user": self.kanik.pk,
             "status": SurveyAttempt.Status.COMPLETED,
         })
         self.assertEqual(response.status_code, 200)
-        content = b"".join(response.streaming_content).decode("utf-8")
-        self.assertIn("Entry user agent", content)
-        self.assertIn("Pre-screener answers", content)
-        self.assertIn("Outbound supplier URL", content)
-        self.assertIn("Payable CPI snapshot", content)
-        self.assertIn("Kanik Sharma", content)
-        self.assertIn(self.complete.rid, content)
-        self.assertNotIn("Ee4Ff5Gg6H", content)
+        self.assertIn("traffic-reports-", response["Content-Disposition"])
+        self.assertIn(".xlsx", response["Content-Disposition"])
+        rows = xlsx_rows(response)
+        self.assertEqual(rows[0], [
+            "Project id", "Cleint survey id", "PID", "RID", "Status", "Status source",
+            "Client name", "Country", "Study type", "Actual LOI", "Current Client CPI",
+            "Client entry link CPI", "Vendor CPI", "Vendor name", "User name", "Device",
+            "OS", "Browser", "User agent", "Entry IP", "Exit IP", "Inisitate at",
+            "Presecreent at", "Redirect at", "entry date time", "Exit date time",
+        ])
+        self.assertIn("Kanik Sharma", rows[1])
+        self.assertIn(self.complete.rid, rows[1])
+        self.assertNotIn("Pre-screener answers", rows[0])
+        self.assertNotIn("Outbound supplier URL", rows[0])
+        self.assertNotIn("Ee4Ff5Gg6H", str(rows))
 
     def test_view_permission_is_scoped_and_does_not_grant_csv_export(self):
         viewer = get_user_model().objects.create_user(username="viewer", first_name="Scoped")
         UserFunctionOverride.objects.create(
             user=viewer,
             function=AccessFunction.objects.get(code="attempts.view"),
+            effect=UserFunctionOverride.Effect.ALLOW,
+        )
+        UserFunctionOverride.objects.create(
+            user=viewer,
+            function=AccessFunction.objects.get(code="studies.card.total"),
             effect=UserFunctionOverride.Effect.ALLOW,
         )
         own_attempt = SurveyAttempt.objects.create(
@@ -652,14 +927,20 @@ class StudiesTrackingTests(TestCase):
         self.client.force_login(viewer)
         page = self.client.get(reverse("studies"))
         self.assertEqual(page.status_code, 200)
-        self.assertNotContains(page, "Export full CSV")
+        self.assertNotContains(page, 'id="exportStudies"')
         self.assertNotContains(page, 'id="studySearch"')
-        self.assertNotContains(page, "<th>Status</th>", html=True)
+        self.assertNotContains(page, "Status</th>")
+        self.assertContains(page, 'id="studyMetricTotal"')
+        self.assertNotContains(page, 'id="studyMetricCompleted"')
         self.assertEqual(scoped_api.get(reverse("survey-attempt-list"), {"status": "1"}).status_code, 403)
+        self.assertEqual(scoped_api.get(reverse("survey-attempt-list"), {"country": "US"}).status_code, 403)
 
-    def test_team_lead_sees_lower_rank_employee_activity_in_same_branch_only(self):
+    def test_team_lead_sees_lower_rank_employee_activity_in_own_shift_only(self):
         team_lead = get_user_model().objects.create_user(
             username="tracking-lead", first_name="Tracking", last_name="Lead"
+        )
+        second_team_lead = get_user_model().objects.create_user(
+            username="tracking-lead-two", first_name="Second", last_name="Lead"
         )
         employee = get_user_model().objects.create_user(
             username="tracking-employee", first_name="Branch", last_name="Employee"
@@ -670,23 +951,63 @@ class StudiesTrackingTests(TestCase):
         manager = get_user_model().objects.create_user(
             username="tracking-manager", first_name="Branch", last_name="Manager"
         )
+        other_shift_employee = get_user_model().objects.create_user(
+            username="tracking-evening-employee", first_name="Evening", last_name="Employee"
+        )
+        delhi = OrganizationUnit.objects.create(
+            workspace_owner=self.owner, unit_type=OrganizationUnit.UnitType.BRANCH,
+            name="Delhi", code="delhi", created_by=self.owner,
+        )
+        delhi_ops = OrganizationUnit.objects.create(
+            workspace_owner=self.owner, parent=delhi, unit_type=OrganizationUnit.UnitType.SUB_BRANCH,
+            name="Operations", code="operations", created_by=self.owner,
+        )
+        delhi_morning = OrganizationUnit.objects.create(
+            workspace_owner=self.owner, parent=delhi_ops, unit_type=OrganizationUnit.UnitType.SHIFT,
+            name="Morning", code="morning", created_by=self.owner,
+        )
+        delhi_support = OrganizationUnit.objects.create(
+            workspace_owner=self.owner, parent=delhi, unit_type=OrganizationUnit.UnitType.SUB_BRANCH,
+            name="Support", code="support", created_by=self.owner,
+        )
+        delhi_evening = OrganizationUnit.objects.create(
+            workspace_owner=self.owner, parent=delhi_support, unit_type=OrganizationUnit.UnitType.SHIFT,
+            name="Evening", code="evening", created_by=self.owner,
+        )
+        mumbai = OrganizationUnit.objects.create(
+            workspace_owner=self.owner, unit_type=OrganizationUnit.UnitType.BRANCH,
+            name="Mumbai", code="mumbai", created_by=self.owner,
+        )
+        mumbai_ops = OrganizationUnit.objects.create(
+            workspace_owner=self.owner, parent=mumbai, unit_type=OrganizationUnit.UnitType.SUB_BRANCH,
+            name="Operations", code="operations", created_by=self.owner,
+        )
+        mumbai_morning = OrganizationUnit.objects.create(
+            workspace_owner=self.owner, parent=mumbai_ops, unit_type=OrganizationUnit.UnitType.SHIFT,
+            name="Morning", code="morning", created_by=self.owner,
+        )
         profiles = [
-            (team_lead, "team-lead", "Delhi", "Operations"),
-            (employee, "employee", "Delhi", "Operations"),
-            (other_branch_employee, "employee", "Mumbai", "Operations"),
-            (manager, "manager", "Delhi", "Operations"),
+            (team_lead, "team-lead", delhi_morning),
+            (second_team_lead, "team-lead", delhi_morning),
+            (employee, "employee", delhi_morning),
+            (other_shift_employee, "employee", delhi_evening),
+            (other_branch_employee, "employee", mumbai_morning),
+            (manager, "manager", delhi_morning),
         ]
-        for platform_user, role_slug, company, department in profiles:
+        for platform_user, role_slug, organization_unit in profiles:
             EmployeeProfile.objects.filter(user=platform_user).update(
                 role=Role.objects.get(slug=role_slug),
                 created_by=self.owner,
-                company_name=company,
-                department=department,
+                organization_unit=organization_unit,
             )
 
         visible_attempt = SurveyAttempt.objects.create(
             rid="Tl1Ee2Aa3D", survey=self.survey, platform_user=employee, user_id=str(employee.pk),
             status=SurveyAttempt.Status.COMPLETED, entry_device="Desktop",
+        )
+        other_shift_attempt = SurveyAttempt.objects.create(
+            rid="Tl0Ee1Dd2E", survey=self.survey, platform_user=other_shift_employee,
+            user_id=str(other_shift_employee.pk), status=SurveyAttempt.Status.TERMINATED, entry_device="Mobile",
         )
         SurveyAttempt.objects.create(
             rid="Tl4Oo5Bb6M", survey=self.survey, platform_user=other_branch_employee,
@@ -702,16 +1023,59 @@ class StudiesTrackingTests(TestCase):
         studies = lead_api.get(reverse("survey-attempt-list"))
         self.assertEqual(studies.status_code, 200)
         self.assertEqual(studies.data["count"], 1)
-        self.assertEqual(studies.data["results"][0]["rid"], visible_attempt.rid)
+        self.assertEqual({row["rid"] for row in studies.data["results"]}, {visible_attempt.rid})
+        branch_studies = lead_api.get(reverse("survey-attempt-list"), {"branch": str(delhi.pk)})
+        self.assertEqual(branch_studies.status_code, 200)
+        self.assertEqual(branch_studies.data["count"], 1)
+        sub_branch_studies = lead_api.get(reverse("survey-attempt-list"), {"sub_branch": str(delhi_support.pk)})
+        self.assertEqual(sub_branch_studies.status_code, 200)
+        self.assertEqual(sub_branch_studies.data["count"], 0)
+        shift_studies = lead_api.get(reverse("survey-attempt-list"), {"shift": str(delhi_morning.pk)})
+        self.assertEqual(shift_studies.status_code, 200)
+        self.assertEqual({row["rid"] for row in shift_studies.data["results"]}, {visible_attempt.rid})
 
         hits = lead_api.get(reverse("user-hits-api"))
         self.assertEqual(hits.status_code, 200)
         self.assertEqual(hits.data["count"], 1)
-        self.assertEqual(hits.data["results"][0]["user_id"], employee.pk)
+        self.assertEqual({row["user_id"] for row in hits.data["results"]}, {employee.pk})
+        morning_hit = next(row for row in hits.data["results"] if row["user_id"] == employee.pk)
+        self.assertEqual(morning_hit["branch"], "Delhi")
+        self.assertEqual(morning_hit["sub_branch"], "Operations")
+        self.assertEqual(morning_hit["shift"], "Morning")
+        branch_hits = lead_api.get(reverse("user-hits-api"), {"branch": str(delhi.pk)})
+        self.assertEqual(branch_hits.status_code, 200)
+        self.assertEqual(branch_hits.data["count"], 1)
+        shift_hits = lead_api.get(reverse("user-hits-api"), {"shift": str(delhi_morning.pk)})
+        self.assertEqual(shift_hits.status_code, 200)
+        self.assertEqual({row["user_id"] for row in shift_hits.data["results"]}, {employee.pk})
+
+        second_lead_api = APIClient()
+        second_lead_api.force_authenticate(second_team_lead)
+        second_lead_studies = second_lead_api.get(reverse("survey-attempt-list"))
+        self.assertEqual(second_lead_studies.status_code, 200)
+        self.assertEqual(second_lead_studies.data["count"], 1)
+        self.assertEqual({row["rid"] for row in second_lead_studies.data["results"]}, {visible_attempt.rid})
+
+        for code in ("attempts.view", "user_hits.view"):
+            UserFunctionOverride.objects.update_or_create(
+                user=employee, function=AccessFunction.objects.get(code=code),
+                defaults={"effect": UserFunctionOverride.Effect.ALLOW},
+            )
+        employee_api = APIClient()
+        employee_api.force_authenticate(employee)
+        employee_studies = employee_api.get(reverse("survey-attempt-list"))
+        self.assertEqual(employee_studies.status_code, 200)
+        self.assertEqual(employee_studies.data["count"], 1)
+        self.assertEqual(employee_studies.data["results"][0]["rid"], visible_attempt.rid)
+        employee_hits = employee_api.get(reverse("user-hits-api"))
+        self.assertEqual(employee_hits.status_code, 200)
+        self.assertEqual(employee_hits.data["count"], 1)
+        self.assertEqual(employee_hits.data["results"][0]["user_id"], employee.pk)
 
         self.client.force_login(team_lead)
         page = self.client.get(reverse("studies"))
         self.assertContains(page, "Branch Employee")
+        self.assertNotContains(page, "Evening Employee")
         self.assertNotContains(page, "Other Branch")
         self.assertNotContains(page, "Branch Manager")
 
@@ -762,6 +1126,224 @@ class StudiesTrackingTests(TestCase):
             self.assertEqual(attempt.status, expected)
 
 
+class TerminationReasonPageTests(TestCase):
+    def setUp(self):
+        self.owner = get_user_model().objects.create_superuser(
+            username="reason-owner", email="reason-owner@example.test", password="test-password"
+        )
+        self.respondent = get_user_model().objects.create_user(
+            username="reason-respondent", first_name="Reason", last_name="Tester"
+        )
+        client = Client.objects.create(
+            code="reason-innovate", name="InnovateMR", provider_code="innovatemr"
+        )
+        integration = ClientIntegration.objects.create(
+            client=client,
+            name="InnovateMR reason test",
+            provider_code="innovatemr",
+            base_url="https://supplier.innovatemr.net/api/v2",
+        )
+        self.survey = Survey.objects.create(
+            source_id=16003381,
+            name="Reason lookup survey",
+            client=client,
+            integration=integration,
+            entry_link="https://edgeapi.innovatemr.net/startSurvey?PID=[%%pid%%]",
+        )
+        self.attempt = SurveyAttempt.objects.create(
+            rid="EqY33Hq0jH",
+            survey=self.survey,
+            platform_user=self.respondent,
+            user_id=str(self.respondent.pk),
+            status=SurveyAttempt.Status.TERMINATED,
+            status_source="browser_callback",
+            callback_at=timezone.now(),
+            callback_count=1,
+            initiation_ip="172.56.27.197",
+        )
+
+    @patch("surveys.views.InnovateMRClient.get_survey_transactions_by_pid")
+    def test_search_fetches_caches_and_displays_exact_provider_reason(self, transaction_lookup):
+        transaction_lookup.return_value = [{
+            "status": "Pre Survey Termination",
+            "termReason": "Off hours",
+            "trackId": self.attempt.rid,
+            "ip": "172.56.27.197",
+        }]
+        self.client.force_login(self.owner)
+
+        response = self.client.get(reverse("termination-reasons"), {"rid": self.attempt.rid})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Pre Survey Termination")
+        self.assertContains(response, "Off hours")
+        self.assertContains(response, "Term Reports")
+        self.assertEqual(response.context["detail_outcome"], {
+            "status": "Pre Survey Termination",
+            "reason": "Off hours",
+            "category": "",
+        })
+        transaction_lookup.assert_called_once_with(self.survey.source_id, self.attempt.rid)
+        self.attempt.refresh_from_db()
+        self.assertEqual(self.attempt.upstream_transaction_data["termReason"], "Off hours")
+        self.assertIsNotNone(self.attempt.upstream_checked_at)
+
+    def test_cached_innovate_transaction_renders_clean_fields_not_raw_json(self):
+        raw_transaction = {
+            "id": "TqU3aQwdQTeKvf3U5r2DPSE",
+            "ip": "49.145.217.139",
+            "CPI": "2.55",
+            "status": "Pre Survey Quality Termination",
+            "trackId": self.attempt.rid,
+            "termReason": "Selected threat potential score at joblevel does not allow the survey",
+            "verifyToken": "Pending",
+        }
+        self.attempt.status = SurveyAttempt.Status.QUALITY_TERMINATED
+        self.attempt.upstream_transaction_data = raw_transaction
+        self.attempt.save(update_fields=["status", "upstream_transaction_data"])
+        self.client.force_login(self.owner)
+
+        with patch("surveys.views.InnovateMRClient.get_survey_transactions_by_pid") as lookup:
+            response = self.client.get(
+                reverse("termination-reasons"), {"detail": self.attempt.rid}
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["detail_outcome"], {
+            "status": "Pre Survey Quality Termination",
+            "reason": "Selected threat potential score at joblevel does not allow the survey",
+            "category": "",
+        })
+        self.assertContains(response, "Pre Survey Quality Termination")
+        self.assertContains(
+            response, "Selected threat potential score at joblevel does not allow the survey"
+        )
+        self.assertNotContains(response, "TqU3aQwdQTeKvf3U5r2DPSE")
+        self.assertNotContains(response, "Platform status")
+        lookup.assert_not_called()
+
+    def test_admin_role_has_page_by_default_and_employee_is_forbidden(self):
+        admin_user = get_user_model().objects.create_user(username="reason-admin")
+        EmployeeProfile.objects.filter(user=admin_user).update(role=Role.objects.get(slug="admin"))
+        self.client.force_login(admin_user)
+        self.assertEqual(self.client.get(reverse("termination-reasons")).status_code, 200)
+
+        employee = get_user_model().objects.create_user(username="reason-employee")
+        EmployeeProfile.objects.filter(user=employee).update(role=Role.objects.get(slug="employee"))
+        self.client.force_login(employee)
+        self.assertEqual(self.client.get(reverse("termination-reasons")).status_code, 403)
+
+    def test_page_lists_every_unsuccessful_status_before_rid_search(self):
+        SurveyAttempt.objects.create(
+            rid="Quota1Ab2C",
+            survey=self.survey,
+            platform_user=self.respondent,
+            status=SurveyAttempt.Status.OVER_QUOTA,
+            callback_at=timezone.now(),
+        )
+        SurveyAttempt.objects.create(
+            rid="Quali1Ab2C",
+            survey=self.survey,
+            platform_user=self.respondent,
+            status=SurveyAttempt.Status.QUALITY_TERMINATED,
+            callback_at=timezone.now(),
+        )
+        self.client.force_login(self.owner)
+
+        response = self.client.get(reverse("termination-reasons"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["summary"]["total"], 3)
+        self.assertEqual(response.context["summary"]["terminated"], 1)
+        self.assertEqual(response.context["summary"]["quota"], 1)
+        self.assertEqual(response.context["summary"]["quality"], 1)
+        self.assertContains(response, self.attempt.rid)
+        self.assertContains(response, "Quota1Ab2C")
+        self.assertContains(response, "Quali1Ab2C")
+        self.assertContains(response, "Details", count=3)
+
+    def test_rfg_detail_uses_stored_provider_callback_reason(self):
+        client = Client.objects.create(code="reason-rfg", name="Research For Good", provider_code="rfg")
+        integration = ClientIntegration.objects.create(
+            client=client,
+            name="RFG reason test",
+            provider_code="rfg",
+            base_url="https://api.researchforgood.com/API",
+        )
+        survey = Survey.objects.create(
+            source_key="RFG-REASON-1",
+            name="RFG reason survey",
+            client=client,
+            integration=integration,
+        )
+        attempt = SurveyAttempt.objects.create(
+            rid="RfgSec1Ab2",
+            survey=survey,
+            platform_user=self.respondent,
+            status=SurveyAttempt.Status.QUALITY_TERMINATED,
+            callback_at=timezone.now(),
+            upstream_transaction_data={"rfg_callback": {"result": "10", "liveS": "2"}},
+        )
+        self.client.force_login(self.owner)
+
+        response = self.client.get(reverse("termination-reasons"), {"detail": attempt.rid})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Security termination")
+        self.assertContains(response, "Suspicious or proxy IP address")
+
+    def test_custom_provider_can_map_nested_outcome_fields(self):
+        client = Client.objects.create(code="reason-custom", name="Future Client", provider_code="custom")
+        integration = ClientIntegration.objects.create(
+            client=client,
+            name="Custom reason test",
+            provider_code="custom",
+            base_url="https://provider.example.test/api",
+            field_mapping={
+                "outcome_status": "provider.state",
+                "outcome_reason": "provider.explanation",
+                "outcome_category": "provider.group",
+            },
+        )
+        survey = Survey.objects.create(
+            source_key="CUSTOM-REASON-1",
+            name="Custom reason survey",
+            client=client,
+            integration=integration,
+        )
+        attempt = SurveyAttempt.objects.create(
+            rid="CstmRe1Ab2",
+            survey=survey,
+            platform_user=self.respondent,
+            status=SurveyAttempt.Status.TERMINATED,
+            callback_at=timezone.now(),
+            upstream_transaction_data={
+                "provider": {
+                    "state": "Rejected",
+                    "explanation": "Outside audience",
+                    "group": "Targeting",
+                }
+            },
+        )
+        self.client.force_login(self.owner)
+
+        response = self.client.get(reverse("termination-reasons"), {"detail": attempt.rid})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Rejected")
+        self.assertContains(response, "Outside audience")
+        self.assertContains(response, "Category: Targeting")
+
+    def test_non_terminal_attempt_does_not_call_provider(self):
+        self.attempt.status = SurveyAttempt.Status.REDIRECTED
+        self.attempt.save(update_fields=["status"])
+        self.client.force_login(self.owner)
+        with patch("surveys.views.InnovateMRClient.get_survey_transactions_by_pid") as lookup:
+            response = self.client.get(reverse("termination-reasons"), {"rid": self.attempt.rid})
+        self.assertContains(response, "currently redirected to survey")
+        lookup.assert_not_called()
+
+
 class UserHitsTests(TestCase):
     def setUp(self):
         self.owner = get_user_model().objects.create_superuser(
@@ -806,6 +1388,9 @@ class UserHitsTests(TestCase):
         self.api.force_authenticate(self.owner)
 
     def test_page_and_api_aggregate_user_day_device_counts(self):
+        idle_user = get_user_model().objects.create_user(
+            username="idle-hits", first_name="Idle", last_name="Employee", email="idle@example.test"
+        )
         self.client.force_login(self.owner)
         page = self.client.get(reverse("user-hits"))
         self.assertEqual(page.status_code, 200)
@@ -815,6 +1400,11 @@ class UserHitsTests(TestCase):
         self.assertContains(page, 'id="hitFromDateTime"')
         self.assertContains(page, 'id="hitToDateTime"')
         self.assertNotContains(page, 'id="hitFromTime"')
+        self.assertContains(page, "Idle Employee")
+        self.assertContains(page, 'aria-label="Search users"')
+        self.assertContains(page, 'aria-label="Search branches"')
+        self.assertContains(page, 'id="hitIncidenceRate"')
+        self.assertContains(page, 'id="hitCompleteDesktop"')
 
         response = self.api.get(reverse("user-hits-api"), {
             "user": self.kanik.pk,
@@ -833,6 +1423,7 @@ class UserHitsTests(TestCase):
             "total": 1, "desktop": 1, "mobile": 0, "tablet": 0, "unclassified": 0,
         })
         self.assertEqual(response.data["summary"]["conversion_rate"], 50.0)
+        self.assertEqual(response.data["summary"]["incidence_rate"], 50.0)
 
     def test_time_filters_narrow_ist_date_boundaries(self):
         response = self.api.get(reverse("user-hits-api"), {
@@ -886,3 +1477,198 @@ class UserHitsTests(TestCase):
         self.assertEqual(denied_api.get(reverse("user-hits-api")).status_code, 403)
         self.client.force_login(no_access)
         self.assertEqual(self.client.get(reverse("user-hits")).status_code, 403)
+
+
+class DashboardAnalyticsTests(TestCase):
+    def setUp(self):
+        self.owner = get_user_model().objects.create_superuser(
+            username="dashboard-owner", email="dashboard-owner@example.test", password="test-password"
+        )
+        self.employee = get_user_model().objects.create_user(
+            username="dashboard-employee", first_name="Dash", last_name="Employee",
+            email="dashboard-employee@example.test",
+        )
+        self.other = get_user_model().objects.create_user(
+            username="dashboard-other", first_name="Other", last_name="User",
+            email="dashboard-other@example.test",
+        )
+        self.client_a = Client.objects.create(code="dashboard-a", name="Client Alpha")
+        self.client_b = Client.objects.create(code="dashboard-b", name="Client Beta")
+        self.survey_a = Survey.objects.create(
+            client=self.client_a, source_id=880001, company_name="Client Alpha", name="Alpha survey",
+            country="United States", country_code="US", cpi="4.00",
+        )
+        self.survey_b = Survey.objects.create(
+            client=self.client_b, source_id=880002, company_name="Client Beta", name="Beta survey",
+            country="Canada", country_code="CA", cpi="2.00",
+        )
+        self.complete = SurveyAttempt.objects.create(
+            rid="Da1Sh2Co3M", survey=self.survey_a, platform_user=self.employee,
+            user_id=str(self.employee.pk), status=SurveyAttempt.Status.COMPLETED,
+            source_cpi_snapshot="4.00", cpi_currency_snapshot="USD", loi_seconds=120,
+            entry_device="Desktop", callback_at=timezone.now(),
+        )
+        SurveyAttempt.objects.create(
+            rid="Da4Sh5Te6R", survey=self.survey_b, platform_user=self.other,
+            user_id=str(self.other.pk), status=SurveyAttempt.Status.TERMINATED,
+            source_cpi_snapshot="2.00", cpi_currency_snapshot="USD", loi_seconds=60,
+            entry_device="Mobile", callback_at=timezone.now(),
+        )
+        self.api = APIClient()
+        self.api.force_authenticate(self.owner)
+
+    def test_dashboard_page_has_animated_widgets_without_filters_or_activity_feed(self):
+        self.client.force_login(self.owner)
+        page = self.client.get(reverse("dashboard"))
+
+        self.assertEqual(page.status_code, 200)
+        self.assertContains(page, "Performance intelligence")
+        self.assertContains(page, 'id="volumeChart"')
+        self.assertContains(page, 'id="financeChart"')
+        self.assertContains(page, 'id="trafficGraphClient"')
+        self.assertContains(page, 'id="financeGraphClient"')
+        self.assertContains(page, 'aria-label="Traffic graph time range"')
+        self.assertContains(page, 'aria-label="Finance graph time range"')
+        self.assertContains(page, 'id="clientShareChart"')
+        self.assertContains(page, 'data-dashboard-range="24h"')
+        self.assertContains(page, 'data-dashboard-range="48h"')
+        self.assertContains(page, 'data-dashboard-range="72h"')
+        self.assertContains(page, 'data-dashboard-range="3m"')
+        self.assertContains(page, 'data-dashboard-range="6m"')
+        self.assertContains(page, 'data-dashboard-range="1y"')
+        self.assertNotContains(page, 'data-dashboard-filter="branch"')
+        self.assertNotContains(page, "Recent activity")
+        self.assertContains(page, 'id="dashboardIR"')
+        self.assertContains(page, "Historical hit-time CPI")
+
+    def test_dashboard_api_returns_overall_kpis_client_share_and_time_series(self):
+        response = self.api.get(reverse("dashboard-api"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["range"]["key"], "24h")
+        self.assertEqual(response.data["range"]["bucket_label"], "2-hour intervals")
+        self.assertEqual(response.data["summary"]["hits"], 2)
+        self.assertEqual(response.data["summary"]["completes"], 1)
+        self.assertEqual(response.data["summary"]["conversion_rate"], 50.0)
+        self.assertEqual(response.data["summary"]["incidence_rate"], 50.0)
+        self.assertEqual(response.data["summary"]["active_users"], 2)
+        self.assertEqual(response.data["summary"]["average_loi_seconds"], 90)
+        self.assertEqual(str(response.data["summary"]["revenue"]), "4.00")
+        self.assertEqual(str(response.data["summary"]["average_cpi"]), "4.00")
+        self.assertEqual(str(response.data["summary"]["rpc"]), "2.00")
+        self.assertEqual(response.data["status_breakdown"]["terminated"], 1)
+        self.assertEqual(response.data["device_breakdown"]["desktop"], 1)
+        self.assertEqual(response.data["client_distribution"][0]["name"], "Client Alpha")
+        self.assertEqual(response.data["client_distribution"][0]["share_percent"], 100.0)
+        self.assertEqual(len(response.data["traffic_chart"]["points"]), 12)
+        self.assertEqual(sum(point["hits"] for point in response.data["traffic_chart"]["points"]), 2)
+        self.assertEqual(len(response.data["finance_chart"]["points"]), 12)
+        self.assertEqual(
+            {item["name"] for item in response.data["graph_clients"]},
+            {"Client Alpha", "Client Beta"},
+        )
+        self.assertEqual(response.data["top_users"][0]["name"], "Dash Employee")
+        self.assertNotIn("recent_activity", response.data)
+
+    def test_dashboard_supports_every_global_analytics_range(self):
+        expected = {
+            "24h": (12, "2-hour intervals"),
+            "48h": (12, "4-hour intervals"),
+            "72h": (12, "6-hour intervals"),
+            "3m": (13, "Weekly intervals"),
+            "6m": (6, "Monthly intervals"),
+            "1y": (12, "Monthly intervals"),
+        }
+        for range_key, (point_count, bucket_label) in expected.items():
+            with self.subTest(range_key=range_key):
+                response = self.api.get(reverse("dashboard-api"), {"range": range_key})
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.data["range"]["key"], range_key)
+                self.assertEqual(response.data["range"]["bucket_label"], bucket_label)
+                self.assertEqual(len(response.data["traffic_chart"]["points"]), point_count)
+                self.assertEqual(
+                    response.data["traffic_chart"]["range"]["bucket_label"], bucket_label
+                )
+                self.assertEqual(
+                    sum(point["hits"] for point in response.data["traffic_chart"]["points"]), 2
+                )
+
+        invalid = self.api.get(reverse("dashboard-api"), {"range": "forever"})
+        self.assertEqual(invalid.status_code, 400)
+        self.assertIn("Range must be one of", invalid.data["detail"])
+
+    def test_dashboard_range_excludes_activity_outside_selected_window(self):
+        SurveyAttempt.objects.create(
+            rid="OldDa5h7Yr", survey=self.survey_a, platform_user=self.employee,
+            user_id=str(self.employee.pk), status=SurveyAttempt.Status.COMPLETED,
+            source_cpi_snapshot="10.00", cpi_currency_snapshot="USD",
+            initiated_at=timezone.now() - timedelta(days=40),
+        )
+
+        recent = self.api.get(reverse("dashboard-api"), {"range": "24h"})
+        quarterly = self.api.get(reverse("dashboard-api"), {"range": "3m"})
+
+        self.assertEqual(recent.data["summary"]["hits"], 2)
+        self.assertEqual(quarterly.data["summary"]["hits"], 3)
+        self.assertEqual(quarterly.data["summary"]["completes"], 2)
+        self.assertEqual(str(quarterly.data["summary"]["revenue"]), "14.00")
+
+    def test_graph_filters_change_only_their_graph_not_dashboard_cards(self):
+        response = self.api.get(reverse("dashboard-api"), {
+            "range": "24h",
+            "traffic_range": "48h",
+            "traffic_client": self.client_b.pk,
+            "finance_range": "6m",
+            "finance_client": self.client_a.pk,
+        })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["range"]["key"], "24h")
+        self.assertEqual(response.data["summary"]["hits"], 2)
+        self.assertEqual(response.data["traffic_chart"]["range"]["key"], "48h")
+        self.assertEqual(response.data["traffic_chart"]["client_id"], self.client_b.pk)
+        self.assertEqual(
+            sum(point["hits"] for point in response.data["traffic_chart"]["points"]), 1
+        )
+        self.assertEqual(response.data["finance_chart"]["range"]["key"], "6m")
+        self.assertEqual(response.data["finance_chart"]["client_id"], self.client_a.pk)
+        self.assertEqual(
+            sum(point["completes"] for point in response.data["finance_chart"]["points"]), 1
+        )
+
+    def test_dashboard_is_unfiltered_for_owner_and_rejects_employee(self):
+        filtered = self.api.get(reverse("dashboard-api"), {"client": self.client_b.pk})
+        self.assertEqual(filtered.status_code, 200)
+        self.assertEqual(filtered.data["summary"]["hits"], 2)
+        self.assertEqual(filtered.data["summary"]["completes"], 1)
+
+        scoped = APIClient()
+        scoped.force_authenticate(self.employee)
+        own = scoped.get(reverse("dashboard-api"))
+        self.assertEqual(own.status_code, 403)
+        self.assertEqual(scoped.get(reverse("dashboard-api"), {"branch": "1"}).status_code, 403)
+        self.assertEqual(scoped.get(reverse("dashboard-api"), {"traffic_range": "48h"}).status_code, 403)
+        self.assertEqual(scoped.get(reverse("dashboard-api"), {"finance_range": "48h"}).status_code, 403)
+
+    def test_employee_card_override_cannot_bypass_dashboard_restriction(self):
+        UserFunctionOverride.objects.create(
+            user=self.employee,
+            function=AccessFunction.objects.get(code="dashboard.card.hits"),
+            effect=UserFunctionOverride.Effect.DENY,
+        )
+        scoped = APIClient()
+        scoped.force_authenticate(self.employee)
+
+        response = scoped.get(reverse("dashboard-api"))
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_local_prescreener_termination_is_excluded_from_ir(self):
+        SurveyAttempt.objects.create(
+            rid="LocalPr3Sc", survey=self.survey_a, platform_user=self.employee,
+            user_id=str(self.employee.pk), status=SurveyAttempt.Status.TERMINATED,
+            status_source="local_prescreener",
+        )
+        response = self.api.get(reverse("dashboard-api"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["summary"]["incidence_rate"], 50.0)

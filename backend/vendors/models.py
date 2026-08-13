@@ -1,3 +1,5 @@
+"""Clients, integrations, suppliers, allocations, reservations and organization."""
+
 from decimal import Decimal
 
 from django.conf import settings
@@ -51,46 +53,40 @@ class ClientIntegration(models.Model):
         blank=True,
         help_text="Environment-variable name containing the token. Secret values are never stored here.",
     )
+    credential_env_keys = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text="Provider credential names mapped to environment-variable names; never secret values.",
+    )
+    config = models.JSONField(default=dict, blank=True, help_text="Non-secret provider configuration.")
     encrypted_api_token = models.TextField(blank=True, editable=False)
     credential_fingerprint = models.CharField(max_length=64, blank=True, editable=False)
     credential_last_four = models.CharField(max_length=4, blank=True, editable=False)
     credential_changed_at = models.DateTimeField(null=True, blank=True, editable=False)
     supplier_code = models.CharField(max_length=40, default="1000")
-    inventory_endpoint = models.CharField(
-        max_length=500,
-        blank=True,
-        help_text="Relative or absolute inventory endpoint. Blank calls Base URL exactly.",
-    )
+    inventory_endpoint = models.CharField(max_length=500, blank=True, help_text="Relative or absolute inventory endpoint. Blank calls Base URL exactly.")
     paged_inventory_endpoint = models.CharField(max_length=500, blank=True)
-    quota_endpoint_template = models.CharField(
-        max_length=500,
-        blank=True,
-        help_text="Optional endpoint containing {survey_id}.",
-    )
-    targeting_endpoint_template = models.CharField(
-        max_length=500,
-        blank=True,
-        help_text="Optional endpoint containing {survey_id}.",
-    )
-    transaction_endpoint_template = models.CharField(
-        max_length=500,
-        blank=True,
-        help_text="Optional endpoint containing {survey_id} and {pid}.",
-    )
+    quota_endpoint_template = models.CharField(max_length=500, blank=True, help_text="Optional endpoint containing {survey_id}.")
+    targeting_endpoint_template = models.CharField(max_length=500, blank=True, help_text="Optional endpoint containing {survey_id}.")
+    transaction_endpoint_template = models.CharField(max_length=500, blank=True, help_text="Optional endpoint containing {survey_id} and {pid}.")
     auth_header_name = models.CharField(max_length=120, default="x-access-token")
     auth_header_prefix = models.CharField(max_length=40, blank=True, help_text="For example: Bearer")
     inventory_result_key = models.CharField(max_length=120, default="result")
     quota_result_key = models.CharField(max_length=120, default="result")
     targeting_result_key = models.CharField(max_length=120, default="result")
     transaction_result_key = models.CharField(max_length=120, default="result")
-    field_mapping = models.JSONField(
-        default=dict,
-        blank=True,
-        help_text="Optional canonical-field to upstream-field mapping for custom providers.",
-    )
+    field_mapping = models.JSONField(default=dict, blank=True, help_text="Optional canonical-field to upstream-field mapping for custom providers.")
     scheduled_sync_enabled = models.BooleanField(default=False)
-    sync_interval_seconds = models.PositiveIntegerField(default=60, validators=[MinValueValidator(60)])
-    detail_refresh_batch = models.PositiveSmallIntegerField(default=3, validators=[MinValueValidator(0), MaxValueValidator(25)])
+    sync_interval_seconds = models.PositiveIntegerField(
+        default=60,
+        validators=[MinValueValidator(60)],
+        help_text="Minimum interval between inventory syncs for this integration.",
+    )
+    detail_refresh_batch = models.PositiveSmallIntegerField(
+        default=3,
+        validators=[MinValueValidator(0), MaxValueValidator(25)],
+        help_text="Survey detail records refreshed after each inventory sync.",
+    )
     last_tested_at = models.DateTimeField(null=True, blank=True, editable=False)
     last_test_status = models.CharField(max_length=20, blank=True, editable=False)
     last_test_error = models.TextField(blank=True, editable=False)
@@ -120,8 +116,195 @@ class ClientIntegration(models.Model):
         return f"{self.client} · {self.name}"
 
 
+    def clean(self):
+        super().clean()
+        if self.provider_code in {"rfg", "cint"} and self.sync_interval_seconds < 60:
+            raise ValidationError({
+                "sync_interval_seconds": (
+                    "This provider inventory cannot be polled more often than every 60 seconds."
+                )
+            })
+        if self.provider_code in {"rfg", "cint"} and self.scheduled_sync_enabled and self.last_test_status != "success":
+            raise ValidationError({
+                "scheduled_sync_enabled": "Test and verify the connection before enabling scheduled sync."
+            })
+
+
+class OrganizationUnit(models.Model):
+    """A strict Branch -> Sub-branch -> Shift hierarchy inside one workspace."""
+
+    class UnitType(models.TextChoices):
+        BRANCH = "branch", "Branch"
+        SUB_BRANCH = "sub_branch", "Sub-branch"
+        SHIFT = "shift", "Shift"
+
+    workspace_owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="organization_units",
+        help_text="The super-admin workspace or internal supplier that owns this hierarchy.",
+    )
+    parent = models.ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="children",
+    )
+    unit_type = models.CharField(max_length=16, choices=UnitType.choices, db_index=True)
+    name = models.CharField(max_length=120)
+    code = models.SlugField(max_length=80)
+    description = models.CharField(max_length=240, blank=True)
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="created_organization_units",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["workspace_owner_id", "unit_type", "name", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["workspace_owner", "parent", "unit_type", "code"],
+                name="unique_organization_unit_code_in_parent",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["workspace_owner", "unit_type", "is_active"]),
+            models.Index(fields=["parent", "is_active"]),
+        ]
+
+    @property
+    def path_label(self):
+        labels = [self.name]
+        current = self.parent
+        visited = {self.pk}
+        while current and current.pk not in visited:
+            visited.add(current.pk)
+            labels.append(current.name)
+            current = current.parent
+        return " / ".join(reversed(labels))
+
+    def clean(self):
+        super().clean()
+        if not self.workspace_owner_id:
+            raise ValidationError({"workspace_owner": "Select a workspace owner."})
+        parent_rules = {
+            self.UnitType.BRANCH: None,
+            self.UnitType.SUB_BRANCH: self.UnitType.BRANCH,
+            self.UnitType.SHIFT: self.UnitType.SUB_BRANCH,
+        }
+        if self.unit_type not in parent_rules:
+            raise ValidationError({"unit_type": "Select a valid organization unit type."})
+        profile = getattr(self.workspace_owner, "employee_profile", None)
+        if not self.workspace_owner.is_superuser and getattr(profile, "account_type", "") != "internal_vendor":
+            raise ValidationError({"workspace_owner": "Organization workspaces must belong to a super admin or internal supplier."})
+        expected_parent_type = parent_rules[self.unit_type]
+        if expected_parent_type is None and self.parent_id:
+            raise ValidationError({"parent": "A branch cannot have a parent."})
+        if expected_parent_type is not None:
+            if not self.parent_id:
+                raise ValidationError({"parent": f"A {self.get_unit_type_display().lower()} requires a parent."})
+            if self.pk and self.parent_id == self.pk:
+                raise ValidationError({"parent": "An organization unit cannot be its own parent."})
+            if self.parent.unit_type != expected_parent_type:
+                parent_name = dict(self.UnitType.choices)[expected_parent_type].lower()
+                raise ValidationError({"parent": f"Parent must be a {parent_name}."})
+            if self.parent.workspace_owner_id != self.workspace_owner_id:
+                raise ValidationError({"parent": "Parent and child must belong to the same workspace."})
+            visited = {self.pk} if self.pk else set()
+            current = self.parent
+            while current:
+                if current.pk in visited:
+                    raise ValidationError({"parent": "This parent would create a hierarchy cycle."})
+                visited.add(current.pk)
+                current = current.parent
+        if self.pk:
+            expected_child_type = {
+                self.UnitType.BRANCH: self.UnitType.SUB_BRANCH,
+                self.UnitType.SUB_BRANCH: self.UnitType.SHIFT,
+                self.UnitType.SHIFT: None,
+            }[self.unit_type]
+            children = OrganizationUnit.objects.filter(parent_id=self.pk)
+            invalid_children = children if expected_child_type is None else children.exclude(unit_type=expected_child_type)
+            if invalid_children.exists():
+                raise ValidationError({
+                    "unit_type": "This type change would invalidate existing child units. Move or deactivate the children first."
+                })
+        duplicate = OrganizationUnit.objects.filter(
+            workspace_owner_id=self.workspace_owner_id,
+            parent_id=self.parent_id,
+            unit_type=self.unit_type,
+            code=self.code,
+        )
+        if self.pk:
+            duplicate = duplicate.exclude(pk=self.pk)
+        if duplicate.exists():
+            raise ValidationError({"code": "This code is already used at the same hierarchy level."})
+
+    def __str__(self):
+        return self.path_label
+
+
+class OrganizationClientAccess(models.Model):
+    """Explicit client visibility with nearest-unit override inheritance."""
+
+    organization_unit = models.ForeignKey(
+        OrganizationUnit,
+        on_delete=models.PROTECT,
+        related_name="client_access_rules",
+    )
+    client = models.ForeignKey(Client, on_delete=models.PROTECT, related_name="organization_access_rules")
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="created_organization_client_access_rules",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["organization_unit__workspace_owner_id", "organization_unit__name", "client__name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["organization_unit", "client"],
+                name="unique_client_access_per_organization_unit",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["organization_unit", "is_active"]),
+            models.Index(fields=["client", "is_active"]),
+        ]
+
+    def clean(self):
+        super().clean()
+        errors = {}
+        if not self.organization_unit_id:
+            errors["organization_unit"] = "Select an organization unit."
+        if not self.client_id:
+            errors["client"] = "Select a client."
+        if errors:
+            raise ValidationError(errors)
+        owner = self.organization_unit.workspace_owner
+        profile = getattr(owner, "employee_profile", None)
+        if getattr(profile, "account_type", "") == "internal_vendor":
+            if not VendorClientAllocation.objects.filter(vendor=owner, client=self.client, is_active=True).exists():
+                raise ValidationError({"client": "Allocate this client to the internal supplier before assigning it to a branch."})
+
+    def __str__(self):
+        return f"{self.organization_unit.path_label} · {self.client.name}"
+
+
 class VendorCommercialProfile(models.Model):
-    """Commercial defaults for a user marked as an internal or external vendor."""
+    """Commercial defaults for a user marked as an internal or external supplier."""
 
     class DeliveryMode(models.TextChoices):
         PANEL = "panel", "Panel only"
@@ -145,7 +328,7 @@ class VendorCommercialProfile(models.Model):
         choices=DeliveryMode.choices,
         default=DeliveryMode.PANEL,
         db_index=True,
-        help_text="Controls whether an external vendor can sign in to the panel, use API keys, or both.",
+        help_text="Controls whether an external supplier can sign in to the panel, use API keys, or both.",
     )
     is_active = models.BooleanField(default=True, db_index=True)
     created_by = models.ForeignKey(
@@ -174,18 +357,18 @@ class VendorCommercialProfile(models.Model):
         employee_profile = getattr(self.vendor, "employee_profile", None)
         account_type = getattr(employee_profile, "account_type", "")
         if account_type not in {"internal_vendor", "external_vendor"}:
-            raise ValidationError({"vendor": "Commercial profiles can only be assigned to vendor accounts."})
+            raise ValidationError({"vendor": "Commercial profiles can only be assigned to supplier accounts."})
         if account_type == "internal_vendor" and self.default_cpi_cut_percent != Decimal("0.00"):
-            raise ValidationError({"default_cpi_cut_percent": "Internal vendors must receive the full source CPI."})
+            raise ValidationError({"default_cpi_cut_percent": "Internal suppliers must receive the full source CPI."})
         if account_type == "internal_vendor" and self.delivery_mode != self.DeliveryMode.PANEL:
-            raise ValidationError({"delivery_mode": "Internal vendors use the panel delivery mode."})
+            raise ValidationError({"delivery_mode": "Internal suppliers use the panel delivery mode."})
 
     def __str__(self):
         return self.vendor.get_full_name() or self.vendor.username
 
 
 class VendorAPIKey(models.Model):
-    """Revocable, hashed API credential for one external vendor account."""
+    """Revocable, hashed API credential for one external supplier account."""
 
     vendor = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -225,7 +408,7 @@ class VendorAPIKey(models.Model):
         super().clean()
         account_type = getattr(getattr(self.vendor, "employee_profile", None), "account_type", "")
         if account_type != "external_vendor":
-            raise ValidationError({"vendor": "API keys can only be issued to external vendors."})
+            raise ValidationError({"vendor": "API keys can only be issued to external suppliers."})
 
     def __str__(self):
         return f"{self.vendor} · {self.name} · {self.masked_key}"
@@ -249,7 +432,7 @@ class VendorClientAllocation(models.Model):
         null=True,
         blank=True,
         validators=PERCENTAGE_VALIDATORS,
-        help_text="Optional client-specific cut. Blank uses the vendor commercial default.",
+        help_text="Optional client-specific cut. Blank uses the supplier commercial default.",
     )
     starts_at = models.DateTimeField(null=True, blank=True)
     ends_at = models.DateTimeField(null=True, blank=True)
@@ -295,9 +478,9 @@ class VendorClientAllocation(models.Model):
         employee_profile = getattr(self.vendor, "employee_profile", None)
         account_type = getattr(employee_profile, "account_type", "")
         if account_type not in {"internal_vendor", "external_vendor"}:
-            raise ValidationError({"vendor": "Client allocations can only be assigned to vendor accounts."})
+            raise ValidationError({"vendor": "Client allocations can only be assigned to supplier accounts."})
         if account_type == "internal_vendor" and self.cpi_cut_override_percent not in {None, Decimal("0.00")}:
-            raise ValidationError({"cpi_cut_override_percent": "Internal vendors cannot have a CPI cut."})
+            raise ValidationError({"cpi_cut_override_percent": "Internal suppliers cannot have a CPI cut."})
         if self.ends_at and self.starts_at and self.ends_at <= self.starts_at:
             raise ValidationError({"ends_at": "End time must be after start time."})
         if self.consumed_quantity + self.reserved_quantity > self.quantity_limit:
@@ -325,7 +508,7 @@ class VendorSurveyAllocation(models.Model):
         null=True,
         blank=True,
         validators=PERCENTAGE_VALIDATORS,
-        help_text="Optional survey-specific cut. Blank uses the client/vendor policy.",
+        help_text="Optional survey-specific cut. Blank uses the client/supplier policy.",
     )
     starts_at = models.DateTimeField(null=True, blank=True)
     ends_at = models.DateTimeField(null=True, blank=True)
@@ -387,7 +570,7 @@ class VendorSurveyAllocation(models.Model):
             raise ValidationError({"survey": "Survey must be mapped to a client before it can be allocated."})
         account_type = getattr(getattr(self.vendor, "employee_profile", None), "account_type", "")
         if account_type == "internal_vendor" and self.cpi_cut_override_percent not in {None, Decimal("0.00")}:
-            raise ValidationError({"cpi_cut_override_percent": "Internal vendors cannot have a CPI cut."})
+            raise ValidationError({"cpi_cut_override_percent": "Internal suppliers cannot have a CPI cut."})
         if self.ends_at and self.starts_at and self.ends_at <= self.starts_at:
             raise ValidationError({"ends_at": "End time must be after start time."})
         if self.consumed_quantity + self.reserved_quantity > self.quantity_limit:
@@ -438,7 +621,7 @@ class AllocationReservation(models.Model):
     def clean(self):
         super().clean()
         if self.survey_allocation and self.survey_allocation.client_allocation_id != self.client_allocation_id:
-            raise ValidationError({"survey_allocation": "Survey and client allocations must belong to the same vendor scope."})
+            raise ValidationError({"survey_allocation": "Survey and client allocations must belong to the same supplier scope."})
         if self.survey_allocation and self.attempt.survey_id != self.survey_allocation.survey_id:
             raise ValidationError({"attempt": "Attempt survey must match the survey allocation."})
 

@@ -1,3 +1,5 @@
+/* Supplier policy, client/survey allocations and API-key management modals. */
+
 (() => {
   const workspace = document.querySelector('#vendorWorkspace');
   if (!workspace) return;
@@ -88,7 +90,7 @@
   }
 
   function accountLabel(type) {
-    return type === 'internal_vendor' ? 'Internal' : type === 'external_vendor' ? 'External' : 'Vendor';
+    return type === 'internal_vendor' ? 'Internal' : type === 'external_vendor' ? 'External' : 'Supplier';
   }
 
   function deliveryLabel(mode) {
@@ -185,8 +187,8 @@
       if (vendorColumns.has('clients')) cells.push(`<td>${number(vendor.allocation_count)}</td>`);
       if (vendorColumns.has('status')) cells.push(`<td>${stateBadge(vendor.is_active && (profile?.is_active ?? true))}<small class="delivery-label">${escapeHtml(deliveryLabel(profile?.delivery_mode || vendor.delivery_mode))}</small></td>`);
       if (vendorColumns.has('actions')) cells.push(`<td>${actionButton('policy', vendor.id, canEditPolicy)}</td>`);
-      return `<tr>${cells.join('') || '<td><div class="vendor-empty">No vendor columns assigned.</div></td>'}</tr>`;
-    }).join('') || emptyRow(Math.max(1, vendorColumns.size), 'No internal or external vendors have been created yet.');
+      return `<tr>${cells.join('') || '<td><div class="vendor-empty">No supplier columns assigned.</div></td>'}</tr>`;
+    }).join('') || emptyRow(Math.max(1, vendorColumns.size), 'No internal or external suppliers have been created yet.');
     $('#vendorRows').innerHTML = rows;
     $('#vendorCards').innerHTML = state.vendors.map((vendor) => {
       const profile = profiles.get(Number(vendor.id));
@@ -204,7 +206,7 @@
       if (clientColumns.has('vendor')) cells.push(`<td><strong>${escapeHtml(row.vendor_name)}</strong><br>${typeBadge(row.account_type)}</td>`);
       if (clientColumns.has('client')) cells.push(`<td><strong>${escapeHtml(row.client_name)}</strong><br><small>${stateBadge(row.is_active)}</small></td>`);
       if (clientColumns.has('quantity')) cells.push(`<td>${quantityMarkup(row)}</td>`);
-      if (clientColumns.has('cpi')) cells.push(`<td>${cutMarkup(row, 'vendor default')}</td>`);
+      if (clientColumns.has('cpi')) cells.push(`<td>${cutMarkup(row, 'supplier default')}</td>`);
       if (clientColumns.has('window')) cells.push(`<td><div class="vendor-window"><span>${dateTime(row.starts_at)}</span><span>to ${dateTime(row.ends_at)}</span></div></td>`);
       if (clientColumns.has('actions')) cells.push(`<td>${actionButton('client', row.id, canAllocateClient)}</td>`);
       return `<tr>${cells.join('') || '<td><div class="vendor-empty">No client-allocation columns assigned.</div></td>'}</tr>`;
@@ -227,7 +229,7 @@
       if (projectColumns.has('cpi')) cells.push(`<td>${cutMarkup(row, 'client policy')}</td>`);
       if (projectColumns.has('actions')) cells.push(`<td>${actionButton('survey', row.id, canAllocateProject)}</td>`);
       return `<tr>${cells.join('') || '<td><div class="vendor-empty">No project-allocation columns assigned.</div></td>'}</tr>`;
-    }).join('') || emptyRow(Math.max(1, projectColumns.size), 'No projects allocated. This vendor cannot see or start any client project yet.');
+    }).join('') || emptyRow(Math.max(1, projectColumns.size), 'No projects allocated. This supplier cannot see or start any client project yet.');
     $('#surveyAllocationCards').innerHTML = state.surveyAllocations.map((row) => {
       const head = `${projectColumns.has('survey') ? `<strong>${escapeHtml(row.survey_local_id)}</strong>` : ''}${projectColumns.has('vendor') || projectColumns.has('client') ? `<small>${projectColumns.has('vendor') ? escapeHtml(row.vendor_name) : ''}${projectColumns.has('vendor') && projectColumns.has('client') ? ' · ' : ''}${projectColumns.has('client') ? escapeHtml(row.client_name) : ''}</small>` : ''}`;
       const details = `${projectColumns.has('survey') ? `<span>Survey ID<strong>${escapeHtml(row.survey_source_id)}</strong></span>` : ''}${projectColumns.has('cpi') ? `<span>CPI cut<strong>${escapeHtml(row.effective_cpi_cut_percent)}%</strong></span>` : ''}${projectColumns.has('quantity') ? `<span>Available<strong>${number(row.remaining_quantity)}</strong></span><span>Limit<strong>${number(row.quantity_limit)}</strong></span>` : ''}`;
@@ -265,10 +267,10 @@
   function hydrateSelects() {
     const vendorOptions = state.vendors.map((vendor) => option(vendor.id, `${vendor.full_name} — ${accountLabel(vendor.account_type)}`)).join('');
     field('policy_vendor', 'policy').innerHTML = vendorOptions;
-    field('client_vendor', 'client').innerHTML = `<option value="">Select vendor</option>${vendorOptions}`;
+    field('client_vendor', 'client').innerHTML = `<option value="">Select supplier</option>${vendorOptions}`;
     field('client', 'client').innerHTML = `<option value="">Select client</option>${state.clients.map((client) => option(client.id, client.name)).join('')}`;
-    field('client_allocation', 'survey').innerHTML = `<option value="">Select vendor and client</option>${state.clientAllocations.map((row) => option(row.id, `${row.vendor_name} — ${row.client_name}`)).join('')}`;
-    field('api_vendor', 'api_key').innerHTML = `<option value="">Select API-enabled external vendor</option>${state.vendors.filter((vendor) => {
+    field('client_allocation', 'survey').innerHTML = `<option value="">Select supplier and client</option>${state.clientAllocations.map((row) => option(row.id, `${row.vendor_name} — ${row.client_name}`)).join('')}`;
+    field('api_vendor', 'api_key').innerHTML = `<option value="">Select API-enabled external supplier</option>${state.vendors.filter((vendor) => {
       const profile = state.profiles.find((item) => Number(item.vendor) === Number(vendor.id));
       return vendor.account_type === 'external_vendor' && ['api', 'both'].includes(profile?.delivery_mode || vendor.delivery_mode);
     }).map((vendor) => option(vendor.id, vendor.full_name)).join('')}`;
@@ -281,7 +283,7 @@
     if (internal) field('default_cpi_cut_percent', 'policy').value = '0.00';
     field('delivery_mode', 'policy').disabled = internal;
     if (internal) field('delivery_mode', 'policy').value = 'panel';
-    $('#policyRuleNote').textContent = internal ? 'Internal vendors always receive the full source CPI.' : 'External vendor payable CPI = source CPI minus this percentage.';
+    $('#policyRuleNote').textContent = internal ? 'Internal suppliers always receive the full source CPI.' : 'External supplier payable CPI = source CPI minus this percentage.';
   }
 
   function updateClientRule() {
@@ -435,6 +437,7 @@
 
   $$('.vendor-tabs [data-vendor-tab]').forEach((button) => button.addEventListener('click', () => {
     $$('.vendor-tabs [data-vendor-tab]').forEach((item) => item.classList.toggle('active', item === button));
+    $$('.vendor-tabs [data-vendor-tab]').forEach((item) => item.setAttribute('aria-selected', String(item === button)));
     $$('[data-vendor-panel]').forEach((panel) => {
       const active = panel.dataset.vendorPanel === button.dataset.vendorTab;
       panel.hidden = !active; panel.classList.toggle('active', active);
@@ -442,22 +445,31 @@
   }));
 
   workspace.addEventListener('click', (event) => {
+    const createClient = event.target.closest('button[data-create-allocation="client"]');
+    const createSurvey = event.target.closest('button[data-create-allocation="survey"]');
+    const createApiKey = event.target.closest('button[data-create-api-key]');
+    if (createClient && canAllocateClient) {
+      event.preventDefault(); event.stopPropagation(); openClientAllocation(); return;
+    }
+    if (createSurvey && canAllocateProject) {
+      event.preventDefault(); event.stopPropagation(); openSurveyAllocation(); return;
+    }
+    if (createApiKey && canCreateApiKey) {
+      event.preventDefault(); event.stopPropagation(); openApiKey(); return;
+    }
     const policy = event.target.closest('[data-edit-policy]');
     const client = event.target.closest('[data-edit-client]');
     const survey = event.target.closest('[data-edit-survey]');
-    if (policy && canEditPolicy) openPolicy(policy.dataset.editPolicy);
-    if (client && canAllocateClient) openClientAllocation(client.dataset.editClient);
-    if (survey && canAllocateProject) openSurveyAllocation(survey.dataset.editSurvey);
+    if (policy && canEditPolicy) { event.preventDefault(); openPolicy(policy.dataset.editPolicy); return; }
+    if (client && canAllocateClient) { event.preventDefault(); openClientAllocation(client.dataset.editClient); return; }
+    if (survey && canAllocateProject) { event.preventDefault(); openSurveyAllocation(survey.dataset.editSurvey); return; }
     const revokeKey = event.target.closest('[data-revoke-api-key]');
     if (revokeKey && canRevokeApiKey && confirm('Revoke this API key permanently?')) {
       api(`/api/v1/vendors/api-keys/${revokeKey.dataset.revokeApiKey}/`, { method: 'DELETE' })
         .then(() => { toast('API key revoked.'); return reloadData(); })
         .catch((error) => toast(error.message, true));
     }
-  });
-  $('[data-create-allocation="client"]')?.addEventListener('click', () => openClientAllocation());
-  $('[data-create-allocation="survey"]')?.addEventListener('click', () => openSurveyAllocation());
-  $('[data-create-api-key]')?.addEventListener('click', openApiKey);
+  }, true);
   $$('[data-close-vendor-modal]').forEach((button) => button.addEventListener('click', closeModal));
   backdrop.addEventListener('click', closeModal);
   document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && modal && !modal.hidden) closeModal(); });

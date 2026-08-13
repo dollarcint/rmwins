@@ -4,10 +4,11 @@
 {% block header_title %}Projects{% endblock %}
 {% block content %}
 {{ project_columns|json_script:"projectColumnAccess" }}
+{{ can_open_project_studies|json_script:"projectStudyLinkAccess" }}
 <section class="page-intro">
-  <div><p class="eyebrow">Survey operations</p><h1>All surveys</h1><p>Live inventory synchronized securely from InnovateMR.</p></div>
+  <div><p class="eyebrow">Survey operations</p><h1>All surveys</h1></div>
   <div class="page-intro-actions">
-    {% if can_export_projects %}<button class="primary-button export-button project-export-button" id="exportProjects" type="button"><span aria-hidden="true">↓</span> Export CSV</button>{% endif %}
+    {% if can_export_projects %}<button class="primary-button export-button project-export-button" id="exportProjects" type="button"><span aria-hidden="true">↓</span> Export</button>{% endif %}
     {% if can_sync %}<button class="primary-button sync-button" id="syncButton"><span class="sync-symbol">↻</span> Sync now</button>{% endif %}
   </div>
 </section>
@@ -37,7 +38,7 @@
     <label id="statusLabel">Status</label>
     <div class="multi-select" data-multi-filter="status">
       <button class="multi-trigger" type="button" aria-labelledby="statusLabel" aria-expanded="false"><span>All statuses</span><i>⌄</i></button>
-      <div class="multi-menu" hidden><label><input type="checkbox" value="live"><span>Live</span></label><label><input type="checkbox" value="closed"><span>Closed</span></label></div>
+      <div class="multi-menu" hidden><div class="multi-options"><label><input type="checkbox" value="live"><span>Live</span></label><label><input type="checkbox" value="closed"><span>Closed</span></label></div></div>
     </div>
   </div>
   {% endif %}
@@ -51,6 +52,28 @@
         <div class="multi-options">{% for company in companies %}<label><input type="checkbox" value="{{ company }}"><span>{{ company }}</span></label>{% empty %}<label><input type="checkbox" value="InnovateMR"><span>InnovateMR</span></label>{% endfor %}</div>
         <p class="multi-no-results" hidden>No matching client</p>
       </div>
+    </div>
+  </div>
+  {% endif %}
+  {% if project_filters.buyer %}
+  <div class="field multi-field">
+    <label id="buyerLabel">Buyer ID</label>
+    <div class="multi-select" data-multi-filter="buyer_id" data-default-label="All buyer IDs">
+      <button class="multi-trigger" type="button" aria-labelledby="buyerLabel" aria-expanded="false"><span>All buyer IDs</span><i>⌄</i></button>
+      <div class="multi-menu" hidden>
+        <div class="multi-menu-search"><span aria-hidden="true">⌕</span><input type="search" data-multi-search placeholder="Search buyer ID…" aria-label="Search buyer IDs" autocomplete="off"></div>
+        <div class="multi-options">{% for buyer in buyer_options %}<label data-client-value="{{ buyer.client_value }}"><input type="checkbox" value="{{ buyer.value }}"><span>{{ buyer.value }}</span></label>{% empty %}<span class="filter-empty">No buyer IDs yet</span>{% endfor %}</div>
+        <p class="multi-no-results" hidden>No matching buyer ID</p>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+  {% if project_filters.survey_type %}
+  <div class="field multi-field">
+    <label id="surveyTypeLabel">Survey type</label>
+    <div class="multi-select" data-multi-filter="survey_type" data-default-label="All survey types">
+      <button class="multi-trigger" type="button" aria-labelledby="surveyTypeLabel" aria-expanded="false"><span>All survey types</span><i>⌄</i></button>
+      <div class="multi-menu" hidden><div class="multi-options">{% for survey_type in survey_types %}<label><input type="checkbox" value="{{ survey_type }}"><span>{{ survey_type }}</span></label>{% empty %}<label><input type="checkbox" value="B2B"><span>B2B</span></label><label><input type="checkbox" value="B2C"><span>B2C</span></label>{% endfor %}</div></div>
     </div>
   </div>
   {% endif %}
@@ -106,7 +129,7 @@
     <table class="survey-table">
       <thead><tr>
         {% if 'project_id' in project_columns %}<th>Project ID</th>{% endif %}
-        {% if 'survey' in project_columns %}<th>Survey</th>{% endif %}
+        {% if 'survey' in project_columns %}<th>Survey ID</th>{% endif %}
         {% if 'market' in project_columns %}<th>Market</th>{% endif %}
         {% if 'completes' in project_columns %}<th>Completes</th>{% endif %}
         {% if 'cpi' in project_columns %}<th>CPI</th>{% endif %}
@@ -143,4 +166,4 @@
   <div class="drawer-content" id="drawerContent"></div>
 </aside>
 {% endblock %}
-{% block scripts %}<script src="{% static 'surveys/projects.js' %}?v=15" defer></script>{% endblock %}
+{% block scripts %}<script src="{% static 'surveys/projects.js' %}?v=22" defer></script>{% endblock %}

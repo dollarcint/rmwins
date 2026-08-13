@@ -1,3 +1,5 @@
+"""Authenticate external supplier API requests using stored key hashes."""
+
 from django.utils import timezone
 from rest_framework.authentication import BaseAuthentication
 from rest_framework.exceptions import AuthenticationFailed
@@ -9,7 +11,7 @@ from .security import digest_api_key
 
 
 class VendorAPIKeyAuthentication(BaseAuthentication):
-    """Authenticate an external vendor using X-API-Key or Authorization: Api-Key."""
+    """Authenticate an external supplier using X-API-Key or Authorization: Api-Key."""
 
     keyword = "Api-Key"
 
@@ -28,7 +30,7 @@ class VendorAPIKeyAuthentication(BaseAuthentication):
         ).filter(key_hash=digest_api_key(raw_key)).first()
         now = timezone.now()
         if not api_key or not api_key.is_active or api_key.revoked_at:
-            raise AuthenticationFailed("Invalid or revoked vendor API key.")
+            raise AuthenticationFailed("Invalid or revoked supplier API key.")
         if api_key.expires_at and api_key.expires_at <= now:
             raise AuthenticationFailed("Vendor API key has expired.")
         vendor = api_key.vendor
@@ -36,7 +38,7 @@ class VendorAPIKeyAuthentication(BaseAuthentication):
             raise AuthenticationFailed("Vendor account is inactive.")
         profile = getattr(vendor, "employee_profile", None)
         if not profile or profile.account_type != EmployeeProfile.AccountType.EXTERNAL_VENDOR:
-            raise AuthenticationFailed("API key is not assigned to an external vendor.")
+            raise AuthenticationFailed("API key is not assigned to an external supplier.")
         commercial = getattr(vendor, "vendor_commercial_profile", None)
         if not commercial or not commercial.is_active or not commercial.api_access_enabled:
             raise AuthenticationFailed("API delivery is not enabled for this vendor.")

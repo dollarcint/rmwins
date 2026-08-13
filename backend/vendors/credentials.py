@@ -12,7 +12,8 @@ from django.utils import timezone
 
 def _fernet() -> Fernet:
     raw = str(settings.INTEGRATION_CREDENTIAL_ENCRYPTION_KEY).encode("utf-8")
-    return Fernet(base64.urlsafe_b64encode(hashlib.sha256(raw).digest()))
+    key = base64.urlsafe_b64encode(hashlib.sha256(raw).digest())
+    return Fernet(key)
 
 
 def token_fingerprint(token: str) -> str:
@@ -25,15 +26,25 @@ def resolve_integration_token(integration) -> str:
             return _fernet().decrypt(integration.encrypted_api_token.encode("ascii")).decode("utf-8")
         except InvalidToken as exc:
             raise ValueError("Stored API credential cannot be decrypted. Check the encryption key.") from exc
-    return os.getenv(integration.credential_env_key, "").strip() if integration.credential_env_key else ""
+    if integration.credential_env_key:
+        return os.getenv(integration.credential_env_key, "").strip()
+    return ""
 
 
 def _clear_integration_data(integration) -> int:
-    return integration.surveys.update(entry_link="", test_entry_link="", raw_data={}, detail_synced_at=None, quota_synced_at=None, targeting_synced_at=None)
+    return integration.surveys.update(
+        entry_link="",
+        test_entry_link="",
+        raw_data={},
+        detail_synced_at=None,
+        quota_synced_at=None,
+        targeting_synced_at=None,
+    )
 
 
 @transaction.atomic
 def set_integration_token(integration, token: str) -> tuple[bool, int]:
+    """Store a secret and immediately invalidate only this integration if it changed."""
     token = token.strip()
     fingerprint = token_fingerprint(token)
     previous_fingerprint = integration.credential_fingerprint
@@ -45,12 +56,17 @@ def set_integration_token(integration, token: str) -> tuple[bool, int]:
     integration.credential_fingerprint = fingerprint
     integration.credential_last_four = token[-4:] if token else ""
     integration.credential_changed_at = timezone.now()
-    integration.save(update_fields=["encrypted_api_token", "credential_fingerprint", "credential_last_four", "credential_changed_at", "updated_at"])
+    integration.save(update_fields=[
+        "encrypted_api_token", "credential_fingerprint", "credential_last_four",
+        "credential_changed_at", "updated_at",
+    ])
     return changed, cleared
 
 
 def reconcile_all_integration_credentials() -> dict[str, int]:
+    """Detect legacy environment-token changes without invalidating first-time baselines."""
     from .models import ClientIntegration
+
     checked = changed = cleared = 0
     for integration in ClientIntegration.objects.exclude(credential_env_key=""):
         token = os.getenv(integration.credential_env_key, "").strip()

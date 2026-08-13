@@ -1,25 +1,31 @@
-import json
+"""Authentication, first-admin setup and Access Control HTTP endpoints."""
 
-from django.contrib.auth import get_user_model, login as django_login
+import re
+
+from django.contrib.auth import get_user_model, login
+from django.contrib.auth.decorators import login_required
 from django.contrib.auth.views import LoginView, LogoutView
 from django.db import transaction
 from django.db.models import Count
-from django.http import Http404, JsonResponse
-from django.middleware.csrf import get_token
+from django.http import Http404
 from django.core.exceptions import PermissionDenied
 from django.shortcuts import redirect, render
 from django.urls import reverse, reverse_lazy
-from django.views.decorators.http import require_GET, require_POST
+from django.views.decorators.http import require_POST
 from drf_spectacular.utils import extend_schema, extend_schema_view
 from rest_framework import filters, viewsets
 
 from .access import (
     EXTERNAL_VENDOR_FORBIDDEN_CODES, HasFunctionPermission, any_function_permission_required, assignable_functions, assignable_roles,
-    can_manage_role, has_function_access, subordinate_user_ids,
+    can_manage_role, has_function_access, manageable_user_ids,
 )
 from .forms import FirstAdminSetupForm, WorkspaceAuthenticationForm
 from .models import AccessFunction, EmployeeProfile, Role
 from .serializers import AccessFunctionSerializer, RoleSerializer, UserAccessSerializer
+from vendors.access import organization_workspace_owner_ids
+from vendors.models import OrganizationUnit
+from prescreener_vault.cint_email_pool import add_real_email, email_pool_status
+from prescreener_vault.services import PrescreenerVaultError
 
 
 class WorkspaceLoginView(LoginView):
@@ -39,45 +45,6 @@ class WorkspaceLogoutView(LogoutView):
     http_method_names = ["post", "options"]
 
 
-@require_GET
-def auth_session(request):
-    return JsonResponse({
-        "authenticated": request.user.is_authenticated,
-        "csrf_token": get_token(request),
-        "redirect_url": request.build_absolute_uri(reverse("home")) if request.user.is_authenticated else None,
-    })
-
-
-@require_POST
-def auth_login(request):
-    try:
-        payload = json.loads(request.body or b"{}")
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        return JsonResponse({"error": "Invalid request."}, status=400)
-    if not isinstance(payload, dict):
-        return JsonResponse({"error": "Invalid request."}, status=400)
-
-    remember_me = payload.get("remember_me", True)
-    if isinstance(remember_me, str):
-        remember_me = remember_me.lower() in {"1", "true", "yes", "on"}
-
-    form = WorkspaceAuthenticationForm(request=request, data={
-        "username": str(payload.get("username", "")).strip(),
-        "password": payload.get("password", ""),
-        "remember_me": bool(remember_me),
-    })
-    if not form.is_valid():
-        return JsonResponse({"error": "Username or password is incorrect."}, status=400)
-
-    django_login(request, form.get_user(), backend="django.contrib.auth.backends.ModelBackend")
-    if not form.cleaned_data.get("remember_me"):
-        request.session.set_expiry(0)
-    return JsonResponse({
-        "authenticated": True,
-        "redirect_url": request.build_absolute_uri(reverse("home")),
-    })
-
-
 def first_admin_setup(request):
     if get_user_model().objects.exists():
         raise Http404
@@ -94,7 +61,7 @@ def first_admin_setup(request):
             profile, _ = EmployeeProfile.objects.get_or_create(user=user)
             profile.role = Role.objects.filter(slug="super-admin").first()
             profile.save(update_fields=["role", "updated_at"])
-        django_login(request, user, backend="django.contrib.auth.backends.ModelBackend")
+        login(request, user, backend="django.contrib.auth.backends.ModelBackend")
         return redirect("home")
     return render(request, "accounts/setup.html", {"form": form})
 
@@ -105,13 +72,33 @@ def first_admin_setup(request):
 def access_control_page(request):
     roles = assignable_roles(request.user).annotate(employee_count=Count("employees")).prefetch_related("function_assignments__function")
     functions = assignable_functions(request.user)
-    user_ids = subordinate_user_ids(request.user)
+    user_ids = manageable_user_ids(request.user)
     if request.user.is_superuser:
         users = get_user_model().objects.all()
     else:
         users = get_user_model().objects.filter(id__in=user_ids)
-    users = users.select_related("employee_profile__role", "employee_profile__created_by").prefetch_related("function_overrides__function")
+    users = users.select_related(
+        "employee_profile__role", "employee_profile__created_by",
+        "employee_profile__organization_unit__workspace_owner",
+        "employee_profile__organization_unit__parent__parent",
+    ).prefetch_related("function_overrides__function")
+    organization_units = OrganizationUnit.objects.filter(
+        workspace_owner_id__in=organization_workspace_owner_ids(request.user),
+        is_active=True,
+    ).select_related("workspace_owner", "parent__parent").order_by("workspace_owner__username", "unit_type", "name")
     requester_type = getattr(getattr(request.user, "employee_profile", None), "account_type", "")
+    can_manage_cint_email_pool = has_function_access(
+        request.user, "access.cint_email_pool.manage"
+    )
+    cint_email_pool = None
+    cint_email_pool_error = ""
+    if can_manage_cint_email_pool:
+        try:
+            cint_email_pool = email_pool_status()
+        except Exception:
+            cint_email_pool_error = (
+                "The encrypted email vault is unavailable. Verify the vault migration and database connection."
+            )
     return render(request, "accounts/access_control_v2.html", {
         "active_page": "access-control", "roles": roles, "functions": functions, "employees": users,
         "can_create_users": any(
@@ -126,7 +113,74 @@ def access_control_page(request):
             else "Add user"
         ),
         "can_create_roles": has_function_access(request.user, "roles.create"),
+        "organization_units": organization_units,
+        "can_manage_cint_email_pool": can_manage_cint_email_pool,
+        "cint_email_pool": cint_email_pool,
+        "cint_email_pool_error": cint_email_pool_error,
+        "cint_email_import_result": request.session.pop("cint_email_import_result", None),
     })
+
+
+@login_required
+@require_POST
+def cint_email_pool_import(request):
+    if not has_function_access(request.user, "access.cint_email_pool.manage"):
+        raise PermissionDenied("You cannot manage the Cint respondent email pool.")
+
+    raw = request.POST.get("emails", "")
+    values = [value.strip() for value in re.split(r"[\r\n,;]+", raw) if value.strip()]
+    if len(values) > 5000:
+        request.session["cint_email_import_result"] = {
+            "tone": "error",
+            "message": "Paste at most 5,000 real email addresses in one import.",
+        }
+        return redirect(f"{reverse('access-control')}#cint-email-pool")
+    if not values:
+        request.session["cint_email_import_result"] = {
+            "tone": "error",
+            "message": "Paste at least one real email address.",
+        }
+        return redirect(f"{reverse('access-control')}#cint-email-pool")
+
+    added = existing = invalid = 0
+    invalid_positions = []
+    try:
+        for position, email in enumerate(values, start=1):
+            try:
+                _, created = add_real_email(email)
+            except ValueError:
+                invalid += 1
+                invalid_positions.append(position)
+            else:
+                if created:
+                    added += 1
+                else:
+                    existing += 1
+    except PrescreenerVaultError:
+        request.session["cint_email_import_result"] = {
+            "tone": "error",
+            "message": "The encrypted email vault is temporarily unavailable. No plaintext emails were stored.",
+        }
+    except Exception:
+        request.session["cint_email_import_result"] = {
+            "tone": "error",
+            "message": "Email import could not be completed. Check the vault database and encryption-key configuration.",
+        }
+    else:
+        suffix = (
+            f" Invalid input positions: {', '.join(map(str, invalid_positions[:25]))}"
+            + ("…" if len(invalid_positions) > 25 else "")
+            if invalid_positions
+            else ""
+        )
+        request.session["cint_email_import_result"] = {
+            "tone": "success" if not invalid else "warning",
+            "message": (
+                f"Processed {len(values)}: {added} encrypted and added, "
+                f"{existing} already present, {invalid} invalid.{suffix}"
+            ),
+        }
+    return redirect(f"{reverse('access-control')}#cint-email-pool")
 
 
 @extend_schema_view(
@@ -219,10 +273,14 @@ class UserAccessViewSet(viewsets.ModelViewSet):
         }.get(self.action, "users.view")
 
     def get_queryset(self):
-        queryset = get_user_model().objects.select_related("employee_profile__role", "employee_profile__created_by").prefetch_related("function_overrides__function")
+        queryset = get_user_model().objects.select_related(
+            "employee_profile__role", "employee_profile__created_by",
+            "employee_profile__organization_unit__workspace_owner",
+            "employee_profile__organization_unit__parent__parent",
+        ).prefetch_related("function_overrides__function")
         if self.request.user.is_superuser:
             return queryset
-        return queryset.filter(id__in=subordinate_user_ids(self.request.user), is_superuser=False)
+        return queryset.filter(id__in=manageable_user_ids(self.request.user), is_superuser=False)
 
     def perform_destroy(self, instance):
         if instance == self.request.user or instance.is_superuser:

@@ -30,6 +30,10 @@ Answers are persisted but are not used as an authoritative local rejection. Inno
 
 ## Supplier redirect
 
+For Research For Good, the 10-character platform attempt RID is the only tracking
+identity sent upstream. It is sent as RFG `rid`; no RFG `tid` and no prescreener
+vault UID are added to the provider URL. RFG callbacks resolve that RID directly.
+
 The public copied link always uses the platform-facing supplier code, so an upstream/vendor supplier code is not exposed there. The exact stored `entryLink` is parsed only after validation. Its PID is replaced with RID, `trackId=RID` is added, and captured `QuestionKey=OptionId` pairs are appended. `survNum` and the real upstream `supCode` are preserved from the allocated link; they are never reconstructed from client parameters. This keeps InnovateMR routing intact while allowing the same public code to be used for future providers.
 
 InnovateMR owns the browser redirect after the respondent leaves this application. Configure the account-level or survey-level return URLs in InnovateMR to point to the public deployment, using `%%trackId%%` as the RID, for example:
@@ -58,6 +62,8 @@ Status mapping:
 Pre-survey statuses are collapsed into the same five operational UI states: pending/redirected both display as Initiated, pre-survey termination maps to 2, pre-survey over-quota maps to 3, and pre-survey quality termination maps to 4.
 
 The landing page accepts RID aliases `PID`, `pid`, `QSID`, `qsid`, and `trackId` for integration tolerance. The canonical parameter remains `rid`.
+
+For Cint, the copied platform URL still opens the local pre-screener. On submit the immutable vault UID is the Cint PID and the attempt RID is the Cint MID. A real respondent email from the encrypted vault pool is permanently assigned to that UID; the live link receives only its normalized SHA-256 `cint_email`, never the employee login email or plaintext. A reused UID resolves to the same identity, while a new UID can only claim an unassigned address. The captured Cint question/precode parameters are added to the link. The entire URL including its required trailing `&` is signed with HMAC-SHA1 using `CINT_HASH_KEY`; URL-safe Base64 without padding is appended as the final lowercase `hash` parameter. Links over 1999 characters fail closed.
 
 ## Trust and verification
 

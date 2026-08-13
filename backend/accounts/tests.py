@@ -1,54 +1,152 @@
 import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from django.contrib.auth import get_user_model
+from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.test import TestCase
 from django.urls import reverse
 from rest_framework.test import APIClient
 
+from prescreener_vault.constants import DATABASE_ALIAS
+from prescreener_vault.models import CintRespondentEmail
+
 from .access import has_function_access
 from .function_catalog import sync_access_function_catalog
-from .models import AccessFunction, EmployeeProfile, Role, UserFunctionOverride
+from .models import AccessFunction, EmployeeProfile, Role, RoleFunctionPermission, UserFunctionOverride
+
+
+class RoleConfigurationCommandTests(TestCase):
+    def test_import_replaces_roles_and_preserves_user_overrides(self):
+        projects = AccessFunction.objects.get(code="projects.view")
+        attempts = AccessFunction.objects.get(code="attempts.view")
+        source_role = Role.objects.create(
+            name="Quest operator",
+            slug="quest-operator",
+            description="Transferred role",
+            rank=27,
+            cpi_visibility_percent="72.50",
+        )
+        RoleFunctionPermission.objects.create(role=source_role, function=projects, allowed=True)
+        RoleFunctionPermission.objects.create(role=source_role, function=attempts, allowed=False)
+
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            export_path = root / "quest-roles.json"
+            backup_path = root / "quant-roles-before-import.json"
+            call_command("role_config", export_path=str(export_path))
+
+            source_role.name = "Changed locally"
+            source_role.cpi_visibility_percent = "10.00"
+            source_role.save(update_fields=["name", "cpi_visibility_percent", "updated_at"])
+            source_role.function_assignments.all().delete()
+
+            extra_role = Role.objects.create(name="Quant only", slug="quant-only", rank=90)
+            user = get_user_model().objects.create_user(username="quant-user", password="password-123")
+            profile = user.employee_profile
+            profile.role = extra_role
+            profile.save(update_fields=["role", "updated_at"])
+            override = UserFunctionOverride.objects.create(
+                user=user,
+                function=attempts,
+                effect=UserFunctionOverride.Effect.ALLOW,
+            )
+
+            call_command("role_config", import_path=str(export_path), dry_run=True)
+            self.assertTrue(Role.objects.filter(slug="quant-only").exists())
+
+            call_command(
+                "role_config",
+                import_path=str(export_path),
+                replace=True,
+                backup=str(backup_path),
+            )
+
+            restored = Role.objects.get(slug="quest-operator")
+            self.assertEqual(restored.name, "Quest operator")
+            self.assertEqual(str(restored.cpi_visibility_percent), "72.50")
+            self.assertEqual(
+                dict(restored.function_assignments.values_list("function__code", "allowed")),
+                {"attempts.view": False, "projects.view": True},
+            )
+            self.assertFalse(Role.objects.filter(slug="quant-only").exists())
+            profile.refresh_from_db()
+            self.assertEqual(profile.role.slug, "employee")
+            self.assertTrue(UserFunctionOverride.objects.filter(pk=override.pk).exists())
+            self.assertTrue(backup_path.is_file())
+
+    def test_import_requires_explicit_replace_confirmation(self):
+        with TemporaryDirectory() as temporary_directory:
+            export_path = Path(temporary_directory) / "roles.json"
+            call_command("role_config", export_path=str(export_path))
+            with self.assertRaises(CommandError):
+                call_command("role_config", import_path=str(export_path))
+
+    def test_import_accepts_source_without_employee_role(self):
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            export_path = root / "roles-without-employee.json"
+            call_command("role_config", export_path=str(export_path))
+            payload = json.loads(export_path.read_text(encoding="utf-8"))
+            payload["roles"] = [role for role in payload["roles"] if role["slug"] != "employee"]
+            export_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            extra_role = Role.objects.create(name="Quant only", slug="quant-only", rank=90)
+            user = get_user_model().objects.create_user(username="roleless-user", password="password-123")
+            user.employee_profile.role = extra_role
+            user.employee_profile.save(update_fields=["role", "updated_at"])
+
+            call_command(
+                "role_config",
+                import_path=str(export_path),
+                replace=True,
+                backup=str(root / "target-backup.json"),
+            )
+
+            user.employee_profile.refresh_from_db()
+            self.assertIsNone(user.employee_profile.role)
+            self.assertFalse(Role.objects.filter(slug__in=["employee", "quant-only"]).exists())
+
+    def test_import_translates_legacy_summary_permission_to_current_cards(self):
+        legacy = AccessFunction.objects.create(
+            code="user_hits.summary",
+            name="Legacy User Hits summary",
+            module="User Hits",
+        )
+        source_role = Role.objects.create(name="Legacy operator", slug="legacy-operator", rank=25)
+        RoleFunctionPermission.objects.create(role=source_role, function=legacy, allowed=False)
+
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            export_path = root / "legacy-roles.json"
+            call_command("role_config", export_path=str(export_path))
+            legacy.delete()
+
+            call_command(
+                "role_config",
+                import_path=str(export_path),
+                replace=True,
+                backup=str(root / "target-backup.json"),
+            )
+
+            assignments = dict(
+                Role.objects.get(slug="legacy-operator").function_assignments.filter(
+                    function__code__startswith="user_hits.card."
+                ).values_list("function__code", "allowed")
+            )
+            self.assertEqual(set(assignments), {
+                "user_hits.card.total_hits",
+                "user_hits.card.completes",
+                "user_hits.card.conversion",
+                "user_hits.card.active_users",
+                "user_hits.card.devices",
+                "user_hits.card.ir",
+            })
+            self.assertEqual(set(assignments.values()), {False})
 
 
 class LoginAndSetupTests(TestCase):
-    def test_frontend_session_endpoint_returns_csrf_token(self):
-        response = self.client.get(reverse("auth-session"), HTTP_ORIGIN="http://localhost:5173")
-
-        self.assertEqual(response.status_code, 200)
-        self.assertFalse(response.json()["authenticated"])
-        self.assertTrue(response.json()["csrf_token"])
-        self.assertIn("csrftoken", response.cookies)
-        self.assertEqual(response["Access-Control-Allow-Origin"], "http://localhost:5173")
-        self.assertEqual(response["Access-Control-Allow-Credentials"], "true")
-
-    def test_frontend_login_endpoint_creates_django_session(self):
-        get_user_model().objects.create_user(username="operator", password="safe-password-123")
-
-        response = self.client.post(
-            reverse("auth-login"),
-            data=json.dumps({
-                "username": "operator",
-                "password": "safe-password-123",
-                "remember_me": False,
-            }),
-            content_type="application/json",
-        )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertTrue(response.json()["authenticated"])
-        self.assertTrue(self.client.session.get("_auth_user_id"))
-        self.assertTrue(self.client.session.get_expire_at_browser_close())
-
-    def test_frontend_login_endpoint_rejects_invalid_credentials(self):
-        response = self.client.post(
-            reverse("auth-login"),
-            data=json.dumps({"username": "missing", "password": "wrong"}),
-            content_type="application/json",
-        )
-
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.json()["error"], "Username or password is incorrect.")
-
     def test_anonymous_internal_page_redirects_to_login(self):
         response = self.client.get(reverse("projects"))
         self.assertEqual(response.status_code, 302)
@@ -84,7 +182,25 @@ class FunctionAccessTests(TestCase):
         self.assertTrue(has_function_access(self.user, "attempts.view"))
         self.assertFalse(has_function_access(self.user, "projects.view"))
         self.assertEqual(self.client.get(reverse("projects")).status_code, 403)
-        self.assertRedirects(self.client.get(reverse("home")), reverse("dashboard"), fetch_redirect_response=False)
+        self.assertRedirects(self.client.get(reverse("home")), reverse("traffic-reports"), fetch_redirect_response=False)
+
+    def test_dashboard_is_hard_restricted_to_super_admin_accounts(self):
+        dashboard = AccessFunction.objects.get(code="dashboard.view")
+        UserFunctionOverride.objects.update_or_create(
+            user=self.user, function=dashboard, defaults={"effect": "allow"}
+        )
+        self.assertFalse(has_function_access(self.user, "dashboard.view"))
+        self.assertEqual(self.client.get(reverse("dashboard")).status_code, 403)
+        api = APIClient()
+        api.force_authenticate(self.user)
+        self.assertEqual(api.get(reverse("dashboard-api")).status_code, 403)
+
+        owner = get_user_model().objects.create_user(username="role-super-admin", password="password-123")
+        owner.employee_profile.role = Role.objects.get(slug="super-admin")
+        owner.employee_profile.save(update_fields=["role", "updated_at"])
+        self.client.force_login(owner)
+        self.assertTrue(has_function_access(owner, "dashboard.view"))
+        self.assertEqual(self.client.get(reverse("dashboard")).status_code, 200)
 
     def test_denied_navigation_and_project_column_are_not_rendered(self):
         UserFunctionOverride.objects.create(
@@ -182,7 +298,76 @@ class FunctionAccessTests(TestCase):
         self.assertContains(page, "projects.filter.cpi")
         self.assertContains(page, "projects.column.completes")
         self.assertContains(page, "studies.filter.date")
+        self.assertContains(page, "studies.filter.country")
+        self.assertContains(page, "studies.column.cpi")
+        self.assertContains(page, "studies.card.revenue")
+        self.assertContains(page, "user_hits.card.completes")
+        self.assertContains(page, "termination_reasons.card.quality")
+        self.assertContains(page, "organization.card.client_grants")
+        self.assertContains(page, "vendors.card.quantity")
         self.assertContains(page, "user_hits.column.completes")
+        self.assertContains(page, "Select entire group")
+        self.assertContains(page, "assigned functions")
+
+
+class CintEmailPoolAccessTests(TestCase):
+    databases = {"default", DATABASE_ALIAS}
+
+    def setUp(self):
+        self.owner = get_user_model().objects.create_superuser(
+            username="email-pool-owner",
+            email="owner@example.test",
+            password="password-123",
+        )
+
+    def test_super_admin_can_bulk_import_real_emails_from_access_control(self):
+        self.client.force_login(self.owner)
+        page = self.client.get(reverse("access-control"))
+        self.assertContains(page, "Cint Email Pool")
+        self.assertContains(page, "Encrypt & add emails")
+
+        response = self.client.post(reverse("cint-email-pool-import"), {
+            "emails": "Real.One@example.com\nreal.two@example.com\ninvalid-value",
+        })
+        self.assertRedirects(
+            response,
+            reverse("access-control") + "#cint-email-pool",
+            fetch_redirect_response=False,
+        )
+        self.assertEqual(
+            CintRespondentEmail.objects.using(DATABASE_ALIAS).count(),
+            2,
+        )
+        stored = CintRespondentEmail.objects.using(DATABASE_ALIAS).first()
+        self.assertNotIn("real.one", stored.encrypted_email.lower())
+
+        result = self.client.get(reverse("access-control"))
+        self.assertContains(result, "2 encrypted and added")
+        self.assertContains(result, "1 invalid")
+        self.assertNotContains(result, "Real.One@example.com")
+
+    def test_employee_cannot_view_or_submit_sensitive_email_pool(self):
+        employee = get_user_model().objects.create_user(
+            username="email-pool-employee",
+            password="password-123",
+        )
+        UserFunctionOverride.objects.create(
+            user=employee,
+            function=AccessFunction.objects.get(code="access.manage"),
+            effect=UserFunctionOverride.Effect.ALLOW,
+        )
+        self.client.force_login(employee)
+        page = self.client.get(reverse("access-control"))
+        self.assertEqual(page.status_code, 200)
+        self.assertNotContains(page, "Cint Email Pool")
+        denied = self.client.post(
+            reverse("cint-email-pool-import"),
+            {"emails": "respondent@example.com"},
+        )
+        self.assertEqual(denied.status_code, 403)
+        self.assertFalse(
+            CintRespondentEmail.objects.using(DATABASE_ALIAS).exists()
+        )
 
 
 class DelegatedVendorTests(TestCase):
@@ -295,4 +480,4 @@ class DelegatedVendorTests(TestCase):
             "allow_codes": ["users.create"], "deny_codes": [],
         }, format="json")
         self.assertEqual(response.status_code, 400)
-        self.assertIn("external vendors cannot receive", str(response.data).lower())
+        self.assertIn("external suppliers cannot receive", str(response.data).lower())

@@ -1,4 +1,8 @@
+"""Supplier, client-integration and organization management HTTP endpoints."""
+
 from django.contrib.auth import get_user_model
+from django.conf import settings
+from django.db.models.deletion import ProtectedError
 from django.db.models import Count, Q
 from django.shortcuts import render
 from django.utils import timezone
@@ -10,15 +14,23 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from accounts.access import HasFunctionPermission, any_function_permission_required, effective_permission_codes, function_permission_required, has_function_access
+from accounts.access import (
+    HasFunctionPermission,
+    any_function_permission_required,
+    effective_permission_codes,
+    function_permission_required,
+    has_function_access,
+)
 from accounts.models import EmployeeProfile
 
-from .access import vendor_scope_user_id
+from .access import organization_workspace_owner_ids, vendor_scope_user_id
 
 from .models import (
     AllocationReservation,
     Client,
     ClientIntegration,
+    OrganizationClientAccess,
+    OrganizationUnit,
     VendorClientAllocation,
     VendorCommercialProfile,
     VendorAPIKey,
@@ -27,7 +39,13 @@ from .models import (
 from .serializers import (
     AllocationReservationSerializer,
     ClientIntegrationSerializer,
+    IntegrationActionResponseSerializer,
+    IntegrationPreviewSerializer,
+    ProviderCatalogSerializer,
     ClientSerializer,
+    OrganizationClientAccessSerializer,
+    OrganizationManagementOptionsSerializer,
+    OrganizationUnitSerializer,
     VendorClientAllocationSerializer,
     VendorCommercialProfileSerializer,
     VendorAPIKeySerializer,
@@ -35,6 +53,7 @@ from .serializers import (
     VendorDirectorySerializer,
     VendorManagementOptionsSerializer,
 )
+from .services import organization_unit_rollup_counts
 
 
 @any_function_permission_required("vendors.view", "vendors.manage", "allocations.view", "allocations.manage")
@@ -63,7 +82,10 @@ def vendor_management_page(request):
     ) if code in codes), "")
     return render(request, "vendors/management.html", {
         "active_page": "vendors",
-        "can_view_vendor_summary": "vendors.summary" in codes,
+        "vendor_cards": [
+            name for name in ("vendors", "client_grants", "quantity", "projects")
+            if f"vendors.card.{name}" in codes
+        ],
         "can_view_vendors": "vendors.tab.policies" in codes,
         "can_view_client_allocations": "vendors.tab.clients" in codes,
         "can_view_project_allocations": "vendors.tab.projects" in codes,
@@ -82,12 +104,224 @@ def vendor_management_page(request):
     })
 
 
-@function_permission_required("clients.view")
+@function_permission_required("clients.integration.view")
 def client_integrations_page(request):
     return render(request, "vendors/integrations.html", {
         "active_page": "client-integrations",
-        "can_manage_integrations": has_function_access(request.user, "clients.manage"),
+        "can_manage_integrations": has_function_access(request.user, "clients.integration.manage"),
     })
+
+
+@function_permission_required("organization.view")
+def organization_management_page(request):
+    codes = effective_permission_codes(request.user)
+    owner_controlled = vendor_scope_user_id(request.user) is None
+    can_view_structure = "organization.tab.structure" in codes
+    can_view_client_access = "organization.tab.client_access" in codes
+    can_view_clients = owner_controlled and "organization.tab.clients" in codes
+    unit_columns = [
+        name for name in ("path", "type", "members", "clients", "status", "actions")
+        if f"organization.column.unit.{name}" in codes
+    ]
+    access_columns = [
+        name for name in ("unit", "client", "status", "actions")
+        if f"organization.column.access.{name}" in codes
+    ]
+    first_tab = next((name for name, available in (
+        ("structure", can_view_structure),
+        ("client-access", can_view_client_access),
+        ("clients", can_view_clients),
+    ) if available), "")
+    return render(request, "vendors/organization.html", {
+        "active_page": "organization",
+        "organization_cards": [
+            name for name in ("branches", "shifts", "members", "client_grants")
+            if f"organization.card.{name}" in codes
+        ],
+        "can_view_structure": can_view_structure,
+        "can_view_client_access": can_view_client_access,
+        "can_view_clients": can_view_clients,
+        "can_manage_units": any(
+            code in codes for code in (
+                "organization.action.create_unit", "organization.action.edit_unit", "organization.action.delete_unit"
+            )
+        ),
+        "can_create_units": "organization.action.create_unit" in codes,
+        "can_edit_units": "organization.action.edit_unit" in codes,
+        "can_delete_units": "organization.action.delete_unit" in codes,
+        "can_manage_unit_clients": "organization.action.assign_client" in codes,
+        "can_remove_unit_clients": "organization.action.remove_client" in codes,
+        "can_manage_clients": owner_controlled and "clients.manage" in codes,
+        "can_view_integrations": owner_controlled and "clients.integration.view" in codes,
+        "can_manage_integrations": owner_controlled and "clients.integration.manage" in codes,
+        "can_test_integrations": owner_controlled and "clients.integration.test" in codes,
+        "can_preview_integrations": owner_controlled and "clients.integration.preview" in codes,
+        "can_sync_integrations": owner_controlled and "clients.integration.sync" in codes,
+        "organization_unit_columns": unit_columns,
+        "organization_access_columns": access_columns,
+        "first_organization_tab": first_tab,
+    })
+
+
+class OrganizationManagementOptionsView(APIView):
+    permission_classes = [HasFunctionPermission]
+    required_function_permission = "organization.view"
+
+    @extend_schema(
+        tags=["Organization hierarchy"],
+        summary="List organization workspace and client selector options",
+        responses={200: OrganizationManagementOptionsSerializer},
+    )
+    def get(self, request):
+        owner_ids = organization_workspace_owner_ids(request.user)
+        owners = get_user_model().objects.filter(pk__in=owner_ids).select_related("employee_profile").order_by(
+            "first_name", "last_name", "username"
+        )
+        clients = Client.objects.filter(is_active=True).order_by("name")
+        eligibility = {}
+        visible_client_ids = set()
+        for owner in owners:
+            profile = getattr(owner, "employee_profile", None)
+            if owner.is_superuser:
+                eligible = list(clients.values_list("id", flat=True))
+                owner_type = "owner"
+            else:
+                eligible = list(
+                    VendorClientAllocation.objects.filter(vendor=owner, client__is_active=True, is_active=True)
+                    .values_list("client_id", flat=True)
+                )
+                owner_type = getattr(profile, "account_type", "")
+            eligibility[str(owner.pk)] = eligible
+            visible_client_ids.update(eligible)
+            owner._organization_owner_type = owner_type
+        visible_clients = clients.filter(pk__in=visible_client_ids)
+        return Response({
+            "owners": [
+                {
+                    "id": owner.pk,
+                    "name": owner.get_full_name() or owner.username,
+                    "username": owner.username,
+                    "type": owner._organization_owner_type,
+                }
+                for owner in owners
+            ],
+            "clients": [
+                {"id": client.pk, "name": client.name, "code": client.code, "provider_code": client.provider_code}
+                for client in visible_clients
+            ],
+            "client_eligibility": eligibility,
+        })
+
+
+class OrganizationScopedMixin:
+    def organization_owner_ids(self):
+        return organization_workspace_owner_ids(self.request.user)
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+    def perform_update(self, serializer):
+        serializer.save()
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        instance.is_active = False
+        instance.save(update_fields=["is_active", "updated_at"])
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+@extend_schema_view(
+    list=extend_schema(tags=["Organization hierarchy"], summary="List Branch, Sub-branch and Shift units"),
+    create=extend_schema(tags=["Organization hierarchy"], summary="Create an organization unit"),
+    retrieve=extend_schema(tags=["Organization hierarchy"], summary="Get an organization unit"),
+    update=extend_schema(tags=["Organization hierarchy"], summary="Replace an organization unit"),
+    partial_update=extend_schema(tags=["Organization hierarchy"], summary="Update an organization unit"),
+    destroy=extend_schema(tags=["Organization hierarchy"], summary="Delete an unused organization unit"),
+)
+class OrganizationUnitViewSet(OrganizationScopedMixin, viewsets.ModelViewSet):
+    serializer_class = OrganizationUnitSerializer
+    permission_classes = [HasFunctionPermission]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ["workspace_owner", "parent", "unit_type", "is_active"]
+    search_fields = ["name", "code", "description", "workspace_owner__username"]
+    ordering_fields = ["unit_type", "name", "created_at", "updated_at"]
+    ordering = ["workspace_owner_id", "unit_type", "name"]
+
+    def get_required_function_permission(self):
+        if self.action in {"list", "retrieve"}:
+            return "organization.view"
+        if self.action == "create":
+            return "organization.action.create_unit"
+        if self.action == "destroy":
+            return "organization.action.delete_unit"
+        return "organization.action.edit_unit"
+
+    def get_queryset(self):
+        return OrganizationUnit.objects.filter(
+            workspace_owner_id__in=self.organization_owner_ids()
+        ).select_related(
+            "workspace_owner", "workspace_owner__employee_profile", "parent", "created_by"
+        )
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context["organization_rollup_counts"] = organization_unit_rollup_counts(
+            self.organization_owner_ids()
+        )
+        return context
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        try:
+            instance.delete()
+        except ProtectedError:
+            return Response(
+                {
+                    "detail": (
+                        "This unit is still used by child units or client assignments. "
+                        "Move or delete those records first."
+                    )
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+@extend_schema_view(
+    list=extend_schema(tags=["Organization hierarchy"], summary="List unit-level client visibility grants"),
+    create=extend_schema(tags=["Organization hierarchy"], summary="Assign a client to an organization unit"),
+    retrieve=extend_schema(tags=["Organization hierarchy"], summary="Get a unit client grant"),
+    update=extend_schema(tags=["Organization hierarchy"], summary="Replace a unit client grant"),
+    partial_update=extend_schema(tags=["Organization hierarchy"], summary="Update a unit client grant"),
+    destroy=extend_schema(tags=["Organization hierarchy"], summary="Remove a unit client grant"),
+)
+class OrganizationClientAccessViewSet(OrganizationScopedMixin, viewsets.ModelViewSet):
+    serializer_class = OrganizationClientAccessSerializer
+    permission_classes = [HasFunctionPermission]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filterset_fields = ["organization_unit", "organization_unit__workspace_owner", "client", "is_active"]
+    search_fields = ["organization_unit__name", "organization_unit__code", "client__name", "client__code"]
+    ordering_fields = ["created_at", "updated_at", "organization_unit__name", "client__name"]
+    ordering = ["organization_unit__workspace_owner_id", "organization_unit__name", "client__name"]
+
+    def get_required_function_permission(self):
+        if self.action in {"list", "retrieve"}:
+            return "organization.view"
+        if self.action == "destroy":
+            return "organization.action.remove_client"
+        return "organization.action.assign_client"
+
+    def get_queryset(self):
+        return OrganizationClientAccess.objects.filter(
+            organization_unit__workspace_owner_id__in=self.organization_owner_ids()
+        ).select_related(
+            "organization_unit", "organization_unit__workspace_owner", "organization_unit__parent__parent",
+            "client", "created_by",
+        )
+
+    def destroy(self, request, *args, **kwargs):
+        self.get_object().delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class VendorManagementOptionsView(APIView):
@@ -101,8 +335,8 @@ class VendorManagementOptionsView(APIView):
     )
 
     @extend_schema(
-        tags=["Vendors & allocations"],
-        summary="List safe vendor-management selector options",
+        tags=["Suppliers & allocations"],
+        summary="List safe supplier-management selector options",
         description="Returns non-secret active vendor and client labels for allocation modals, scoped to the current vendor hierarchy when applicable.",
         responses={200: VendorManagementOptionsSerializer},
     )
@@ -174,8 +408,8 @@ class PermissionByActionMixin(VendorScopedQuerysetMixin):
 
 
 @extend_schema_view(
-    list=extend_schema(tags=["Vendors & allocations"], summary="List internal and external vendor accounts"),
-    retrieve=extend_schema(tags=["Vendors & allocations"], summary="Get a vendor account and commercial summary"),
+    list=extend_schema(tags=["Suppliers & allocations"], summary="List internal and external supplier accounts"),
+    retrieve=extend_schema(tags=["Suppliers & allocations"], summary="Get a supplier account and commercial summary"),
 )
 class VendorDirectoryViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = VendorDirectorySerializer
@@ -205,15 +439,17 @@ class VendorDirectoryViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 @extend_schema_view(
-    list=extend_schema(tags=["Vendors & allocations"], summary="List survey clients"),
-    create=extend_schema(tags=["Vendors & allocations"], summary="Create a survey client"),
-    retrieve=extend_schema(tags=["Vendors & allocations"], summary="Get a survey client"),
-    update=extend_schema(tags=["Vendors & allocations"], summary="Replace a survey client"),
-    partial_update=extend_schema(tags=["Vendors & allocations"], summary="Update a survey client"),
-    destroy=extend_schema(tags=["Vendors & allocations"], summary="Deactivate a survey client"),
+    list=extend_schema(tags=["Suppliers & allocations"], summary="List survey clients"),
+    create=extend_schema(tags=["Suppliers & allocations"], summary="Create a survey client"),
+    retrieve=extend_schema(tags=["Suppliers & allocations"], summary="Get a survey client"),
+    update=extend_schema(tags=["Suppliers & allocations"], summary="Replace a survey client"),
+    partial_update=extend_schema(tags=["Suppliers & allocations"], summary="Update a survey client"),
+    destroy=extend_schema(tags=["Suppliers & allocations"], summary="Deactivate a survey client"),
 )
 class ClientViewSet(PermissionByActionMixin, viewsets.ModelViewSet):
-    queryset = Client.objects.select_related("created_by").prefetch_related("integrations").all()
+    queryset = Client.objects.select_related("created_by").prefetch_related("integrations").exclude(
+        is_active=False, provider_code__in=("biobrain", "voqall")
+    )
     serializer_class = ClientSerializer
     permission_classes = [HasFunctionPermission]
     view_permission = "clients.view"
@@ -227,32 +463,73 @@ class ClientViewSet(PermissionByActionMixin, viewsets.ModelViewSet):
 
 
 @extend_schema_view(
-    list=extend_schema(tags=["Vendors & allocations"], summary="List non-secret client integration metadata"),
-    create=extend_schema(tags=["Vendors & allocations"], summary="Create client integration metadata"),
-    retrieve=extend_schema(tags=["Vendors & allocations"], summary="Get client integration metadata"),
-    update=extend_schema(tags=["Vendors & allocations"], summary="Replace client integration metadata"),
-    partial_update=extend_schema(tags=["Vendors & allocations"], summary="Update client integration metadata"),
-    destroy=extend_schema(tags=["Vendors & allocations"], summary="Deactivate client integration metadata"),
+    list=extend_schema(tags=["Suppliers & allocations"], summary="List non-secret client integration metadata"),
+    create=extend_schema(tags=["Suppliers & allocations"], summary="Create client integration metadata"),
+    retrieve=extend_schema(tags=["Suppliers & allocations"], summary="Get client integration metadata"),
+    update=extend_schema(tags=["Suppliers & allocations"], summary="Replace client integration metadata"),
+    partial_update=extend_schema(tags=["Suppliers & allocations"], summary="Update client integration metadata"),
+    destroy=extend_schema(tags=["Suppliers & allocations"], summary="Deactivate client integration metadata"),
 )
 class ClientIntegrationViewSet(PermissionByActionMixin, viewsets.ModelViewSet):
-    queryset = ClientIntegration.objects.select_related("client", "created_by").all()
+    queryset = ClientIntegration.objects.select_related("client", "created_by").exclude(
+        client__is_active=False, provider_code__in=("biobrain", "voqall")
+    )
     serializer_class = ClientIntegrationSerializer
     permission_classes = [HasFunctionPermission]
-    view_permission = "clients.view"
-    manage_permission = "clients.manage"
+    view_permission = "clients.integration.view"
+    manage_permission = "clients.integration.manage"
     filter_backends = [DjangoFilterBackend, filters.SearchFilter]
     filterset_fields = ["client", "provider_code", "scheduled_sync_enabled", "is_active"]
     search_fields = ["name", "client__name", "client__code"]
     vendor_scope_filter = "client__vendor_allocations__vendor_id"
 
+    def get_required_function_permission(self):
+        if self.action in {"list", "retrieve", "providers"}:
+            return "clients.integration.view"
+        return {
+            "test_connection": "clients.integration.test",
+            "preview": "clients.integration.preview",
+            "sync_now": "clients.integration.sync",
+        }.get(self.action, "clients.integration.manage")
+
+    @extend_schema(
+        tags=["Client integrations"],
+        summary="List installed upstream provider adapters",
+        responses=ProviderCatalogSerializer(many=True),
+    )
+    @action(detail=False, methods=["get"], url_path="providers")
+    def providers(self, request):
+        from surveys.providers import provider_catalog
+
+        providers = provider_catalog()
+        biobrain_is_published = Client.objects.filter(
+            is_active=True, provider_code__in=("biobrain", "voqall")
+        ).exists()
+        if not biobrain_is_published:
+            providers = [item for item in providers if item.get("code") not in {"biobrain", "voqall"}]
+        return Response(providers)
+
     @action(detail=True, methods=["post"], url_path="test-connection")
     def test_connection(self, request, pk=None):
-        from surveys.integrations import InnovateMRClient
         integration = self.get_object()
+        from surveys.providers import has_provider
+        if has_provider(integration.provider_code):
+            from surveys.provider_services import test_provider_connection
+            from surveys.providers import ProviderError
+
+            try:
+                result = test_provider_connection(integration)
+            except ProviderError as exc:
+                return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": "Connection verified.", "result": result})
+
+        from surveys.integrations import InnovateMRClient
         try:
             result = InnovateMRClient(integration=integration).test_connection()
             integration.last_test_status = "success"
             integration.last_test_error = ""
+            integration.scheduled_sync_enabled = True
+            integration.sync_interval_seconds = settings.CLIENT_INTEGRATION_INNOVATEMR_SYNC_INTERVAL_SECONDS
             response_status = status.HTTP_200_OK
         except Exception as exc:
             integration.last_test_status = "failed"
@@ -260,23 +537,50 @@ class ClientIntegrationViewSet(PermissionByActionMixin, viewsets.ModelViewSet):
             result = {"ok": False, "error": integration.last_test_error}
             response_status = status.HTTP_400_BAD_REQUEST
         integration.last_tested_at = timezone.now()
-        integration.save(update_fields=["last_tested_at", "last_test_status", "last_test_error", "updated_at"])
+        integration.save(update_fields=[
+            "last_tested_at", "last_test_status", "last_test_error",
+            "scheduled_sync_enabled", "sync_interval_seconds", "updated_at",
+        ])
         return Response(result, status=response_status)
+
+    @extend_schema(
+        tags=["Client integrations"],
+        summary="Preview provider inventory without storing it",
+        responses=IntegrationPreviewSerializer,
+    )
+    @action(detail=True, methods=["get"], url_path="preview")
+    def preview(self, request, pk=None):
+        from surveys.provider_services import provider_preview
+        from surveys.providers import ProviderError
+
+        try:
+            data = provider_preview(self.get_object(), request.query_params.get("limit", 10))
+        except (ProviderError, ValueError) as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(data)
 
     @action(detail=True, methods=["post"], url_path="sync-now")
     def sync_now(self, request, pk=None):
         from surveys.tasks import sync_client_integration_task
-        task = sync_client_integration_task.delay(self.get_object().pk)
+
+        integration = self.get_object()
+        from surveys.providers import has_provider
+        if has_provider(integration.provider_code) and integration.last_test_status != "success":
+            return Response(
+                {"detail": "Test and verify the connection first."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        task = sync_client_integration_task.delay(integration.pk)
         return Response({"status": "queued", "task_id": task.id}, status=status.HTTP_202_ACCEPTED)
 
 
 @extend_schema_view(
-    list=extend_schema(tags=["Vendors & allocations"], summary="List vendor CPI policies"),
-    create=extend_schema(tags=["Vendors & allocations"], summary="Create a vendor CPI policy"),
-    retrieve=extend_schema(tags=["Vendors & allocations"], summary="Get a vendor CPI policy"),
-    update=extend_schema(tags=["Vendors & allocations"], summary="Replace a vendor CPI policy"),
-    partial_update=extend_schema(tags=["Vendors & allocations"], summary="Update a vendor CPI policy"),
-    destroy=extend_schema(tags=["Vendors & allocations"], summary="Deactivate a vendor CPI policy"),
+    list=extend_schema(tags=["Suppliers & allocations"], summary="List supplier CPI policies"),
+    create=extend_schema(tags=["Suppliers & allocations"], summary="Create a supplier CPI policy"),
+    retrieve=extend_schema(tags=["Suppliers & allocations"], summary="Get a supplier CPI policy"),
+    update=extend_schema(tags=["Suppliers & allocations"], summary="Replace a supplier CPI policy"),
+    partial_update=extend_schema(tags=["Suppliers & allocations"], summary="Update a supplier CPI policy"),
+    destroy=extend_schema(tags=["Suppliers & allocations"], summary="Deactivate a supplier CPI policy"),
 )
 class VendorCommercialProfileViewSet(PermissionByActionMixin, viewsets.ModelViewSet):
     queryset = VendorCommercialProfile.objects.select_related(
@@ -293,16 +597,16 @@ class VendorCommercialProfileViewSet(PermissionByActionMixin, viewsets.ModelView
 
 
 @extend_schema_view(
-    list=extend_schema(tags=["Vendors & allocations"], summary="List external-vendor API keys (masked)"),
+    list=extend_schema(tags=["Suppliers & allocations"], summary="List external-supplier API keys (masked)"),
     create=extend_schema(
-        tags=["Vendors & allocations"],
-        summary="Issue an external-vendor API key",
+        tags=["Suppliers & allocations"],
+        summary="Issue an external-supplier API key",
         description="Returns the plaintext api_key once. Store it securely; later responses contain only the masked identifier.",
     ),
-    retrieve=extend_schema(tags=["Vendors & allocations"], summary="Get masked API-key metadata"),
-    update=extend_schema(tags=["Vendors & allocations"], summary="Replace API-key label or expiration"),
-    partial_update=extend_schema(tags=["Vendors & allocations"], summary="Update API-key label or expiration"),
-    destroy=extend_schema(tags=["Vendors & allocations"], summary="Revoke an external-vendor API key"),
+    retrieve=extend_schema(tags=["Suppliers & allocations"], summary="Get masked API-key metadata"),
+    update=extend_schema(tags=["Suppliers & allocations"], summary="Replace API-key label or expiration"),
+    partial_update=extend_schema(tags=["Suppliers & allocations"], summary="Update API-key label or expiration"),
+    destroy=extend_schema(tags=["Suppliers & allocations"], summary="Revoke an external-supplier API key"),
 )
 class VendorAPIKeyViewSet(viewsets.ModelViewSet):
     queryset = VendorAPIKey.objects.select_related(
@@ -329,22 +633,22 @@ class VendorAPIKeyViewSet(viewsets.ModelViewSet):
 
     def create(self, request, *args, **kwargs):
         if vendor_scope_user_id(request.user):
-            raise PermissionDenied("Only the owner workspace can issue vendor API keys.")
+            raise PermissionDenied("Only the owner workspace can issue supplier API keys.")
         return super().create(request, *args, **kwargs)
 
     def perform_create(self, serializer):
         if vendor_scope_user_id(self.request.user):
-            raise PermissionDenied("Only the owner workspace can issue vendor API keys.")
+            raise PermissionDenied("Only the owner workspace can issue supplier API keys.")
         serializer.save()
 
     def perform_update(self, serializer):
         if vendor_scope_user_id(self.request.user):
-            raise PermissionDenied("Only the owner workspace can change vendor API keys.")
+            raise PermissionDenied("Only the owner workspace can change supplier API keys.")
         serializer.save()
 
     def destroy(self, request, *args, **kwargs):
         if vendor_scope_user_id(request.user):
-            raise PermissionDenied("Only the owner workspace can revoke vendor API keys.")
+            raise PermissionDenied("Only the owner workspace can revoke supplier API keys.")
         instance = self.get_object()
         if instance.is_active:
             instance.is_active = False
@@ -354,12 +658,12 @@ class VendorAPIKeyViewSet(viewsets.ModelViewSet):
 
 
 @extend_schema_view(
-    list=extend_schema(tags=["Vendors & allocations"], summary="List vendor client grants and quantities"),
-    create=extend_schema(tags=["Vendors & allocations"], summary="Allocate a client and quantity to a vendor"),
-    retrieve=extend_schema(tags=["Vendors & allocations"], summary="Get a vendor client allocation"),
-    update=extend_schema(tags=["Vendors & allocations"], summary="Replace a vendor client allocation"),
-    partial_update=extend_schema(tags=["Vendors & allocations"], summary="Update a vendor client allocation"),
-    destroy=extend_schema(tags=["Vendors & allocations"], summary="Deactivate a vendor client allocation"),
+    list=extend_schema(tags=["Suppliers & allocations"], summary="List supplier client grants and quantities"),
+    create=extend_schema(tags=["Suppliers & allocations"], summary="Allocate a client and quantity to a supplier"),
+    retrieve=extend_schema(tags=["Suppliers & allocations"], summary="Get a supplier client allocation"),
+    update=extend_schema(tags=["Suppliers & allocations"], summary="Replace a supplier client allocation"),
+    partial_update=extend_schema(tags=["Suppliers & allocations"], summary="Update a supplier client allocation"),
+    destroy=extend_schema(tags=["Suppliers & allocations"], summary="Deactivate a supplier client allocation"),
 )
 class VendorClientAllocationViewSet(PermissionByActionMixin, viewsets.ModelViewSet):
     queryset = VendorClientAllocation.objects.select_related(
@@ -378,7 +682,7 @@ class VendorClientAllocationViewSet(PermissionByActionMixin, viewsets.ModelViewS
 
 
 @extend_schema_view(
-    list=extend_schema(tags=["Vendors & allocations"], summary="List vendor project allocations and complete caps"),
+    list=extend_schema(tags=["Suppliers & allocations"], summary="List supplier project allocations and complete caps"),
     create=extend_schema(tags=["Vendors & allocations"], summary="Allocate a visible project with a complete cap"),
     retrieve=extend_schema(tags=["Vendors & allocations"], summary="Get a project allocation"),
     update=extend_schema(tags=["Vendors & allocations"], summary="Replace a project allocation"),
@@ -406,8 +710,8 @@ class VendorSurveyAllocationViewSet(PermissionByActionMixin, viewsets.ModelViewS
 
 
 @extend_schema_view(
-    list=extend_schema(tags=["Vendors & allocations"], summary="List allocation reservation audit records"),
-    retrieve=extend_schema(tags=["Vendors & allocations"], summary="Get an allocation reservation audit record"),
+    list=extend_schema(tags=["Suppliers & allocations"], summary="List allocation reservation audit records"),
+    retrieve=extend_schema(tags=["Suppliers & allocations"], summary="Get an allocation reservation audit record"),
 )
 class AllocationReservationViewSet(VendorScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
     queryset = AllocationReservation.objects.select_related(

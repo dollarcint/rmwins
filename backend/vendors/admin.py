@@ -1,14 +1,32 @@
+"""Django Admin registration for suppliers, integrations and allocations."""
+
 from django.contrib import admin
 
 from .models import (
     AllocationReservation,
     Client,
     ClientIntegration,
+    OrganizationClientAccess,
+    OrganizationUnit,
     VendorClientAllocation,
     VendorCommercialProfile,
     VendorAPIKey,
     VendorSurveyAllocation,
 )
+
+
+@admin.register(OrganizationUnit)
+class OrganizationUnitAdmin(admin.ModelAdmin):
+    list_display = ["name", "unit_type", "workspace_owner", "parent", "is_active", "updated_at"]
+    list_filter = ["unit_type", "workspace_owner", "is_active"]
+    search_fields = ["name", "code", "workspace_owner__username", "workspace_owner__email"]
+
+
+@admin.register(OrganizationClientAccess)
+class OrganizationClientAccessAdmin(admin.ModelAdmin):
+    list_display = ["organization_unit", "client", "is_active", "updated_at"]
+    list_filter = ["organization_unit__workspace_owner", "client", "is_active"]
+    search_fields = ["organization_unit__name", "organization_unit__code", "client__name", "client__code"]
 
 
 class ClientIntegrationInline(admin.TabularInline):
@@ -62,7 +80,7 @@ class VendorSurveyAllocationAdmin(admin.ModelAdmin):
     ]
     search_fields = [
         "client_allocation__vendor__username", "client_allocation__vendor__email",
-        "survey__local_id", "survey__source_id", "survey__name",
+        "survey__local_id", "survey__source_key", "survey__source_id", "survey__name",
     ]
     list_filter = ["client_allocation__client", "is_active"]
     readonly_fields = ["reserved_quantity", "consumed_quantity", "created_at", "updated_at"]

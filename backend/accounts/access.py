@@ -1,3 +1,9 @@
+"""Resolve function permissions and organization-scoped user visibility.
+
+UI hiding is only presentation; decorators and DRF permission classes in this
+module are the authoritative enforcement layer.
+"""
+
 from functools import wraps
 
 from django.contrib.auth.views import redirect_to_login
@@ -14,8 +20,35 @@ EXTERNAL_VENDOR_FORBIDDEN_CODES = frozenset({
     "users.manage", "users.view", "users.create", "users.update", "users.delete",
     "respondents.create",
     "clients.manage", "vendors.manage", "allocations.manage",
+    "clients.integration.view", "clients.integration.manage", "clients.integration.test",
+    "clients.integration.preview", "clients.integration.sync",
+    "organization.view", "organization.manage", "organization.clients.manage",
+    "termination_reasons.view", "termination_reasons.filter.rid", "termination_reasons.action.refresh",
+    "termination_reasons.filter.status", "termination_reasons.filter.client", "termination_reasons.filters.clear",
+    "termination_reasons.summary", "termination_reasons.control.pagination", "termination_reasons.action.details",
+    "termination_reasons.card.total", "termination_reasons.card.terminated",
+    "termination_reasons.card.quota", "termination_reasons.card.quality",
+    "termination_reasons.column.rid", "termination_reasons.column.survey", "termination_reasons.column.client",
+    "termination_reasons.column.respondent", "termination_reasons.column.status", "termination_reasons.column.ended",
+    "termination_reasons.column.actions",
+    "termination_reasons.field.status", "termination_reasons.field.reason",
+    "termination_reasons.field.respondent", "termination_reasons.field.survey",
+    "termination_reasons.field.timing", "termination_reasons.field.audit",
+    "studies.column.cpi", "studies.card.revenue", "dashboard.card.revenue",
+    "dashboard.card.average_cpi", "dashboard.card.rpc",
+    "dashboard.graph.finance_filters",
     "sync.run",
 })
+
+
+def is_super_admin_account(user) -> bool:
+    """Return whether the account may access temporarily restricted super-admin areas."""
+    if not user or not user.is_authenticated or not user.is_active:
+        return False
+    if user.is_superuser:
+        return True
+    profile = EmployeeProfile.objects.select_related("role").filter(user=user).first()
+    return bool(profile and profile.role and profile.role.is_active and profile.role.slug in {"super-admin", "superadmin"})
 
 
 def effective_permission_codes(user) -> set[str]:
@@ -38,10 +71,15 @@ def effective_permission_codes(user) -> set[str]:
             codes.discard(code)
     if profile and profile.account_type == EmployeeProfile.AccountType.EXTERNAL_VENDOR:
         codes.difference_update(EXTERNAL_VENDOR_FORBIDDEN_CODES)
+        codes = {code for code in codes if not code.startswith("organization.")}
+    if not is_super_admin_account(user):
+        codes = {code for code in codes if not code.startswith("dashboard.")}
     return codes
 
 
 def has_function_access(user, code: str) -> bool:
+    if code == "dashboard.view":
+        return is_super_admin_account(user)
     return bool(user and user.is_authenticated and user.is_active and (user.is_superuser or code in effective_permission_codes(user)))
 
 
@@ -88,14 +126,32 @@ def subordinate_user_ids(user) -> set[int]:
     return descendants
 
 
+def manageable_user_ids(user) -> set[int]:
+    """Subordinates plus members explicitly placed in an internal vendor workspace."""
+
+    ids = subordinate_user_ids(user)
+    if not user or not user.is_authenticated or user.is_superuser:
+        return ids
+    profile = EmployeeProfile.objects.filter(user=user).first()
+    if profile and profile.account_type == EmployeeProfile.AccountType.INTERNAL_VENDOR:
+        ids.update(
+            EmployeeProfile.objects.filter(
+                organization_unit__workspace_owner=user,
+                account_type=EmployeeProfile.AccountType.EMPLOYEE,
+            ).values_list("user_id", flat=True)
+        )
+    return ids
+
+
 def activity_visible_user_ids(user) -> set[int]:
     """Return users whose tracking activity is visible to ``user``.
 
-    The explicit ``created_by`` tree remains the primary ownership boundary. In
-    addition, employee accounts at Team Lead rank or above can see lower-ranked
-    employee siblings in the same branch. This covers the common setup where an
-    admin creates both a Team Lead and that lead's employees, without exposing
-    another vendor, branch, or higher-level account.
+    Shift assignment determines the Team Lead tracking boundary. A Team Lead
+    sees lower-ranked employees only inside the exact Shift to which the lead is
+    assigned. Managers and higher employee roles retain Branch-wide visibility.
+    A normal employee can only see their own tracking records, even when another
+    user was created beneath them. Vendor and super-admin workspace rules remain
+    intact.
     """
     if not user or not user.is_authenticated:
         return set()
@@ -103,16 +159,50 @@ def activity_visible_user_ids(user) -> set[int]:
         from django.contrib.auth import get_user_model
         return set(get_user_model().objects.values_list("id", flat=True))
 
-    visible_ids = subordinate_user_ids(user)
-    visible_ids.add(user.id)
-    profile = EmployeeProfile.objects.select_related("role").filter(user=user).first()
+    visible_ids = {user.id}
+    profile = EmployeeProfile.objects.select_related(
+        "role", "organization_unit__workspace_owner",
+        "organization_unit__parent", "organization_unit__parent__parent",
+    ).filter(user=user).first()
     if (
         not profile
-        or profile.account_type != EmployeeProfile.AccountType.EMPLOYEE
         or not profile.role
-        or profile.role.rank < 20
-        or not profile.created_by_id
     ):
+        return visible_ids
+
+    from vendors.access import organization_unit_descendant_ids, vendor_scope_user_id
+
+    vendor_id = vendor_scope_user_id(user)
+    if profile.account_type == EmployeeProfile.AccountType.INTERNAL_VENDOR and vendor_id:
+        visible_ids.update(subordinate_user_ids(user))
+        visible_ids.update(
+            EmployeeProfile.objects.filter(
+                organization_unit__workspace_owner_id=vendor_id,
+                account_type=EmployeeProfile.AccountType.EMPLOYEE,
+            ).values_list("user_id", flat=True)
+        )
+        return visible_ids
+    if profile.account_type != EmployeeProfile.AccountType.EMPLOYEE or profile.role.rank < 20:
+        return visible_ids
+
+    if profile.organization_unit_id:
+        scope_unit = profile.organization_unit
+        if profile.role.rank > 20:
+            while scope_unit.parent_id and scope_unit.unit_type != "branch":
+                scope_unit = scope_unit.parent
+        unit_ids = organization_unit_descendant_ids(scope_unit)
+        visible_ids.update(
+            EmployeeProfile.objects.filter(
+                organization_unit_id__in=unit_ids,
+                account_type=EmployeeProfile.AccountType.EMPLOYEE,
+                role__isnull=False,
+                role__rank__lt=profile.role.rank,
+            ).values_list("user_id", flat=True)
+        )
+        return visible_ids
+
+    if not profile.created_by_id:
+        visible_ids.update(subordinate_user_ids(user))
         return visible_ids
 
     lower_rank_peers = EmployeeProfile.objects.filter(
@@ -121,10 +211,6 @@ def activity_visible_user_ids(user) -> set[int]:
         role__isnull=False,
         role__rank__lt=profile.role.rank,
     )
-    if profile.company_name.strip():
-        lower_rank_peers = lower_rank_peers.filter(company_name__iexact=profile.company_name.strip())
-    if profile.department.strip():
-        lower_rank_peers = lower_rank_peers.filter(department__iexact=profile.department.strip())
     visible_ids.update(lower_rank_peers.values_list("user_id", flat=True))
     return visible_ids
 

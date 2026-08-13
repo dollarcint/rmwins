@@ -1,6 +1,6 @@
 # Survey Workspace
 
-Django-based internal survey workspace that synchronizes live InnovateMR Supplier API inventory, stores it locally, and exposes responsive Projects UI plus a documented REST API.
+Django-based multi-client survey workspace that synchronizes upstream provider inventory, stores it locally, and exposes responsive Projects UI plus a documented REST API. InnovateMR remains supported and Research For Good Live Alert is available through the Client Catalog integration flow.
 
 Hostinger Ubuntu VPS deployment with MySQL, Nginx, Gunicorn, Redis and Celery is covered in [`deploy/README.md`](deploy/README.md).
 
@@ -8,15 +8,18 @@ Hostinger Ubuntu VPS deployment with MySQL, Nginx, Gunicorn, Redis and Celery is
 
 - Dashboard placeholder and responsive Projects workspace matching the supplied table reference.
 - Full and cursor-paged InnovateMR inventory ingestion.
+- Secure UI-driven Research For Good onboarding, HMAC-SHA1 API adapter, preview, per-client scheduled sync, targeting, deduplication and callback tracking.
 - Deterministic merge by `surveyId`; the payload with the newest `modifiedDate` wins.
 - Immutable 14-digit project IDs in `YYYYMM########` format, for example `20260800000001`.
 - Quota and survey-targeting/pre-screening persistence with stale-data refresh.
 - Environment-configurable Celery Beat jobs (60-second defaults) for inventory and bounded detail refresh.
+- Fail-open Redis application cache isolated from Celery, with TTL jitter and vault cache invalidation; see [`docs/redis-cache.md`](docs/redis-cache.md).
 - Search, multi-select company/market/status filters, date/CPI filters, ordering, pagination, and mobile survey cards.
 - Direct survey detail drawer with equal-width Pre-screening and Quota tabs.
 - Dynamic respondent pre-screener with 10-character RID, answer capture, supplier redirect, four callback outcomes, IP tracking and measured LOI.
 - Session login plus dynamic role/function access control with per-user allow and deny overrides.
 - UAT vendor operations workspace with internal/external policy, client visibility, quantity limits, CPI cuts and optional survey overrides.
+- Internal organization workspace with strict Branch → Sub-branch → Shift hierarchy, multiple Team Leads per Shift and inherited client visibility.
 - Transactional allocation reservation at respondent start, terminal consume/release and scheduled abandoned-reservation expiry.
 - Swagger UI, ReDoc, downloadable OpenAPI schema, Django Admin, sync audit records, and automated tests.
 
@@ -40,6 +43,7 @@ Open:
 - Swagger: `http://127.0.0.1:8000/api/docs/`
 - ReDoc: `http://127.0.0.1:8000/api/redoc/`
 - Admin: `http://127.0.0.1:8000/admin/`
+- Organization: `http://127.0.0.1:8000/organization/`
 
 Run one sync without Celery:
 
@@ -56,12 +60,11 @@ celery -A config worker --loglevel=info --pool=solo
 celery -A config beat --loglevel=info
 ```
 
-Beat schedules four independent jobs every minute by default:
+Beat schedules three independent dispatch/check jobs every minute by default:
 
-1. `surveys.sync_innovatemr_surveys` fetches both inventory endpoints, merges them, upserts current rows, and closes surveys no longer present.
-2. `surveys.refresh_stale_details` refreshes a bounded batch of quotas and targeting. `INNOVATEMR_DETAIL_REFRESH_BATCH` controls the batch size.
-3. `surveys.reconcile_pending_attempts` checks redirected attempts whose legacy client return URL has not called this application.
-4. `vendors.expire_allocation_reservations` releases capacity held by abandoned vendor attempts after the configured TTL.
+1. `surveys.dispatch_due_integrations` queues each active scheduled client integration only when its own interval is due. The worker synchronizes inventory and a bounded detail batch; RFG has a hard 600-second minimum.
+2. `surveys.reconcile_pending_attempts` checks redirected attempts whose legacy client return URL has not called this application.
+3. `vendors.expire_allocation_reservations` releases capacity held by abandoned vendor attempts after the configured TTL.
 
 Opening Quota or Pre-screening in the UI also refreshes that survey immediately when its cached details are older than its source `modifiedDate`. Cached details remain available during a temporary upstream outage.
 
@@ -82,6 +85,10 @@ Opening Quota or Pre-screening in the UI also refreshes that survey immediately 
 | CRUD | `/api/v1/vendors/survey-allocations/` | Optional per-survey limit or CPI override |
 | CRUD | `/api/v1/vendors/api-keys/` | Issue/revoke hashed external-vendor API credentials (plaintext returned once) |
 | `GET` | `/api/v1/vendors/reservations/` | Reservation lifecycle audit |
+| CRUD | `/api/v1/vendors/organization-units/` | Branch, Sub-branch and Shift hierarchy |
+| CRUD | `/api/v1/vendors/organization-client-access/` | Inherited unit-level client visibility |
+| CRUD | `/api/v1/vendors/integrations/` | Non-secret client integration metadata |
+| `GET/POST` | `/api/v1/vendors/integrations/{id}/preview/`, `test-connection/`, `sync-now/` | Provider onboarding and operations |
 | CRUD | `/api/v1/access/roles/` | Roles and their explicit function assignments |
 | CRUD | `/api/v1/access/functions/` | Function permission catalog |
 | CRUD | `/api/v1/access/users/` | Employee accounts, role and individual allow/deny overrides |
@@ -129,4 +136,11 @@ python manage.py spectacular --file schema.yml --validate
 python manage.py collectstatic --noinput
 ```
 
-See [architecture](docs/architecture.md) and [synchronization runbook](docs/synchronization.md) for the internal design and operations contract.
+See [architecture](docs/architecture.md), [client integrations](docs/client-integrations.md), and [synchronization runbook](docs/synchronization.md) for the internal design and operations contract.
+
+For code ownership, provider identifier mapping, connected call chains and a
+production debugging map, start with the [developer handbook](docs/developer-handbook.md).
+The companion [production function reference](docs/function-reference.md) explains
+each business helper's inputs, connections and side effects.
+Use the [complete production symbol index](docs/code-symbol-index.md) to locate
+every Python class/function/method and named browser JavaScript helper.

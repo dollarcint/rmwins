@@ -1,4 +1,7 @@
+"""Read-oriented API schemas and permission-aware survey presentation fields."""
+
 from urllib.parse import urlencode
+from decimal import Decimal, ROUND_HALF_UP
 
 from django.conf import settings
 from django.urls import reverse
@@ -7,24 +10,233 @@ from rest_framework import serializers
 
 from accounts.access import has_function_access
 from vendors.access import is_external_vendor_scope, vendor_scope_user_id
-from vendors.services import survey_pricing_for_user
+from vendors.services import organization_client_ids_for_user, survey_pricing_for_user
 
-from .models import Survey, SurveyAttempt, SurveyQuota, SyncRun, TargetingQuestion
+from .models import (
+    CanonicalOption,
+    CanonicalQuestion,
+    ProviderOptionMapping,
+    ProviderQuestionMapping,
+    Survey,
+    SurveyAttempt,
+    SurveyQuota,
+    SyncRun,
+    TargetingQuestion,
+)
+from .outcomes import provider_outcome
+from .rfg_text import clean_rfg_display_text, clean_rfg_options
 
 
 class SurveyQuotaSerializer(serializers.ModelSerializer):
+    status = serializers.SerializerMethodField(help_text="Current quota state; RFG zero-remaining quotas are reported as Full.")
+    target_known = serializers.SerializerMethodField(help_text="True only when the provider supplied a target total.")
+    completed_known = serializers.SerializerMethodField(help_text="True only when the provider supplied a completed total.")
+    limit_type = serializers.SerializerMethodField(help_text="Provider quota unit, such as Completes or Starts.")
+    scope_label = serializers.SerializerMethodField(help_text="Human-readable overall or targeted quota scope.")
+    targeting_details = serializers.SerializerMethodField(help_text="Quota targeting decoded into readable datapoint names and answer labels.")
+
     class Meta:
         model = SurveyQuota
-        fields = ["id", "quota_id", "title", "name", "sample_size", "remaining", "completes", "clicks", "status", "targeting", "updated_at"]
+        fields = [
+            "id", "quota_id", "title", "name", "sample_size", "remaining", "completes",
+            "clicks", "status", "targeting", "target_known", "completed_known", "limit_type",
+            "scope_label", "targeting_details", "updated_at",
+        ]
+
+    @staticmethod
+    def _is_rfg(obj) -> bool:
+        return bool(obj.survey.integration_id and obj.survey.integration.provider_code == "rfg")
+
+    def get_status(self, obj) -> str:
+        raw = obj.raw_data or {}
+        if self._is_rfg(obj):
+            if raw.get("quotaThrottle") == 1:
+                return "Throttled"
+            if obj.remaining <= 0:
+                return "Full"
+        return obj.status or "Open"
+
+    def get_target_known(self, obj) -> bool:
+        raw = obj.raw_data or {}
+        if "_target_known" in raw:
+            return bool(raw["_target_known"])
+        if not self._is_rfg(obj):
+            return True
+        return obj.sample_size > 0 or any(
+            raw.get(key) is not None for key in ("limit", "quotaTarget", "sampleSize")
+        )
+
+    def get_completed_known(self, obj) -> bool:
+        raw = obj.raw_data or {}
+        if "_completed_known" in raw:
+            return bool(raw["_completed_known"])
+        if not self._is_rfg(obj):
+            return True
+        return any(raw.get(key) is not None for key in ("currentCompletes", "completes", "completed"))
+
+    def get_limit_type(self, obj) -> str:
+        raw = obj.raw_data or {}
+        return str(raw.get("quotaLimitBy") or "completes").replace("_", " ").strip().title()
+
+    def _quota_datapoints(self, obj) -> list:
+        raw = obj.raw_data or {}
+        datapoints = raw.get("datapoints")
+        if not isinstance(datapoints, list):
+            datapoints = (obj.targeting or {}).get("datapoints")
+        return datapoints if isinstance(datapoints, list) else []
+
+    def get_scope_label(self, obj) -> str:
+        raw = obj.raw_data or {}
+        quota_type = str(raw.get("SurveyQuotaType") or "").strip().lower()
+        if quota_type:
+            return "Overall survey quota" if quota_type == "total" else f"{quota_type.title()} quota"
+        return "Targeted respondent quota" if self._quota_datapoints(obj) else "Overall survey quota"
+
+    @staticmethod
+    def _range_label(value) -> str:
+        minimum, maximum = value.get("min"), value.get("max")
+        if minimum is None and maximum is None:
+            return ""
+        if minimum == maximum:
+            return str(minimum)
+        if minimum is None:
+            return f"Up to {maximum}"
+        if maximum is None:
+            return f"{minimum}+"
+        return f"{minimum}\u2013{maximum}"
+
+    def get_targeting_details(self, obj) -> list:
+        normalized = (obj.raw_data or {}).get("targeting_details")
+        if isinstance(normalized, list):
+            return normalized
+        questions = list(obj.survey.targeting_questions.all())
+        details = []
+        for datapoint in self._quota_datapoints(obj):
+            if not isinstance(datapoint, dict):
+                continue
+            name = str(datapoint.get("name") or datapoint.get("property") or "Targeting")
+            question = next((item for item in questions if (
+                str((item.raw_data or {}).get("targeting", {}).get("name") or "") == name
+                or item.key == name
+            )), None)
+            option_labels = {
+                str(option.get("OptionId")): clean_rfg_display_text(option.get("OptionText"))
+                for option in (question.options if question else [])
+                if isinstance(option, dict)
+            }
+            values = []
+            for value in datapoint.get("values") or []:
+                if not isinstance(value, dict):
+                    values.append(str(value))
+                    continue
+                range_label = self._range_label(value)
+                if range_label:
+                    values.append(range_label)
+                    continue
+                choice = value.get("choice")
+                if choice is not None:
+                    if name.lower() == "gender":
+                        values.append({"1": "Male", "2": "Female"}.get(str(choice), str(choice)))
+                    else:
+                        values.append(option_labels.get(str(choice), f"Choice {choice}"))
+                    continue
+                free_value = value.get("value", value.get("text", value.get("freeList")))
+                if free_value not in (None, ""):
+                    values.append(str(free_value))
+            details.append({"name": clean_rfg_display_text(name), "values": values or ["Provider-defined segment"]})
+        return details
 
 
 class TargetingQuestionSerializer(serializers.ModelSerializer):
+    text = serializers.SerializerMethodField()
+    options = serializers.SerializerMethodField()
+    targeting_note = serializers.SerializerMethodField(
+        help_text="Readable provider qualifying-answer or age rule for internal project details."
+    )
+
     class Meta:
         model = TargetingQuestion
-        fields = ["id", "question_id", "key", "text", "question_type", "category", "options", "updated_at"]
+        fields = ["id", "question_id", "key", "text", "question_type", "category", "options", "targeting_note", "updated_at"]
+
+    def get_text(self, obj) -> str:
+        return clean_rfg_display_text(obj.text)
+
+    def get_options(self, obj) -> list:
+        options = clean_rfg_options(obj.options)
+        raw = obj.raw_data or {}
+        if "targeting_choices" not in raw:
+            return options
+        allowed = {str(value) for value in raw.get("targeting_choices") or []}
+        if obj.key == "RFG_GENDER":
+            allowed = {"M" if value == "1" else "F" if value == "2" else value for value in allowed}
+        return [
+            {**option, "Qualifies": str(option.get("OptionId")) in allowed}
+            for option in options
+        ]
+
+    def get_targeting_note(self, obj) -> str:
+        raw = obj.raw_data or {}
+        ranges = raw.get("targeting_age_ranges") or []
+        if ranges:
+            labels = [SurveyQuotaSerializer._range_label(item) for item in ranges if isinstance(item, dict)]
+            labels = [label for label in labels if label]
+            if labels:
+                return f"Qualifying age: {', '.join(labels)}"
+        if "targeting_choices" in raw:
+            qualifying = [
+                str(option.get("OptionText")) for option in self.get_options(obj)
+                if option.get("Qualifies") is True
+            ]
+            return (
+                f"Qualifying answer{'s' if len(qualifying) != 1 else ''}: {', '.join(qualifying)}"
+                if qualifying else "No fixed answer restriction was returned by the provider."
+            )
+        if obj.category == "Required profile":
+            return "Required respondent profile field."
+        return ""
+
+
+class CanonicalOptionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CanonicalOption
+        fields = ["code", "label", "normalized_value"]
+
+
+class CanonicalQuestionSerializer(serializers.ModelSerializer):
+    options = CanonicalOptionSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = CanonicalQuestion
+        fields = ["code", "label", "value_type", "description", "options", "updated_at"]
+
+
+class ProviderOptionMappingSerializer(serializers.ModelSerializer):
+    canonical_option = serializers.SlugRelatedField(slug_field="code", read_only=True)
+
+    class Meta:
+        model = ProviderOptionMapping
+        fields = [
+            "external_value", "external_label", "canonical_option", "canonical_value",
+        ]
+
+
+class ProviderQuestionMappingSerializer(serializers.ModelSerializer):
+    canonical_key = serializers.CharField(source="canonical_question.code", read_only=True)
+    canonical_label = serializers.CharField(source="canonical_question.label", read_only=True)
+    options = ProviderOptionMappingSerializer(source="option_mappings", many=True, read_only=True)
+
+    class Meta:
+        model = ProviderQuestionMapping
+        fields = [
+            "provider_code", "country_code", "language_code", "country_language_id",
+            "external_question_id", "external_question_key", "canonical_key",
+            "canonical_label", "options", "updated_at",
+        ]
 
 
 class SurveyListSerializer(serializers.ModelSerializer):
+    source_id = serializers.SerializerMethodField()
+    provider_code = serializers.SerializerMethodField()
     client_name = serializers.CharField(source="client.name", read_only=True, allow_null=True)
     display_company_name = serializers.SerializerMethodField()
     country_label = serializers.SerializerMethodField()
@@ -39,9 +251,9 @@ class SurveyListSerializer(serializers.ModelSerializer):
     class Meta:
         model = Survey
         fields = [
-            "id", "local_id", "client", "client_name", "display_company_name", "source_id", "company_name", "name", "status", "sample_size", "completes", "remaining",
+            "id", "local_id", "client", "client_name", "display_company_name", "source_id", "provider_code", "company_name", "name", "status", "sample_size", "completes", "remaining",
             "starts", "cpi", "cpi_cut_percent", "vendor_pricing", "loi", "incidence_rate", "country", "country_code", "country_label",
-            "language", "language_code", "group_type", "device_type", "entry_link", "start_link", "has_quota",
+            "language", "language_code", "group_type", "buyer_id", "survey_type", "device_type", "entry_link", "start_link", "has_quota",
             "source_created_at", "source_modified_at", "source_created_display", "source_modified_display",
             "detail_synced_at", "quota_synced_at", "targeting_synced_at", "created_at", "updated_at",
             "progress_percent",
@@ -50,9 +262,18 @@ class SurveyListSerializer(serializers.ModelSerializer):
     def get_country_label(self, obj) -> str:
         return " ".join(part for part in [obj.country_code, obj.language_code] if part) or obj.country
 
+    @extend_schema_field({"oneOf": [{"type": "integer"}, {"type": "string"}]})
+    def get_source_id(self, obj):
+        return obj.source_identifier
+
+    def get_provider_code(self, obj) -> str:
+        return obj.integration.provider_code if obj.integration_id else getattr(obj.client, "provider_code", "innovatemr")
+
     def get_display_company_name(self, obj) -> str:
         request = self.context.get("request")
-        if request and vendor_scope_user_id(request.user) and obj.client:
+        if request and (
+            vendor_scope_user_id(request.user) or organization_client_ids_for_user(request.user) is not None
+        ) and obj.client:
             return obj.client.name
         return obj.company_name
 
@@ -63,7 +284,7 @@ class SurveyListSerializer(serializers.ModelSerializer):
         return obj.raw_data.get("createdDate") or None
 
     def get_source_modified_display(self, obj) -> str | None:
-        return obj.raw_data.get("modifiedDate") or None
+        return obj.raw_data.get("modifiedDate") or obj.raw_data.get("lastModified") or None
 
     def _pricing(self, obj):
         request = self.context.get("request")
@@ -86,11 +307,15 @@ class SurveyListSerializer(serializers.ModelSerializer):
         request = self.context.get("request")
         if not request or not request.user.is_authenticated or not has_function_access(request.user, "survey_links.copy"):
             return None
-        if not obj.entry_link:
+        supports_lazy_entry_link = bool(
+            obj.integration_id and obj.integration.provider_code in {"rfg", "cint"}
+        )
+        if not obj.entry_link and not supports_lazy_entry_link:
             return None
         query = urlencode({
-            "surveyId": obj.source_id,
-            "supplierCode": obj.integration.supplier_code if obj.integration_id else settings.PUBLIC_SUPPLIER_CODE,
+            "surveyId": obj.source_identifier,
+            # Public platform links never expose a client's real upstream supplier code.
+            "supplierCode": settings.PUBLIC_SUPPLIER_CODE,
             "userId": request.user.pk,
             "code": obj.local_id,
         })
@@ -132,12 +357,18 @@ class SyncTriggerResponseSerializer(serializers.Serializer):
     detail_failures = serializers.IntegerField()
 
 
+class RFGCallbackResponseSerializer(serializers.Serializer):
+    ok = serializers.BooleanField()
+    rid = serializers.CharField(max_length=10)
+    status = serializers.CharField()
+
+
 class UserHitDeviceCountsSerializer(serializers.Serializer):
-    total = serializers.IntegerField(min_value=0)
-    desktop = serializers.IntegerField(min_value=0)
-    mobile = serializers.IntegerField(min_value=0)
-    tablet = serializers.IntegerField(min_value=0)
-    unclassified = serializers.IntegerField(min_value=0)
+    total = serializers.IntegerField(min_value=0, allow_null=True)
+    desktop = serializers.IntegerField(min_value=0, allow_null=True)
+    mobile = serializers.IntegerField(min_value=0, allow_null=True)
+    tablet = serializers.IntegerField(min_value=0, allow_null=True)
+    unclassified = serializers.IntegerField(min_value=0, allow_null=True)
 
 
 class UserHitRowSerializer(serializers.Serializer):
@@ -147,6 +378,7 @@ class UserHitRowSerializer(serializers.Serializer):
     user_email = serializers.EmailField(allow_blank=True)
     branch = serializers.CharField(allow_blank=True)
     sub_branch = serializers.CharField(allow_blank=True)
+    shift = serializers.CharField(allow_blank=True)
     date = serializers.DateField()
     hits = UserHitDeviceCountsSerializer()
     completes = UserHitDeviceCountsSerializer()
@@ -155,9 +387,10 @@ class UserHitRowSerializer(serializers.Serializer):
 class UserHitSummarySerializer(serializers.Serializer):
     hits = UserHitDeviceCountsSerializer()
     completes = UserHitDeviceCountsSerializer()
-    active_users = serializers.IntegerField(min_value=0)
+    active_users = serializers.IntegerField(min_value=0, allow_null=True)
     days = serializers.IntegerField(min_value=0)
-    conversion_rate = serializers.FloatField(min_value=0)
+    conversion_rate = serializers.FloatField(min_value=0, allow_null=True)
+    incidence_rate = serializers.FloatField(min_value=0, allow_null=True)
 
 
 class UserHitsResponseSerializer(serializers.Serializer):
@@ -168,11 +401,110 @@ class UserHitsResponseSerializer(serializers.Serializer):
     summary = UserHitSummarySerializer()
 
 
+class DashboardSummarySerializer(serializers.Serializer):
+    hits = serializers.IntegerField(min_value=0, allow_null=True)
+    completes = serializers.IntegerField(min_value=0, allow_null=True)
+    conversion_rate = serializers.FloatField(min_value=0, allow_null=True)
+    incidence_rate = serializers.FloatField(min_value=0, allow_null=True)
+    active_users = serializers.IntegerField(min_value=0, allow_null=True)
+    average_loi_seconds = serializers.IntegerField(min_value=0, allow_null=True)
+    revenue = serializers.DecimalField(max_digits=18, decimal_places=2, allow_null=True)
+    average_cpi = serializers.DecimalField(max_digits=18, decimal_places=2, allow_null=True)
+    rpc = serializers.DecimalField(max_digits=18, decimal_places=2, allow_null=True)
+    revenue_currency = serializers.CharField(allow_null=True)
+
+
+class DashboardRangeSerializer(serializers.Serializer):
+    key = serializers.CharField()
+    label = serializers.CharField()
+    bucket_label = serializers.CharField()
+    start = serializers.DateTimeField()
+    end = serializers.DateTimeField()
+
+
+class DashboardPerformancePointSerializer(serializers.Serializer):
+    key = serializers.CharField()
+    label = serializers.CharField()
+    short_label = serializers.CharField()
+    hits = serializers.IntegerField(min_value=0)
+    completes = serializers.IntegerField(min_value=0)
+    conversion_rate = serializers.FloatField(min_value=0)
+    incidence_rate = serializers.FloatField(min_value=0)
+    revenue = serializers.DecimalField(max_digits=18, decimal_places=2, allow_null=True)
+    average_cpi = serializers.DecimalField(max_digits=18, decimal_places=2, allow_null=True)
+    rpc = serializers.DecimalField(max_digits=18, decimal_places=2, allow_null=True)
+
+
+class DashboardClientShareSerializer(serializers.Serializer):
+    client_id = serializers.IntegerField(allow_null=True)
+    name = serializers.CharField()
+    completes = serializers.IntegerField(min_value=0)
+    share_percent = serializers.FloatField(min_value=0, max_value=100)
+
+
+class DashboardStatusBreakdownSerializer(serializers.Serializer):
+    initiated = serializers.IntegerField(min_value=0)
+    completed = serializers.IntegerField(min_value=0)
+    terminated = serializers.IntegerField(min_value=0)
+    quota = serializers.IntegerField(min_value=0)
+    security = serializers.IntegerField(min_value=0)
+
+
+class DashboardDeviceBreakdownSerializer(serializers.Serializer):
+    desktop = serializers.IntegerField(min_value=0)
+    mobile = serializers.IntegerField(min_value=0)
+    tablet = serializers.IntegerField(min_value=0)
+    unclassified = serializers.IntegerField(min_value=0)
+
+
+class DashboardTopUserSerializer(serializers.Serializer):
+    user_id = serializers.IntegerField()
+    name = serializers.CharField()
+    hits = serializers.IntegerField(min_value=0)
+    completes = serializers.IntegerField(min_value=0)
+    conversion_rate = serializers.FloatField(min_value=0)
+
+
+class DashboardGraphClientSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    name = serializers.CharField()
+
+
+class DashboardGraphSeriesSerializer(serializers.Serializer):
+    range = DashboardRangeSerializer()
+    client_id = serializers.IntegerField(allow_null=True)
+    points = DashboardPerformancePointSerializer(many=True)
+
+
+class DashboardRecentActivitySerializer(serializers.Serializer):
+    rid = serializers.CharField()
+    user_name = serializers.CharField()
+    project_id = serializers.CharField()
+    client_name = serializers.CharField()
+    status = serializers.CharField()
+    status_label = serializers.CharField()
+    initiated_at = serializers.DateTimeField()
+
+
+class DashboardResponseSerializer(serializers.Serializer):
+    range = DashboardRangeSerializer()
+    summary = DashboardSummarySerializer()
+    traffic_chart = DashboardGraphSeriesSerializer(allow_null=True)
+    finance_chart = DashboardGraphSeriesSerializer(allow_null=True)
+    graph_clients = DashboardGraphClientSerializer(many=True)
+    client_distribution = DashboardClientShareSerializer(many=True, allow_null=True)
+    status_breakdown = DashboardStatusBreakdownSerializer(allow_null=True)
+    device_breakdown = DashboardDeviceBreakdownSerializer(allow_null=True)
+    top_users = DashboardTopUserSerializer(many=True, allow_null=True)
+    generated_at = serializers.DateTimeField()
+
+
 class SurveyAttemptSerializer(serializers.ModelSerializer):
     survey_local_id = serializers.CharField(source="survey.local_id", read_only=True)
-    survey_source_id = serializers.IntegerField(source="survey.source_id", read_only=True)
+    survey_source_id = serializers.SerializerMethodField()
     survey_name = serializers.CharField(source="survey.name", read_only=True)
     company_name = serializers.CharField(source="survey.company_name", read_only=True)
+    country = serializers.CharField(source="survey.country", read_only=True)
     country_code = serializers.CharField(source="survey.country_code", read_only=True)
     language_code = serializers.CharField(source="survey.language_code", read_only=True)
     user_name = serializers.SerializerMethodField()
@@ -181,18 +513,23 @@ class SurveyAttemptSerializer(serializers.ModelSerializer):
     status_label = serializers.SerializerMethodField()
     entry_ip = serializers.IPAddressField(source="initiation_ip", read_only=True, allow_null=True)
     exit_ip = serializers.IPAddressField(source="callback_ip", read_only=True, allow_null=True)
-    client_name = serializers.CharField(source="client.name", read_only=True, allow_null=True)
+    client_name = serializers.SerializerMethodField()
+    buyer_id = serializers.CharField(source="survey.buyer_id", read_only=True)
     vendor_name = serializers.SerializerMethodField()
+    supplier = serializers.IntegerField(source="vendor_id", read_only=True, allow_null=True)
+    supplier_name = serializers.SerializerMethodField()
     source_cpi_snapshot = serializers.SerializerMethodField()
+    termination_reason = serializers.SerializerMethodField()
+    termination_category = serializers.SerializerMethodField()
 
     class Meta:
         model = SurveyAttempt
         fields = [
-            "rid", "survey_local_id", "survey_source_id", "survey_name", "company_name", "country_code",
-            "language_code", "platform_user", "user_id", "user_name", "username", "user_email", "vendor",
-            "vendor_name", "client", "client_name", "client_allocation", "survey_allocation", "supplier_code",
-            "source_cpi_snapshot", "cpi_cut_percent_snapshot", "payable_cpi_snapshot", "cpi_currency_snapshot",
-            "status_label",
+            "rid", "prescreener_uid", "survey_local_id", "survey_source_id", "survey_name", "company_name", "country", "country_code",
+            "language_code", "platform_user", "user_id", "user_name", "username", "user_email", "supplier",
+            "supplier_name", "vendor", "vendor_name", "client", "client_name", "client_allocation", "survey_allocation", "supplier_code",
+            "buyer_id", "source_cpi_snapshot", "cpi_snapshot_source", "cpi_cut_percent_snapshot", "payable_cpi_snapshot", "cpi_currency_snapshot",
+            "status_label", "termination_reason", "termination_category",
             "status", "initiated_at", "submitted_at", "redirected_at", "callback_at", "last_callback_at",
             "loi_seconds", "entry_ip", "exit_ip", "initiation_ip", "callback_ip", "entry_user_agent",
             "exit_user_agent", "entry_browser", "exit_browser", "entry_device", "exit_device", "entry_os",
@@ -206,17 +543,83 @@ class SurveyAttemptSerializer(serializers.ModelSerializer):
             return "Deleted user"
         return obj.platform_user.get_full_name() or obj.platform_user.username
 
+    def get_survey_source_id(self, obj) -> str:
+        return str(obj.survey.source_identifier)
+
+    def get_client_name(self, obj) -> str:
+        client = obj.client or obj.survey.client
+        return client.name if client else obj.survey.company_name
+
     def get_vendor_name(self, obj) -> str | None:
         if not obj.vendor:
             return None
         return obj.vendor.get_full_name() or obj.vendor.username
 
+    def get_supplier_name(self, obj) -> str | None:
+        return self.get_vendor_name(obj)
+
     @extend_schema_field(serializers.DecimalField(max_digits=12, decimal_places=2, allow_null=True))
     def get_source_cpi_snapshot(self, obj):
         request = self.context.get("request")
-        return None if request and is_external_vendor_scope(request.user) else obj.source_cpi_snapshot
+        if request and is_external_vendor_scope(request.user):
+            return None
+        value = obj.source_cpi_snapshot
+        profile = getattr(request.user, "employee_profile", None) if request else None
+        role = getattr(profile, "role", None) if profile else None
+        if value is not None and profile and profile.account_type == "employee" and role and not request.user.is_superuser:
+            return (Decimal(value) * role.cpi_visibility_percent / Decimal("100.00")).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+        return value
 
     def get_status_label(self, obj) -> str:
         if obj.status in {SurveyAttempt.Status.INITIATED, SurveyAttempt.Status.REDIRECTED}:
             return "Initiated"
         return obj.get_status_display()
+
+    def get_termination_reason(self, obj) -> str:
+        if obj.status not in {
+            SurveyAttempt.Status.TERMINATED,
+            SurveyAttempt.Status.OVER_QUOTA,
+            SurveyAttempt.Status.QUALITY_TERMINATED,
+        }:
+            return ""
+        return provider_outcome(obj).get("reason", "")
+
+    def get_termination_category(self, obj) -> str:
+        if obj.status not in {
+            SurveyAttempt.Status.TERMINATED,
+            SurveyAttempt.Status.OVER_QUOTA,
+            SurveyAttempt.Status.QUALITY_TERMINATED,
+        }:
+            return ""
+        return provider_outcome(obj).get("category", "")
+
+
+class SurveyAttemptCompletedDeviceSummarySerializer(serializers.Serializer):
+    desktop = serializers.IntegerField(allow_null=True)
+    mobile = serializers.IntegerField(allow_null=True)
+    tablet = serializers.IntegerField(allow_null=True)
+    unclassified = serializers.IntegerField()
+
+
+class SurveyAttemptSummarySerializer(serializers.Serializer):
+    total = serializers.IntegerField(allow_null=True)
+    initiated = serializers.IntegerField(allow_null=True)
+    completed = serializers.IntegerField(allow_null=True)
+    terminated = serializers.IntegerField(allow_null=True)
+    over_quota = serializers.IntegerField(allow_null=True)
+    security_terminated = serializers.IntegerField(allow_null=True)
+    conversion_rate = serializers.FloatField(allow_null=True)
+    incidence_rate = serializers.FloatField(allow_null=True)
+    total_revenue = serializers.DecimalField(max_digits=18, decimal_places=2, allow_null=True)
+    revenue_currency = serializers.CharField(allow_null=True)
+    completed_devices = SurveyAttemptCompletedDeviceSummarySerializer()
+
+
+class SurveyAttemptListResponseSerializer(serializers.Serializer):
+    count = serializers.IntegerField()
+    next = serializers.URLField(allow_null=True)
+    previous = serializers.URLField(allow_null=True)
+    results = SurveyAttemptSerializer(many=True)
+    summary = SurveyAttemptSummarySerializer()

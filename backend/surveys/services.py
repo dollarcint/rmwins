@@ -1,3 +1,5 @@
+"""InnovateMR normalization, inventory merge, detail refresh and reconciliation."""
+
 import hashlib
 import json
 import logging
@@ -15,6 +17,7 @@ from vendors.models import ClientIntegration
 
 from .integrations import InnovateMRAPIError, InnovateMRClient, InnovateMRNotFound
 from .models import Survey, SurveyAttempt, SurveyQuota, SyncRun, TargetingQuestion
+from .project_cache import invalidate_project_cache
 from .survey_flow import normalize_client_ip
 
 logger = logging.getLogger(__name__)
@@ -87,6 +90,14 @@ def merge_inventory(*inventories: list[dict[str, Any]]) -> dict[int, dict[str, A
 
 
 def _survey_values(payload: dict[str, Any], seen_at: datetime) -> dict[str, Any]:
+    group_type = str(payload.get("groupType") or payload.get("surveyType") or "").strip()
+    normalized_group = "".join(character for character in group_type.upper() if character.isalnum())
+    if normalized_group in {"B2B", "BUSINESS", "BUSINESSTOBUSINESS"}:
+        survey_type = "B2B"
+    elif normalized_group in {"B2C", "CONSUMER", "BUSINESSTOCONSUMER"}:
+        survey_type = "B2C"
+    else:
+        survey_type = group_type[:20]
     return {
         "company_name": str(payload.get("_provider_name") or "InnovateMR"),
         "name": str(payload.get("surveyName") or ""),
@@ -102,7 +113,9 @@ def _survey_values(payload: dict[str, Any], seen_at: datetime) -> dict[str, Any]
         "country_code": str(payload.get("CountryCode") or "").upper(),
         "language": str(payload.get("Language") or ""),
         "language_code": str(payload.get("LanguageCode") or "").upper(),
-        "group_type": str(payload.get("groupType") or ""),
+        "group_type": group_type,
+        "buyer_id": str(payload.get("BuyerId") or payload.get("buyerId") or "").strip(),
+        "survey_type": survey_type,
         "device_type": str(payload.get("deviceType") or ""),
         "entry_link": str(payload.get("entryLink") or ""),
         "test_entry_link": str(payload.get("testEntryLink") or ""),
@@ -177,6 +190,8 @@ def replace_survey_targeting(client: InnovateMRClient, survey: Survey) -> None:
         ])
         survey.targeting_synced_at = timezone.now()
         survey.save(update_fields=["targeting_synced_at", "updated_at"])
+    from .mappings import sync_survey_mappings
+    sync_survey_mappings(survey)
 
 
 def replace_survey_details(client: InnovateMRClient, survey: Survey) -> None:
@@ -299,12 +314,14 @@ def sync_surveys(client: InnovateMRClient | None = None, integration: ClientInte
         with transaction.atomic():
             source_client = integration.client if integration else None
             for source_id, payload in merged.items():
-                lookup = Survey.objects.filter(source_id=source_id)
+                source_key = str(source_id)
+                lookup = Survey.objects.filter(source_key=source_key)
                 lookup = lookup.filter(integration=integration) if integration else lookup.filter(integration__isnull=True)
                 existing = lookup.first()
                 values = _survey_values(payload, now)
                 values["client"] = source_client
                 values["integration"] = integration
+                values["source_key"] = source_key
                 if existing is None:
                     survey = Survey.objects.create(source_id=source_id, **values)
                     run.created += 1
@@ -333,6 +350,9 @@ def sync_surveys(client: InnovateMRClient | None = None, integration: ClientInte
     finally:
         run.finished_at = timezone.now()
         run.save()
+
+    if run.status == SyncRun.Status.SUCCESS:
+        invalidate_project_cache()
 
     return SyncSummary(
         run_id=run.id,

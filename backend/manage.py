@@ -1,4 +1,6 @@
 #!/usr/bin/env python
+"""Django management-command entry point."""
+
 import os
 import sys
 

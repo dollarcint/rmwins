@@ -8,18 +8,28 @@ from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from accounts.models import AccessFunction, EmployeeProfile, UserFunctionOverride
+from accounts.models import AccessFunction, EmployeeProfile, Role, UserFunctionOverride
 from surveys.models import Survey, SurveyAttempt
 
 from .models import (
     AllocationReservation,
     Client,
+    ClientIntegration,
+    OrganizationClientAccess,
+    OrganizationUnit,
     VendorAPIKey,
     VendorClientAllocation,
     VendorCommercialProfile,
     VendorSurveyAllocation,
 )
-from .services import AllocationUnavailable, finalize_attempt_capacity, payable_cpi, reserve_attempt_capacity
+from .services import (
+    AllocationUnavailable,
+    finalize_attempt_capacity,
+    payable_cpi,
+    reserve_attempt_capacity,
+    resolve_vendor_survey_context,
+    survey_pricing_for_user,
+)
 from .tasks import expire_allocation_reservations_task
 
 
@@ -79,6 +89,35 @@ class VendorFoundationTests(TestCase):
             status=status,
         )
 
+    def test_hidden_biobrain_client_is_not_published_before_inventory(self):
+        hidden = Client.objects.create(
+            code="catalog-hidden-biobrain", name="BioBrain", provider_code="biobrain", is_active=False
+        )
+        integration = ClientIntegration.objects.create(
+            client=hidden,
+            name="Hidden BioBrain",
+            provider_code="biobrain",
+            base_url="https://partner-api.voqall.com/api/v1/surveys",
+            credential_env_key="BIOBRAIN_API_KEY",
+        )
+        api = APIClient()
+        api.force_authenticate(self.owner)
+        response = api.get(reverse("vendor-client-list"))
+        self.assertEqual(response.status_code, 200)
+        self.assertNotIn(hidden.pk, [row["id"] for row in response.data["results"]])
+        response = api.get(reverse("client-integration-list"))
+        self.assertNotIn(integration.pk, [row["id"] for row in response.data["results"]])
+        response = api.get(reverse("client-integration-providers"))
+        self.assertNotIn("biobrain", [row["code"] for row in response.data])
+        hidden.is_active = True
+        hidden.save(update_fields=["is_active", "updated_at"])
+        response = api.get(reverse("vendor-client-list"))
+        self.assertIn(hidden.pk, [row["id"] for row in response.data["results"]])
+        response = api.get(reverse("client-integration-list"))
+        self.assertIn(integration.pk, [row["id"] for row in response.data["results"]])
+        response = api.get(reverse("client-integration-providers"))
+        self.assertIn("biobrain", [row["code"] for row in response.data])
+
     def test_external_cut_and_internal_full_cpi_rules(self):
         self.assertEqual(payable_cpi(Decimal("10.00"), Decimal("30.00")), Decimal("7.00"))
         self.assertEqual(self.external_survey_allocation.effective_cpi_cut_percent, Decimal("30.00"))
@@ -90,6 +129,18 @@ class VendorFoundationTests(TestCase):
         )
         with self.assertRaises(ValidationError):
             internal_policy.full_clean()
+
+    def test_employee_role_can_show_a_configured_cpi_percentage(self):
+        role = Role.objects.get(slug="team-lead")
+        role.cpi_visibility_percent = Decimal("70.00")
+        role.save(update_fields=["cpi_visibility_percent"])
+        EmployeeProfile.objects.filter(user=self.employee).update(role=role)
+        self.employee.employee_profile.refresh_from_db()
+
+        visible_cpi, applied_cut = survey_pricing_for_user(self.employee, self.survey)
+
+        self.assertEqual(visible_cpi, Decimal("7.00"))
+        self.assertEqual(applied_cut, Decimal("30.00"))
 
     def test_reservation_freezes_cpi_and_completion_consumes_both_limits(self):
         attempt = self.attempt("Ua1Bb2Cc3D")
@@ -431,3 +482,323 @@ class VendorFoundationTests(TestCase):
             "name": "Forbidden delegated key",
         }, format="json")
         self.assertEqual(response.status_code, 403)
+
+
+class OrganizationHierarchyTests(TestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.owner = User.objects.create_superuser("organization-owner", "org-owner@example.test", "test-password")
+        self.internal = User.objects.create_user("organization-internal", first_name="Internal", last_name="Vendor")
+        EmployeeProfile.objects.filter(user=self.internal).update(
+            account_type=EmployeeProfile.AccountType.INTERNAL_VENDOR,
+            role=Role.objects.get(slug="admin"),
+            created_by=self.owner,
+        )
+        VendorCommercialProfile.objects.create(vendor=self.internal, created_by=self.owner)
+        self.client_a = Client.objects.create(code="client-a", name="Client A", created_by=self.owner)
+        self.client_b = Client.objects.create(code="client-b", name="Client B", created_by=self.owner)
+        self.survey_a = Survey.objects.create(
+            client=self.client_a, source_id=99001, name="Client A survey", status=Survey.Status.LIVE,
+            remaining=10, cpi=Decimal("3.00"),
+        )
+        self.survey_b = Survey.objects.create(
+            client=self.client_b, source_id=99002, name="Client B survey", status=Survey.Status.LIVE,
+            remaining=10, cpi=Decimal("4.00"),
+        )
+        self.owner_api = APIClient()
+        self.owner_api.force_authenticate(self.owner)
+
+    def create_tree(self, owner, prefix):
+        branch = OrganizationUnit.objects.create(
+            workspace_owner=owner, unit_type=OrganizationUnit.UnitType.BRANCH,
+            name=f"{prefix} Branch", code=f"{prefix}-branch", created_by=self.owner,
+        )
+        sub_branch = OrganizationUnit.objects.create(
+            workspace_owner=owner, parent=branch, unit_type=OrganizationUnit.UnitType.SUB_BRANCH,
+            name="Operations", code="operations", created_by=self.owner,
+        )
+        shift = OrganizationUnit.objects.create(
+            workspace_owner=owner, parent=sub_branch, unit_type=OrganizationUnit.UnitType.SHIFT,
+            name="Morning", code="morning", created_by=self.owner,
+        )
+        return branch, sub_branch, shift
+
+    def test_owner_can_build_strict_tree_and_internal_vendor_is_scoped(self):
+        branch = self.owner_api.post(reverse("organization-unit-list"), {
+            "workspace_owner": self.internal.pk,
+            "unit_type": "branch",
+            "name": "Gurgaon",
+            "code": "gurgaon",
+            "is_active": True,
+        }, format="json")
+        self.assertEqual(branch.status_code, 201)
+        sub_branch = self.owner_api.post(reverse("organization-unit-list"), {
+            "workspace_owner": self.internal.pk,
+            "parent": branch.data["id"],
+            "unit_type": "sub_branch",
+            "name": "Operations",
+            "code": "operations",
+            "is_active": True,
+        }, format="json")
+        self.assertEqual(sub_branch.status_code, 201)
+        invalid_shift = self.owner_api.post(reverse("organization-unit-list"), {
+            "workspace_owner": self.internal.pk,
+            "parent": branch.data["id"],
+            "unit_type": "shift",
+            "name": "Invalid",
+            "code": "invalid",
+        }, format="json")
+        self.assertEqual(invalid_shift.status_code, 400)
+        shift = self.owner_api.post(reverse("organization-unit-list"), {
+            "workspace_owner": self.internal.pk,
+            "parent": sub_branch.data["id"],
+            "unit_type": "shift",
+            "name": "Morning",
+            "code": "morning",
+        }, format="json")
+        self.assertEqual(shift.status_code, 201)
+
+        internal_api = APIClient()
+        internal_api.force_authenticate(self.internal)
+        listing = internal_api.get(reverse("organization-unit-list"))
+        self.assertEqual(listing.status_code, 200)
+        self.assertEqual(listing.data["count"], 3)
+        self.assertTrue(all(row["workspace_owner"] == self.internal.pk for row in listing.data["results"]))
+        self.client.force_login(self.internal)
+        page = self.client.get(reverse("organization-management"))
+        self.assertEqual(page.status_code, 200)
+        self.assertContains(page, "Organization hierarchy")
+
+    def test_unit_client_grants_filter_main_office_projects(self):
+        branch, _, shift = self.create_tree(self.owner, "main")
+        OrganizationClientAccess.objects.create(
+            organization_unit=branch, client=self.client_a, created_by=self.owner,
+        )
+        employee = get_user_model().objects.create_user("main-shift-employee")
+        EmployeeProfile.objects.filter(user=employee).update(
+            organization_unit=shift,
+            created_by=self.owner,
+            role=Role.objects.get(slug="employee"),
+        )
+        api = APIClient()
+        api.force_authenticate(employee)
+        response = api.get(reverse("survey-list"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual({row["source_id"] for row in response.data["results"]}, {self.survey_a.source_id})
+        with self.assertRaisesMessage(AllocationUnavailable, "not assigned"):
+            resolve_vendor_survey_context(employee, self.survey_b)
+
+    def test_shift_client_grants_override_broader_branch_grants(self):
+        branch, _, shift = self.create_tree(self.owner, "shift-override")
+        OrganizationClientAccess.objects.bulk_create([
+            OrganizationClientAccess(
+                organization_unit=branch, client=self.client_a, created_by=self.owner,
+            ),
+            OrganizationClientAccess(
+                organization_unit=branch, client=self.client_b, created_by=self.owner,
+            ),
+            OrganizationClientAccess(
+                organization_unit=shift, client=self.client_a, created_by=self.owner,
+            ),
+        ])
+        employee = get_user_model().objects.create_user("shift-override-employee")
+        EmployeeProfile.objects.filter(user=employee).update(
+            organization_unit=shift,
+            created_by=self.owner,
+            role=Role.objects.get(slug="employee"),
+        )
+        api = APIClient()
+        api.force_authenticate(employee)
+
+        response = api.get(reverse("survey-list"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            {row["source_id"] for row in response.data["results"]},
+            {self.survey_a.source_id},
+        )
+        with self.assertRaisesMessage(AllocationUnavailable, "not assigned"):
+            resolve_vendor_survey_context(employee, self.survey_b)
+
+    def test_shift_members_and_clients_roll_up_to_parent_totals(self):
+        branch, sub_branch, shift = self.create_tree(self.owner, "rollup")
+        OrganizationClientAccess.objects.create(
+            organization_unit=shift, client=self.client_a, created_by=self.owner,
+        )
+        for index in range(2):
+            employee = get_user_model().objects.create_user(f"rollup-employee-{index}")
+            EmployeeProfile.objects.filter(user=employee).update(
+                organization_unit=shift,
+                created_by=self.owner,
+                role=Role.objects.get(slug="employee"),
+            )
+
+        response = self.owner_api.get(reverse("organization-unit-list"))
+
+        self.assertEqual(response.status_code, 200)
+        units = {row["id"]: row for row in response.data["results"]}
+        for unit in (branch, sub_branch, shift):
+            self.assertEqual(units[unit.pk]["member_count"], 2)
+            self.assertEqual(units[unit.pk]["client_count"], 1)
+        self.assertEqual(units[branch.pk]["direct_member_count"], 0)
+        self.assertEqual(units[branch.pk]["direct_client_count"], 0)
+        self.assertEqual(units[shift.pk]["direct_member_count"], 2)
+        self.assertEqual(units[shift.pk]["direct_client_count"], 1)
+
+    def test_user_creation_assigns_team_leads_and_employees_to_shifts(self):
+        branch, _, shift = self.create_tree(self.owner, "people")
+        invalid = self.owner_api.post(reverse("access-user-list"), {
+            "first_name": "Invalid", "last_name": "Lead", "email": "invalid-lead@example.test",
+            "password": "password-123", "role": "team-lead", "account_type": "employee",
+            "organization_unit": branch.pk, "allow_codes": [], "deny_codes": [],
+        }, format="json")
+        self.assertEqual(invalid.status_code, 400)
+        created = self.owner_api.post(reverse("access-user-list"), {
+            "first_name": "Morning", "last_name": "Lead", "email": "morning-lead@example.test",
+            "password": "password-123", "role": "team-lead", "account_type": "employee",
+            "organization_unit": shift.pk, "allow_codes": [], "deny_codes": [],
+        }, format="json")
+        self.assertEqual(created.status_code, 201)
+        lead = get_user_model().objects.get(email="morning-lead@example.test")
+        self.assertEqual(lead.employee_profile.organization_unit, shift)
+        self.assertEqual(created.data["organization_unit_details"]["path"], "people Branch / Operations / Morning")
+
+    def test_internal_vendor_unit_grants_intersect_vendor_allocations(self):
+        allocation_a = VendorClientAllocation.objects.create(
+            vendor=self.internal, client=self.client_a, quantity_limit=10, created_by=self.owner,
+        )
+        allocation_b = VendorClientAllocation.objects.create(
+            vendor=self.internal, client=self.client_b, quantity_limit=10, created_by=self.owner,
+        )
+        VendorSurveyAllocation.objects.create(
+            client_allocation=allocation_a, survey=self.survey_a, quantity_limit=10, created_by=self.owner,
+        )
+        VendorSurveyAllocation.objects.create(
+            client_allocation=allocation_b, survey=self.survey_b, quantity_limit=10, created_by=self.owner,
+        )
+        branch, _, shift = self.create_tree(self.internal, "internal")
+        OrganizationClientAccess.objects.create(
+            organization_unit=branch, client=self.client_a, created_by=self.owner,
+        )
+        employee = get_user_model().objects.create_user("internal-shift-employee")
+        EmployeeProfile.objects.filter(user=employee).update(
+            organization_unit=shift,
+            created_by=self.owner,
+            role=Role.objects.get(slug="employee"),
+        )
+        api = APIClient()
+        api.force_authenticate(employee)
+        response = api.get(reverse("survey-list"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual({row["source_id"] for row in response.data["results"]}, {self.survey_a.source_id})
+
+        unallocated_client = Client.objects.create(code="not-allocated", name="Not Allocated", created_by=self.owner)
+        rejected = self.owner_api.post(reverse("organization-client-access-list"), {
+            "organization_unit": branch.pk,
+            "client": unallocated_client.pk,
+            "is_active": True,
+        }, format="json")
+        self.assertEqual(rejected.status_code, 400)
+
+    def test_existing_tree_cannot_be_reparented_into_a_cycle(self):
+        branch, sub_branch, _ = self.create_tree(self.owner, "cycle")
+        response = self.owner_api.patch(reverse("organization-unit-detail", args=[branch.pk]), {
+            "unit_type": OrganizationUnit.UnitType.SHIFT,
+            "parent": sub_branch.pk,
+        }, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("parent", response.data)
+
+    def test_existing_branch_can_be_corrected_to_sub_branch_under_another_branch(self):
+        destination = OrganizationUnit.objects.create(
+            workspace_owner=self.owner, unit_type=OrganizationUnit.UnitType.BRANCH,
+            name="Destination", code="destination", created_by=self.owner,
+        )
+        mistaken = OrganizationUnit.objects.create(
+            workspace_owner=self.owner, unit_type=OrganizationUnit.UnitType.BRANCH,
+            name="Mistaken Branch", code="mistaken-branch", created_by=self.owner,
+        )
+        response = self.owner_api.patch(reverse("organization-unit-detail", args=[mistaken.pk]), {
+            "unit_type": OrganizationUnit.UnitType.SUB_BRANCH,
+            "parent": destination.pk,
+            "name": "Corrected Sub-branch",
+        }, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        mistaken.refresh_from_db()
+        self.assertEqual(mistaken.unit_type, OrganizationUnit.UnitType.SUB_BRANCH)
+        self.assertEqual(mistaken.parent, destination)
+        self.assertEqual(mistaken.name, "Corrected Sub-branch")
+
+    def test_unused_unit_deletes_and_parent_with_children_returns_conflict(self):
+        unused = OrganizationUnit.objects.create(
+            workspace_owner=self.owner, unit_type=OrganizationUnit.UnitType.BRANCH,
+            name="Unused", code="unused", created_by=self.owner,
+        )
+        deleted = self.owner_api.delete(reverse("organization-unit-detail", args=[unused.pk]))
+        self.assertEqual(deleted.status_code, 204)
+        self.assertFalse(OrganizationUnit.objects.filter(pk=unused.pk).exists())
+
+        branch, _, _ = self.create_tree(self.owner, "protected")
+        protected = self.owner_api.delete(reverse("organization-unit-detail", args=[branch.pk]))
+        self.assertEqual(protected.status_code, 409)
+        self.assertIn("child units", protected.data["detail"])
+
+    def test_client_access_can_be_removed_before_deleting_unit(self):
+        branch = OrganizationUnit.objects.create(
+            workspace_owner=self.owner, unit_type=OrganizationUnit.UnitType.BRANCH,
+            name="Client Branch", code="client-branch", created_by=self.owner,
+        )
+        grant = OrganizationClientAccess.objects.create(
+            organization_unit=branch, client=self.client_a, created_by=self.owner,
+        )
+        blocked = self.owner_api.delete(reverse("organization-unit-detail", args=[branch.pk]))
+        self.assertEqual(blocked.status_code, 409)
+        removed = self.owner_api.delete(reverse("organization-client-access-detail", args=[grant.pk]))
+        self.assertEqual(removed.status_code, 204)
+        self.assertFalse(OrganizationClientAccess.objects.filter(pk=grant.pk).exists())
+        deleted = self.owner_api.delete(reverse("organization-unit-detail", args=[branch.pk]))
+        self.assertEqual(deleted.status_code, 204)
+
+    def test_user_cannot_be_assigned_below_an_inactive_ancestor(self):
+        branch, _, shift = self.create_tree(self.owner, "inactive")
+        branch.is_active = False
+        branch.save(update_fields=["is_active", "updated_at"])
+        response = self.owner_api.post(reverse("access-user-list"), {
+            "first_name": "Blocked", "last_name": "Employee", "email": "blocked@example.test",
+            "password": "password-123", "role": "employee", "account_type": "employee",
+            "organization_unit": shift.pk, "allow_codes": [], "deny_codes": [],
+        }, format="json")
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("organization_unit", response.data)
+
+    def test_external_vendor_cannot_receive_organization_access_by_override(self):
+        external = get_user_model().objects.create_user("organization-external")
+        EmployeeProfile.objects.filter(user=external).update(
+            account_type=EmployeeProfile.AccountType.EXTERNAL_VENDOR,
+            role=Role.objects.get(slug="external-vendor"),
+            created_by=self.owner,
+        )
+        function = AccessFunction.objects.get(code="organization.view")
+        UserFunctionOverride.objects.create(
+            user=external,
+            function=function,
+            effect=UserFunctionOverride.Effect.ALLOW,
+        )
+        external_api = APIClient()
+        external_api.force_authenticate(external)
+        response = external_api.get(reverse("organization-unit-list"))
+        self.assertEqual(response.status_code, 403)
+
+    def test_internal_vendor_organization_options_do_not_expose_unallocated_clients(self):
+        VendorClientAllocation.objects.create(
+            vendor=self.internal,
+            client=self.client_a,
+            quantity_limit=10,
+            created_by=self.owner,
+        )
+        internal_api = APIClient()
+        internal_api.force_authenticate(self.internal)
+        response = internal_api.get(reverse("organization-options"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual({row["id"] for row in response.data["clients"]}, {self.client_a.pk})
+        self.assertEqual(response.data["client_eligibility"][str(self.internal.pk)], [self.client_a.pk])

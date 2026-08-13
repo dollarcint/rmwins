@@ -1,3 +1,5 @@
+/* User Hits hierarchy filters, summaries, pagination and device breakdowns. */
+
 (() => {
   const byId = (id) => document.getElementById(id);
   const columns = new Set(JSON.parse(byId('hitColumnAccess')?.textContent || '[]'));
@@ -9,9 +11,15 @@
     first: byId('hitFirstPage'), prev: byId('hitPrevPage'), next: byId('hitNextPage'), last: byId('hitLastPage'),
     totalHits: byId('totalHitCount'), totalCompletes: byId('totalCompleteCount'), conversion: byId('conversionRate'),
     activeUsers: byId('activeUserCount'), dayCount: byId('hitDayCount'),
+    incidenceRate: byId('hitIncidenceRate'), completeDesktop: byId('hitCompleteDesktop'),
+    completeMobile: byId('hitCompleteMobile'), completeTablet: byId('hitCompleteTablet'),
+    branchFilters: document.querySelector('[data-hit-filter="branch"]'),
+    subBranchFilters: document.querySelector('[data-hit-filter="sub_branch"]'),
+    shiftFilters: document.querySelector('[data-hit-filter="shift"]'),
+    userFilters: document.querySelector('[data-hit-filter="user"]'),
   };
   if (!elements.rows) return;
-  document.querySelector('.user-hits-table').style.minWidth = `${Math.max(520, columnCount * 175)}px`;
+  document.querySelector('.user-hits-table').style.minWidth = `${Math.max(520, columnCount * 145)}px`;
 
   const state = { page: 1, pages: 1, pageSize: 20, timer: null, controller: null };
   const icons = {
@@ -26,7 +34,7 @@
 
   function updateMultiLabel(container) {
     const checked = [...container.querySelectorAll('input:checked')]; const button = container.querySelector('.multi-trigger');
-    const fallback = { branch: 'All branches', sub_branch: 'All sub-branches', user: 'All users' }[container.dataset.hitFilter];
+    const fallback = { branch: 'All branches', sub_branch: 'All sub-branches', shift: 'All shifts', user: 'All users' }[container.dataset.hitFilter];
     button.querySelector('span').textContent = checked.length === 0 ? fallback : checked.length === 1 ? checked[0].closest('label').innerText.trim() : `${checked.length} selected`;
     button.classList.toggle('has-value', checked.length > 0);
   }
@@ -39,14 +47,66 @@
     });
   }
 
+  function applyMenuVisibility(container) {
+    if (!container) return;
+    const needle = container.querySelector('[data-multi-search]')?.value.trim().toLocaleLowerCase() || '';
+    let visibleCount = 0;
+    container.querySelectorAll('.multi-options label').forEach((option) => {
+      const parentMatches = option.dataset.parentHidden !== 'true';
+      const searchMatches = !needle || option.innerText.toLocaleLowerCase().includes(needle);
+      option.hidden = !(parentMatches && searchMatches);
+      if (!option.hidden) visibleCount += 1;
+    });
+    const noResults = container.querySelector('.multi-no-results');
+    if (noResults) noResults.hidden = visibleCount > 0 || Boolean(container.querySelector('.filter-empty'));
+  }
+
+  function setParentVisibility(container, predicate) {
+    if (!container) return;
+    container.querySelectorAll('.multi-options label').forEach((option) => {
+      const matches = predicate(option);
+      option.dataset.parentHidden = String(!matches);
+      const input = option.querySelector('input');
+      if (!matches && input?.checked) input.checked = false;
+    });
+    applyMenuVisibility(container);
+    updateMultiLabel(container);
+  }
+
+  function updateHierarchyOptions() {
+    const branches = new Set(elements.branchFilters ? selectedValues(elements.branchFilters) : []);
+    setParentVisibility(elements.subBranchFilters, (option) => !branches.size || branches.has(option.dataset.branchValue || ''));
+    const subBranches = new Set(elements.subBranchFilters ? selectedValues(elements.subBranchFilters) : []);
+    setParentVisibility(elements.shiftFilters, (option) => (
+      (!branches.size || branches.has(option.dataset.branchValue || ''))
+      && (!subBranches.size || subBranches.has(option.dataset.subBranchValue || ''))
+    ));
+    const shifts = new Set(elements.shiftFilters ? selectedValues(elements.shiftFilters) : []);
+    setParentVisibility(elements.userFilters, (option) => (
+      (!branches.size || branches.has(option.dataset.branchValue || ''))
+      && (!subBranches.size || subBranches.has(option.dataset.subBranchValue || ''))
+      && (!shifts.size || shifts.has(option.dataset.shiftValue || ''))
+    ));
+  }
+
   document.querySelectorAll('.user-hits-filters .multi-select').forEach((container) => {
     const trigger = container.querySelector('.multi-trigger'); const menu = container.querySelector('.multi-menu');
     trigger.addEventListener('click', () => {
       const shouldOpen = !container.classList.contains('open'); closeMultiSelects(container);
       container.classList.toggle('open', shouldOpen); menu.hidden = !shouldOpen; trigger.setAttribute('aria-expanded', String(shouldOpen));
+      if (shouldOpen) window.setTimeout(() => menu.querySelector('[data-multi-search]')?.focus(), 0);
     });
-    menu.addEventListener('change', () => { updateMultiLabel(container); scheduleLoad(); });
+    menu.querySelector('[data-multi-search]')?.addEventListener('input', () => applyMenuVisibility(container));
+    menu.addEventListener('change', (event) => {
+      if (event.target.matches('[data-multi-search]')) return;
+      updateMultiLabel(container);
+      if ([elements.branchFilters, elements.subBranchFilters, elements.shiftFilters].includes(container)) updateHierarchyOptions();
+      scheduleLoad();
+    });
+    updateMultiLabel(container);
+    applyMenuVisibility(container);
   });
+  updateHierarchyOptions();
 
   function filterParams() {
     const params = new URLSearchParams({ page: state.page, page_size: state.pageSize });
@@ -75,6 +135,7 @@
     const cells = [];
     if (columns.has('branch')) cells.push(`<td><strong class="hit-branch">${escapeHtml(row.branch || '—')}</strong></td>`);
     if (columns.has('sub_branch')) cells.push(`<td><span class="hit-sub-branch">${escapeHtml(row.sub_branch || '—')}</span></td>`);
+    if (columns.has('shift')) cells.push(`<td><span class="hit-sub-branch">${escapeHtml(row.shift || '—')}</span></td>`);
     if (columns.has('user')) cells.push(`<td>${userCell(row)}</td>`);
     if (columns.has('date')) cells.push(`<td><time class="hit-date" datetime="${escapeHtml(row.date)}"><strong>${formatDate(row.date)}</strong><span>IST calendar day</span></time></td>`);
     if (columns.has('hits')) cells.push(`<td>${deviceBreakdown(row.hits)}</td>`);
@@ -84,16 +145,25 @@
 
   function cardTemplate(row) {
     if (!columns.size) return '<article class="survey-card user-hit-card"><div class="column-denied">No User Hits columns are assigned to your account.</div></article>';
-    const location = columns.has('branch') || columns.has('sub_branch') ? `<div class="hit-location">${columns.has('branch') ? `<span>${escapeHtml(row.branch)}</span>` : ''}${columns.has('branch') && columns.has('sub_branch') ? '<i>→</i>' : ''}${columns.has('sub_branch') ? `<span>${escapeHtml(row.sub_branch)}</span>` : ''}</div>` : '';
+    const locationParts = [];
+    if (columns.has('branch')) locationParts.push(escapeHtml(row.branch));
+    if (columns.has('sub_branch')) locationParts.push(escapeHtml(row.sub_branch));
+    if (columns.has('shift')) locationParts.push(escapeHtml(row.shift));
+    const location = locationParts.length ? `<div class="hit-location">${locationParts.map((part) => `<span>${part}</span>`).join('<i>→</i>')}</div>` : '';
     const metrics = `${columns.has('hits') ? `<section><label>Hits</label>${deviceBreakdown(row.hits)}</section>` : ''}${columns.has('completes') ? `<section><label>Completes</label>${deviceBreakdown(row.completes)}</section>` : ''}`;
     return `<article class="survey-card user-hit-card"><div class="user-hit-card-head">${columns.has('user') ? userCell(row) : '<div></div>'}${columns.has('date') ? `<time>${formatDate(row.date)}</time>` : ''}</div>${location}${metrics ? `<div class="hit-card-metrics">${metrics}</div>` : ''}</article>`;
   }
 
   function updateOverview(summary) {
-    if (!elements.totalHits) return;
-    elements.totalHits.textContent = number(summary.hits.total); elements.totalCompletes.textContent = number(summary.completes.total);
-    elements.conversion.textContent = `${Number(summary.conversion_rate || 0).toLocaleString('en-IN')}%`;
-    elements.activeUsers.textContent = number(summary.active_users); elements.dayCount.textContent = `${number(summary.days)} selected ${Number(summary.days) === 1 ? 'day' : 'days'}`;
+    if (elements.totalHits) elements.totalHits.textContent = number(summary.hits.total);
+    if (elements.totalCompletes) elements.totalCompletes.textContent = number(summary.completes.total);
+    if (elements.conversion) elements.conversion.textContent = `${Number(summary.conversion_rate || 0).toLocaleString('en-IN')}%`;
+    if (elements.activeUsers) elements.activeUsers.textContent = number(summary.active_users);
+    if (elements.incidenceRate) elements.incidenceRate.textContent = `${Number(summary.incidence_rate || 0).toLocaleString('en-IN')}%`;
+    if (elements.completeDesktop) elements.completeDesktop.textContent = number(summary.completes.desktop);
+    if (elements.completeMobile) elements.completeMobile.textContent = number(summary.completes.mobile);
+    if (elements.completeTablet) elements.completeTablet.textContent = number(summary.completes.tablet);
+    if (elements.dayCount) elements.dayCount.textContent = `${number(summary.days)} selected ${Number(summary.days) === 1 ? 'day' : 'days'}`;
   }
 
   async function loadHits() {
@@ -127,7 +197,12 @@
   elements.pageSize?.addEventListener('change', () => { state.pageSize = Number(elements.pageSize.value); state.page = 1; loadHits(); });
   elements.clear?.addEventListener('click', () => {
     if (elements.search) elements.search.value = ''; if (elements.from) elements.from.value = ''; if (elements.to) elements.to.value = '';
-    document.querySelectorAll('.user-hits-filters .multi-select').forEach((container) => { container.querySelectorAll('input').forEach((input) => { input.checked = false; }); updateMultiLabel(container); });
+    document.querySelectorAll('.user-hits-filters .multi-select').forEach((container) => {
+      container.querySelectorAll('input[type="checkbox"]').forEach((input) => { input.checked = false; });
+      const searchInput = container.querySelector('[data-multi-search]'); if (searchInput) searchInput.value = '';
+      updateMultiLabel(container);
+    });
+    updateHierarchyOptions();
     closeMultiSelects(); state.page = 1; loadHits();
   });
   elements.first?.addEventListener('click', () => go(1)); elements.prev?.addEventListener('click', () => go(state.page - 1));

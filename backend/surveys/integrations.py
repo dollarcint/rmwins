@@ -1,3 +1,5 @@
+"""Dedicated InnovateMR HTTP client used by legacy sync and reconciliation."""
+
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -24,18 +26,10 @@ class PagedSurveyResult:
 
 
 BIOBRAIN_FIELD_MAP = {
-    "surveyId": "SurveyId",
-    "surveyName": "Name",
-    "CPI": "Revenue",
-    "IR": "IncidentRate",
-    "LOI": "LengthOfInterview",
-    "supCmps": "Completes",
-    "entryLink": "SurveyUrl",
-    "isQuota": "Has_Quotas",
-    "isPIIRequired": "CollectPii",
-    "createdDate": "StartDate",
-    "modifiedDate": "LastUpdatedOnUTC",
-    "Language": "LanguageId",
+    "surveyId": "SurveyId", "surveyName": "Name", "CPI": "Revenue", "IR": "IncidentRate",
+    "LOI": "LengthOfInterview", "supCmps": "Completes", "entryLink": "SurveyUrl",
+    "isQuota": "Has_Quotas", "isPIIRequired": "CollectPii", "createdDate": "StartDate",
+    "modifiedDate": "LastUpdatedOnUTC", "Language": "LanguageId",
 }
 
 
@@ -99,8 +93,7 @@ class InnovateMRClient:
         default_header = "EQ-PARTNER-ACCESS-KEY" if self.is_biobrain else "x-access-token"
         header_name = str(self._config("auth_header_name", "") or default_header).strip()
         prefix = str(self._config("auth_header_prefix", "") or "").strip()
-        value = f"{prefix} {self.token}" if prefix else self.token
-        return {header_name: value, "Accept": "application/json"}
+        return {header_name: f"{prefix} {self.token}" if prefix else self.token, "Accept": "application/json"}
 
     def _get(self, endpoint: str, params: dict[str, Any] | None = None) -> Any:
         url = self._url(endpoint)
@@ -114,16 +107,90 @@ class InnovateMRClient:
             raise InnovateMRAPIError(f"{self.provider_code} request failed for {url}: {exc}") from exc
         except (requests.RequestException, ValueError) as exc:
             raise InnovateMRAPIError(f"{self.provider_code} request failed for {url}: {exc}") from exc
-
         if not isinstance(payload, (dict, list)):
             raise InnovateMRAPIError(f"{self.provider_code} returned an invalid JSON payload")
         if isinstance(payload, dict) and self.provider_key == "innovatemr" and payload.get("apiStatus") not in {None, "success"}:
             raise InnovateMRAPIError(f"InnovateMR rejected the request: {payload.get('msg', 'Unexpected response')}")
         if isinstance(payload, dict) and self.is_biobrain and payload.get("hasError") is True:
             messages = payload.get("messages") or []
-            message = "; ".join(str(item) for item in messages) or str(payload.get("error") or "Unexpected response")
-            raise InnovateMRAPIError(f"Bio Brain rejected the request: {message}")
+            raise InnovateMRAPIError(f"Bio Brain rejected the request: {'; '.join(str(item) for item in messages) or str(payload.get('error') or 'Unexpected response')}")
         return payload
+
+    def _post(self, endpoint: str, body: dict[str, Any]) -> Any:
+        url = self._url(endpoint)
+        try:
+            response = self.session.post(
+                url, json=body, headers=self._headers(), timeout=self.timeout
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                raise InnovateMRNotFound(f"{self.provider_code} returned no data for {url}") from exc
+            raise InnovateMRAPIError(f"{self.provider_code} request failed for {url}: {exc}") from exc
+        except (requests.RequestException, ValueError) as exc:
+            raise InnovateMRAPIError(f"{self.provider_code} request failed for {url}: {exc}") from exc
+        if not isinstance(payload, (dict, list)):
+            raise InnovateMRAPIError(f"{self.provider_code} returned an invalid JSON payload")
+        if isinstance(payload, dict) and self.provider_key == "innovatemr" and payload.get("apiStatus") not in {None, "success"}:
+            raise InnovateMRAPIError(f"InnovateMR rejected the request: {payload.get('msg', 'Unexpected response')}")
+        return payload
+
+    def request_json(self, endpoint: str, params: dict[str, Any] | None = None) -> Any:
+        """Execute one server-configured read request for the admin API explorer.
+
+        Authentication is still resolved internally. Callers receive only the
+        provider JSON payload, never request headers or credential values.
+        """
+        return self._get(endpoint, params=params)
+
+    def post_json(self, endpoint: str, body: dict[str, Any]) -> Any:
+        """Execute one allow-listed, non-mutating provider check via POST."""
+        return self._post(endpoint, body)
+
+    def write_json(self, method: str, endpoint: str, body: dict[str, Any] | None = None) -> Any:
+        """Execute an explicitly confirmed provider configuration/profile mutation.
+
+        This method is intentionally separate from the inventory helpers so a
+        caller cannot turn an arbitrary Swagger request into an upstream write.
+        The explorer allow-list and confirmation gate are enforced before this
+        method is reached.
+        """
+        method = str(method or "").upper()
+        if method not in {"POST", "PUT", "DELETE"}:
+            raise InnovateMRAPIError("Unsupported upstream write method")
+        url = self._url(endpoint)
+        try:
+            response = self.session.request(
+                method,
+                url,
+                json=body or {},
+                headers=self._headers(),
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except requests.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code == 404:
+                raise InnovateMRNotFound(f"{self.provider_code} returned no data for {url}") from exc
+            raise InnovateMRAPIError(f"{self.provider_code} request failed for {url}: {exc}") from exc
+        except (requests.RequestException, ValueError) as exc:
+            raise InnovateMRAPIError(f"{self.provider_code} request failed for {url}: {exc}") from exc
+        if not isinstance(payload, (dict, list)):
+            raise InnovateMRAPIError(f"{self.provider_code} returned an invalid JSON payload")
+        if (
+            isinstance(payload, dict)
+            and self.provider_key == "innovatemr"
+            and payload.get("apiStatus") not in {None, "success"}
+        ):
+            raise InnovateMRAPIError(
+                f"InnovateMR rejected the request: {payload.get('msg', 'Unexpected response')}"
+            )
+        return payload
+
+    def endpoint_url(self, endpoint: str) -> str:
+        """Return the non-secret effective URL used for documentation metadata."""
+        return self._url(endpoint)
 
     def _result_list(self, payload: Any, key: str) -> list[dict[str, Any]]:
         result = _path_value(payload, key, []) if isinstance(payload, dict) else payload
@@ -142,11 +209,8 @@ class InnovateMRClient:
             if value is not None:
                 normalized[canonical] = value
         if self.is_biobrain:
-            normalized.setdefault("CPI", item.get("Cpi"))
-            normalized.setdefault("IR", item.get("Ir"))
-            normalized.setdefault("LOI", item.get("Loi"))
-            devices = [name for name, field in (("desktop", "DesktopAllowed"), ("mobile", "MobileAllowed"), ("tablet", "TabletAllowed")) if item.get(field)]
-            normalized["deviceType"] = ", ".join(devices)
+            normalized.setdefault("CPI", item.get("Cpi")); normalized.setdefault("IR", item.get("Ir")); normalized.setdefault("LOI", item.get("Loi"))
+            normalized["deviceType"] = ", ".join(name for name, field in (("desktop", "DesktopAllowed"), ("mobile", "MobileAllowed"), ("tablet", "TabletAllowed")) if item.get(field))
         normalized["_provider_name"] = getattr(getattr(self.integration, "client", None), "name", self.provider_code)
         return normalized
 
@@ -163,47 +227,29 @@ class InnovateMRClient:
         endpoint = self._endpoint("paged_inventory_endpoint", "/supply/getAllocatedSurveysPaged", "")
         if not endpoint:
             return PagedSurveyResult(surveys=[], pages=0)
-        surveys: list[dict[str, Any]] = []
-        next_cursor: str | None = None
-        seen_cursors: set[str] = set()
-        key = str(self._config("inventory_result_key", "") or "result")
+        surveys=[]; next_cursor=None; seen_cursors=set(); key=str(self._config("inventory_result_key", "") or "result")
         for page_number in range(1, self.max_pages + 1):
-            params: dict[str, Any] = {"limit": self.page_size}
-            if next_cursor:
-                params["next"] = next_cursor
-            payload = self._get(endpoint, params=params)
-            surveys.extend(self._normalize_survey(item) for item in self._result_list(payload, key))
-            paging = payload.get("paging") or {} if isinstance(payload, dict) else {}
-            candidate = paging.get("next") if isinstance(paging, dict) else None
-            if not candidate or candidate in seen_cursors:
-                return PagedSurveyResult(surveys=surveys, pages=page_number)
-            seen_cursors.add(candidate)
-            next_cursor = candidate
+            params={"limit": self.page_size}
+            if next_cursor: params["next"] = next_cursor
+            payload=self._get(endpoint, params=params); surveys.extend(self._normalize_survey(item) for item in self._result_list(payload, key))
+            paging=payload.get("paging") or {} if isinstance(payload, dict) else {}; candidate=paging.get("next") if isinstance(paging, dict) else None
+            if not candidate or candidate in seen_cursors: return PagedSurveyResult(surveys=surveys, pages=page_number)
+            seen_cursors.add(candidate); next_cursor=candidate
         raise InnovateMRAPIError(f"Pagination exceeded max pages ({self.max_pages})")
 
     def get_quota_for_survey(self, survey_id: int) -> list[dict[str, Any]]:
-        endpoint = self._endpoint("quota_endpoint_template", "/supply/getQuotaForSurvey/{survey_id}", "")
-        if not endpoint:
-            return []
-        key = str(self._config("quota_result_key", "") or ("Quotas" if self.is_biobrain else "result"))
-        items = self._result_list(self._get(endpoint.format(survey_id=survey_id)), key)
-        if self.is_biobrain:
-            return [{**item, "id": item.get("QuotaId"), "targeting": {"Conditions": item.get("Conditions", [])}} for item in items]
-        return items
+        endpoint=self._endpoint("quota_endpoint_template", "/supply/getQuotaForSurvey/{survey_id}", "")
+        if not endpoint: return []
+        key=str(self._config("quota_result_key", "") or ("Quotas" if self.is_biobrain else "result")); items=self._result_list(self._get(endpoint.format(survey_id=survey_id)), key)
+        return [{**item, "id": item.get("QuotaId"), "targeting": {"Conditions": item.get("Conditions", [])}} for item in items] if self.is_biobrain else items
 
     def get_survey_targeting(self, survey_id: int) -> list[dict[str, Any]]:
-        endpoint = self._endpoint("targeting_endpoint_template", "/supply/getSurveyTargeting/{survey_id}", "")
-        if not endpoint:
-            return []
-        key = str(self._config("targeting_result_key", "") or ("Qualifications" if self.is_biobrain else "result"))
-        items = self._result_list(self._get(endpoint.format(survey_id=survey_id)), key)
-        if self.is_biobrain:
-            return [{**item, "QuestionId": item.get("QualificationId"), "QuestionKey": str(item.get("QualificationId") or ""), "QuestionType": str(item.get("QualificationTypeId") or ""), "Options": item.get("OptionIds", [])} for item in items]
-        return items
+        endpoint=self._endpoint("targeting_endpoint_template", "/supply/getSurveyTargeting/{survey_id}", "")
+        if not endpoint: return []
+        key=str(self._config("targeting_result_key", "") or ("Qualifications" if self.is_biobrain else "result")); items=self._result_list(self._get(endpoint.format(survey_id=survey_id)), key)
+        return [{**item, "QuestionId": item.get("QualificationId"), "QuestionKey": str(item.get("QualificationId") or ""), "QuestionType": str(item.get("QualificationTypeId") or ""), "Options": item.get("OptionIds", [])} for item in items] if self.is_biobrain else items
 
     def get_survey_transactions_by_pid(self, survey_id: int, pid: str) -> list[dict[str, Any]]:
-        endpoint = self._endpoint("transaction_endpoint_template", "/supply/getSurveyTransactionsByCond/{survey_id}/{pid}", "")
-        if not endpoint:
-            return []
-        key = str(self._config("transaction_result_key", "") or "result")
-        return self._result_list(self._get(endpoint.format(survey_id=survey_id, pid=pid)), key)
+        endpoint=self._endpoint("transaction_endpoint_template", "/supply/getSurveyTransactionsByCond/{survey_id}/{pid}", "")
+        if not endpoint: return []
+        return self._result_list(self._get(endpoint.format(survey_id=survey_id, pid=pid)), str(self._config("transaction_result_key", "") or "result"))

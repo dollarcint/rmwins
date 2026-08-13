@@ -1,3 +1,5 @@
+"""Provider-neutral respondent identifiers, audit capture and redirect helpers."""
+
 import secrets
 import string
 import re
@@ -11,6 +13,7 @@ from .models import Survey, SurveyAttempt
 
 
 RID_ALPHABET = string.ascii_letters + string.digits
+PRESCREENER_UID_ALPHABET = string.ascii_letters + string.digits
 
 
 def generate_rid() -> str:
@@ -25,7 +28,43 @@ def generate_rid() -> str:
     return "".join(characters)
 
 
+def generate_prescreener_uid() -> str:
+    """Generate 16 mixed alphanumeric characters rendered in four groups."""
+    characters = [
+        secrets.choice(string.ascii_uppercase),
+        secrets.choice(string.ascii_lowercase),
+        secrets.choice(string.digits),
+        *(secrets.choice(PRESCREENER_UID_ALPHABET) for _ in range(13)),
+    ]
+    secrets.SystemRandom().shuffle(characters)
+    compact = "".join(characters)
+    return "-".join(compact[index:index + 4] for index in range(0, 16, 4))
+
+
+def ensure_attempt_prescreener_uid(attempt: SurveyAttempt) -> str:
+    """Allocate one stable vault UID for an attempt, including legacy attempts."""
+    if attempt.prescreener_uid:
+        return attempt.prescreener_uid
+    for _ in range(10):
+        candidate = generate_prescreener_uid()
+        try:
+            updated = SurveyAttempt.objects.filter(
+                pk=attempt.pk, prescreener_uid__isnull=True
+            ).update(prescreener_uid=candidate)
+        except IntegrityError:
+            continue
+        if updated:
+            attempt.prescreener_uid = candidate
+            return candidate
+        attempt.refresh_from_db(fields=["prescreener_uid"])
+        if attempt.prescreener_uid:
+            return attempt.prescreener_uid
+    raise RuntimeError("Could not allocate a unique prescreener UID")
+
+
 def normalize_client_ip(value) -> str | None:
+    """Return a syntactically valid non-loopback/non-unspecified IP or ``None``."""
+
     if not value:
         return None
     try:
@@ -54,11 +93,15 @@ def get_request_ip(request) -> str | None:
 
 
 def supplier_code_from_entry_link(entry_link: str) -> str:
+    """Snapshot the real provider supplier code embedded in an allocated link."""
+
     query = dict(parse_qsl(urlsplit(entry_link).query, keep_blank_values=True))
     return str(query.get("supCode") or query.get("supplierCode") or "")
 
 
 def _versioned_match(user_agent: str, patterns: list[tuple[str, str]]) -> str:
+    """Return the first named user-agent pattern and its normalized version."""
+
     for name, pattern in patterns:
         match = re.search(pattern, user_agent, re.IGNORECASE)
         if match:
@@ -148,16 +191,27 @@ def backfill_attempt_entry_audit(attempt: SurveyAttempt, request) -> SurveyAttem
 
 
 def create_attempt(survey: Survey, platform_user, ip_address: str | None, client_data: dict | None = None) -> SurveyAttempt:
+    """Create one immutable respondent journey with fresh RID/UID and CPI audit.
+
+    The transaction makes identifier allocation and the historical attempt
+    snapshots one unit. Database uniqueness is the final collision guard.
+    """
+
     client_data = client_data or {}
     for _ in range(10):
         try:
             with transaction.atomic():
                 return SurveyAttempt.objects.create(
                     rid=generate_rid(),
+                    prescreener_uid=generate_prescreener_uid(),
                     survey=survey,
                     platform_user=platform_user,
                     user_id=str(platform_user.pk),
                     supplier_code=supplier_code_from_entry_link(survey.entry_link),
+                    source_cpi_snapshot=survey.cpi,
+                    cpi_snapshot_source="captured",
+                    payable_cpi_snapshot=survey.cpi,
+                    cpi_currency_snapshot="USD",
                     initiation_ip=ip_address,
                     entry_user_agent=client_data.get("user_agent", ""),
                     entry_browser=client_data.get("browser", ""),
@@ -203,7 +257,15 @@ def build_outbound_url(entry_link: str, rid: str, answers: dict) -> str:
 
 
 def status_rid_from_request(request) -> str:
-    for name in ("rid", "RID", "pid", "PID", "qsid", "QSID", "trackId"):
+    """Read a callback tracking identifier, preferring the platform RID alias.
+
+    Some providers echo our canonical RID as ``tid``/``trackId`` while their
+    field named ``rid`` contains our persistent prescreener UID.  Callers must
+    resolve the returned value against both model fields and then display the
+    matched attempt's canonical ``SurveyAttempt.rid``.
+    """
+
+    for name in ("tid", "TID", "trackId", "rid", "RID", "pid", "PID", "qsid", "QSID"):
         value = request.GET.get(name)
         if value:
             return value.strip()

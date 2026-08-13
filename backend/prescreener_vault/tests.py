@@ -1,0 +1,267 @@
+import re
+import zipfile
+from datetime import datetime, timezone as dt_timezone
+from io import BytesIO
+from io import StringIO
+from unittest.mock import patch
+
+from django.contrib.auth import get_user_model
+from django.core.cache import cache
+from django.core.management import call_command
+from django.test import TestCase, override_settings
+from django.urls import reverse
+from django.utils import timezone
+from xml.etree import ElementTree
+
+from surveys.models import Survey, SurveyAttempt, TargetingQuestion
+from surveys.survey_flow import create_attempt
+
+from .constants import DATABASE_ALIAS
+from .models import PrescreenerAnswer, PrescreenerSubmission
+from .cache import cached_profile, invalidate_vault_cache, vault_filter_options, vault_filtered_summary
+from .services import _age_from_value, _canonical_attribute, increment_profile_usage
+from .services import PrescreenerVaultError
+
+
+@override_settings(PRESCREENER_VAULT_ENABLED=True)
+class PrescreenerVaultFlowTests(TestCase):
+    databases = {"default", DATABASE_ALIAS}
+
+    def setUp(self):
+        cache.clear()
+        self.user = get_user_model().objects.create_user(
+            username="vault-user",
+            first_name="Vault",
+            last_name="User",
+            email="vault@example.test",
+        )
+        self.survey = Survey.objects.create(
+            source_id=801122,
+            name="US profile survey",
+            status=Survey.Status.LIVE,
+            company_name="Example client",
+            country="United States",
+            country_code="US",
+            language="English",
+            language_code="EN",
+            entry_link="https://provider.example/start?PID=[%%pid%%]",
+        )
+        self.age = TargetingQuestion.objects.create(
+            survey=self.survey,
+            question_id=1,
+            key="AGE",
+            text="What is your age?",
+            question_type="Numeric",
+            category="Demographic",
+        )
+        self.gender = TargetingQuestion.objects.create(
+            survey=self.survey,
+            question_id=2,
+            key="GENDER",
+            text="What is your gender?",
+            question_type="Single Punch",
+            category="Demographic",
+            options=[
+                {"OptionId": 1, "OptionText": "Male"},
+                {"OptionId": 2, "OptionText": "Female"},
+            ],
+        )
+
+    def _attempt(self):
+        return create_attempt(self.survey, self.user, "8.8.8.8")
+
+    def _submit(self, attempt, age="24", gender="1"):
+        return self.client.post(reverse("survey-start"), {
+            "rid": attempt.rid,
+            f"question_{self.age.pk}": age,
+            f"question_{self.gender.pk}": gender,
+        })
+
+    def test_valid_submission_is_saved_only_in_vault_with_profile_snapshots(self):
+        attempt = self._attempt()
+        response = self._submit(attempt)
+        self.assertEqual(response.status_code, 302)
+
+        attempt.refresh_from_db()
+        self.assertRegex(attempt.prescreener_uid, r"^[A-Za-z0-9]{4}(?:-[A-Za-z0-9]{4}){3}$")
+        self.assertNotEqual(attempt.prescreener_uid.replace("-", "")[:10], attempt.rid)
+        self.assertEqual(attempt.answers, {})
+
+        submission = PrescreenerSubmission.objects.using(DATABASE_ALIAS).get(uid=attempt.prescreener_uid)
+        self.assertEqual(submission.rid, attempt.rid)
+        self.assertEqual(submission.country_code, "US")
+        self.assertEqual(submission.language_code, "EN")
+        self.assertEqual(submission.respondent_age, 24)
+        self.assertEqual(submission.respondent_age_group, "18-24")
+        self.assertEqual(submission.respondent_gender, "male")
+        self.assertEqual(submission.answer_count, 2)
+        self.assertEqual(submission.usage_count, 1)
+        self.assertEqual(increment_profile_usage(submission.uid), 2)
+        submission.refresh_from_db(using=DATABASE_ALIAS)
+        self.assertEqual(submission.usage_count, 2)
+        gender = PrescreenerAnswer.objects.using(DATABASE_ALIAS).get(
+            submission=submission, question_key="GENDER"
+        )
+        self.assertEqual(gender.question_text, "What is your gender?")
+        self.assertEqual(gender.answer_values, ["1"])
+        self.assertEqual(gender.answer_labels, ["Male"])
+        self.assertEqual(gender.upstream_values, ["1"])
+
+    def test_same_profile_answers_on_new_links_create_distinct_uid_rows(self):
+        first = self._attempt()
+        second = self._attempt()
+        self.assertEqual(self._submit(first).status_code, 302)
+        self.assertEqual(self._submit(second).status_code, 302)
+        first.refresh_from_db()
+        second.refresh_from_db()
+        self.assertNotEqual(first.rid, second.rid)
+        self.assertNotEqual(first.prescreener_uid, second.prescreener_uid)
+        self.assertEqual(PrescreenerSubmission.objects.using(DATABASE_ALIAS).count(), 2)
+
+    def test_vault_metadata_and_profile_cache_invalidate_after_write(self):
+        self.assertEqual(vault_filter_options()["countries"], [])
+        self.assertEqual(vault_filtered_summary({})["total"], 0)
+
+        attempt = self._attempt()
+        with self.captureOnCommitCallbacks(using=DATABASE_ALIAS, execute=True):
+            self.assertEqual(self._submit(attempt).status_code, 302)
+        attempt.refresh_from_db()
+
+        self.assertEqual(vault_filtered_summary({})["total"], 1)
+        self.assertEqual(vault_filter_options()["countries"][0]["country_code"], "US")
+        profile = cached_profile(attempt.prescreener_uid)
+        self.assertEqual(profile["uid"], attempt.prescreener_uid)
+        self.assertEqual(profile["respondent_age"], 24)
+
+        invalidate_vault_cache()
+        self.assertEqual(cached_profile(attempt.prescreener_uid)["usage_count"], 1)
+
+    def test_admin_can_filter_and_expand_prescreened_data_page(self):
+        attempt = self._attempt()
+        self.assertEqual(self._submit(attempt, age="24", gender="1").status_code, 302)
+        admin = get_user_model().objects.create_superuser(
+            username="vault-admin", email="vault-admin@example.test", password="test-password"
+        )
+        self.client.force_login(admin)
+        response = self.client.get(reverse("prescreened-data"), {
+            "country": "US", "age_group": "18-24", "gender": "male",
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Panelist Data")
+        self.assertContains(response, "Country / Language")
+        self.assertContains(response, "Profile Specs")
+        self.assertContains(response, "Registered at")
+        self.assertContains(response, "Visits")
+        self.assertContains(response, "Profile Information")
+        self.assertContains(response, "Profile details")
+        self.assertNotContains(response, attempt.rid)
+        self.assertContains(response, "What is your age?")
+        self.assertContains(response, "Male")
+        self.assertContains(response, "All countries")
+        self.assertContains(response, "vault-answer-drawer")
+        self.assertNotContains(response, "<details")
+
+        rid_search = self.client.get(reverse("prescreened-data"), {
+            "search": attempt.rid,
+        })
+        self.assertContains(rid_search, "No profiles available")
+        uid_search = self.client.get(reverse("prescreened-data"), {
+            "search": PrescreenerSubmission.objects.using(DATABASE_ALIAS).get(
+                rid=attempt.rid
+            ).uid,
+        })
+        self.assertContains(uid_search, "Profile details")
+
+        exported = self.client.get(reverse("prescreened-data-export"), {
+            "country": "US", "age_group": "18-24", "gender": "male",
+        })
+        self.assertEqual(exported.status_code, 200)
+        self.assertIn(".xlsx", exported["Content-Disposition"])
+        content = b"".join(exported.streaming_content)
+        with zipfile.ZipFile(BytesIO(content)) as workbook:
+            self.assertIn("xl/worksheets/sheet2.xml", workbook.namelist())
+            submissions = ElementTree.fromstring(workbook.read("xl/worksheets/sheet1.xml"))
+            answers = ElementTree.fromstring(workbook.read("xl/worksheets/sheet2.xml"))
+        submission_text = " ".join(submissions.itertext())
+        answer_text = " ".join(answers.itertext())
+        self.assertIn(attempt.rid, submission_text)
+        self.assertNotIn("Answer count", submission_text)
+        self.assertIn("Visits", submission_text)
+        self.assertIn("What is your age?", answer_text)
+        self.assertIn("Male", answer_text)
+
+    def test_rfg_birthday_alias_and_display_date_are_normalized_to_age(self):
+        submitted_at = datetime(2026, 8, 13, 12, tzinfo=dt_timezone.utc)
+        self.assertEqual(
+            _canonical_attribute("RFG_BIRTHDAY", "What is your date of birth?"),
+            "date_of_birth",
+        )
+        self.assertEqual(_age_from_value("13-08-2001", submitted_at), 25)
+        self.assertEqual(_age_from_value("2001-08-13", submitted_at), 25)
+
+    def test_repair_command_permanently_rebuilds_old_rfg_profile_specs(self):
+        submission = PrescreenerSubmission.objects.using(DATABASE_ALIAS).create(
+            uid="OldR-FG00-Prof-0001",
+            rid="OldRfg1234",
+            country="United States",
+            country_code="US",
+            language="English",
+            language_code="EN",
+            submitted_at=timezone.now(),
+        )
+        answer = PrescreenerAnswer.objects.using(DATABASE_ALIAS).create(
+            submission=submission,
+            position=1,
+            question_key="RFG_BIRTHDAY",
+            question_text="What is your date of birth?",
+            answer_values=["13-08-2001"],
+        )
+
+        call_command("repair_panelist_profiles", stdout=StringIO())
+
+        submission.refresh_from_db(using=DATABASE_ALIAS)
+        answer.refresh_from_db(using=DATABASE_ALIAS)
+        self.assertEqual(answer.canonical_attribute, "date_of_birth")
+        self.assertIsNotNone(submission.respondent_age)
+        self.assertTrue(submission.respondent_age_group)
+
+    def test_vault_failure_does_not_redirect_or_lose_the_retry(self):
+        attempt = self._attempt()
+        with patch(
+            "surveys.views.capture_prescreener_submission",
+            side_effect=PrescreenerVaultError("database unavailable"),
+        ):
+            response = self._submit(attempt)
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Secure prescreener storage is temporarily unavailable")
+        attempt.refresh_from_db()
+        self.assertEqual(attempt.status, SurveyAttempt.Status.INITIATED)
+        self.assertEqual(attempt.answers, {})
+
+    def test_backfill_can_verify_then_clear_existing_operational_answers(self):
+        attempt = SurveyAttempt.objects.create(
+            rid="Abc123Xyz9",
+            survey=self.survey,
+            platform_user=self.user,
+            user_id=str(self.user.pk),
+            answers={
+                str(self.gender.pk): {
+                    "question_id": self.gender.question_id,
+                    "question_key": self.gender.key,
+                    "question_text": self.gender.text,
+                    "values": ["2"],
+                    "upstream_values": ["2"],
+                }
+            },
+        )
+        output = StringIO()
+        call_command("backfill_prescreener_vault", "--clear-source", stdout=output)
+        attempt.refresh_from_db()
+        self.assertTrue(re.fullmatch(r"[A-Za-z0-9]{4}(?:-[A-Za-z0-9]{4}){3}", attempt.prescreener_uid))
+        self.assertEqual(attempt.answers, {})
+        self.assertTrue(
+            PrescreenerSubmission.objects.using(DATABASE_ALIAS).filter(
+                uid=attempt.prescreener_uid, rid=attempt.rid
+            ).exists()
+        )
+        self.assertIn("failed=0", output.getvalue())

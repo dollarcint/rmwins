@@ -1,9 +1,12 @@
+/* Projects inventory filters, pagination, cards/table and survey-detail drawer. */
+
 (() => {
   const $ = (id) => document.getElementById(id);
   if (!$('surveyRows')) return;
   const projectColumns = new Set(JSON.parse($('projectColumnAccess')?.textContent || '[]'));
+  const canOpenProjectStudies = JSON.parse($('projectStudyLinkAccess')?.textContent || 'false');
   const visibleColumnCount = Math.max(1, projectColumns.size);
-  document.querySelector('.survey-table').style.minWidth = `${Math.max(520, visibleColumnCount * 135)}px`;
+  document.querySelector('.survey-table').style.minWidth = `${Math.max(620, visibleColumnCount * 112)}px`;
 
   const state = {
     page: 1,
@@ -36,7 +39,10 @@
   const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[char]));
   const formatDate = (value) => value ? new Intl.DateTimeFormat('en-IN', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value)) : '—';
   const money = (value) => value == null ? '—' : `$${Number(value).toFixed(2)}`;
-  const filterDefaults = { country: 'All countries', status: 'All statuses', company: 'All clients', client_name: 'All clients' };
+  const filterDefaults = {
+    country: 'All countries', status: 'All statuses', company: 'All clients', client_name: 'All clients',
+    buyer_id: 'All buyer IDs', survey_type: 'All survey types',
+  };
   els.multiSelects.forEach((filter) => {
     if (filter.dataset.defaultLabel) filterDefaults[filter.dataset.multiFilter] = filter.dataset.defaultLabel;
   });
@@ -63,6 +69,7 @@
   }
 
   function selectedValues(filter) {
+    if (!filter) return [];
     return [...filter.querySelectorAll('input:checked')].map((input) => input.value);
   }
 
@@ -74,6 +81,27 @@
     else if (values.length === 1) label.textContent = values[0];
     else label.textContent = `${values.length} selected`;
     filter.querySelector('.multi-trigger').classList.toggle('has-value', values.length > 0);
+  }
+
+  const clientFilter = els.multiSelects.find((filter) => ['company', 'client_name'].includes(filter.dataset.multiFilter));
+  const buyerFilter = els.multiSelects.find((filter) => filter.dataset.multiFilter === 'buyer_id');
+
+  function updateBuyerOptions() {
+    if (!buyerFilter) return;
+    const selectedClients = new Set(selectedValues(clientFilter));
+    const searchTerm = buyerFilter.querySelector('[data-multi-search]')?.value.trim().toLocaleLowerCase() || '';
+    let visible = 0;
+    buyerFilter.querySelectorAll('.multi-options label').forEach((option) => {
+      const clientMatches = !selectedClients.size || selectedClients.has(option.dataset.clientValue || '');
+      const searchMatches = !searchTerm || option.textContent.toLocaleLowerCase().includes(searchTerm);
+      option.hidden = !(clientMatches && searchMatches);
+      const input = option.querySelector('input');
+      if (!clientMatches && input?.checked) input.checked = false;
+      if (!option.hidden) visible += 1;
+    });
+    const noResults = buyerFilter.querySelector('.multi-no-results');
+    if (noResults) noResults.hidden = visible > 0;
+    updateMultiLabel(buyerFilter);
   }
 
   function closeMultiSelects(except = null) {
@@ -98,7 +126,11 @@
       menu.hidden = !willOpen;
     });
     menu.addEventListener('click', (event) => event.stopPropagation());
-    menu.addEventListener('change', () => { updateMultiLabel(filter); scheduleLoad(); });
+    menu.addEventListener('change', () => {
+      updateMultiLabel(filter);
+      if (filter === clientFilter) updateBuyerOptions();
+      scheduleLoad();
+    });
     const search = menu.querySelector('[data-multi-search]');
     search?.addEventListener('input', () => {
       const term = search.value.trim().toLocaleLowerCase();
@@ -106,14 +138,17 @@
       let visible = 0;
       options.forEach((option) => {
         const matches = option.textContent.toLocaleLowerCase().includes(term);
-        option.classList.toggle('multi-option-hidden', !matches);
-        if (matches) visible += 1;
+        const selectedClients = filter === buyerFilter ? selectedValues(clientFilter) : [];
+        const clientMatches = filter !== buyerFilter || !selectedClients.length || selectedClients.includes(option.dataset.clientValue || '');
+        option.hidden = !(matches && clientMatches);
+        if (!option.hidden) visible += 1;
       });
       const noResults = menu.querySelector('.multi-no-results');
       if (noResults) noResults.hidden = visible > 0;
     });
     updateMultiLabel(filter);
   });
+  updateBuyerOptions();
 
   function selectedOrdering() {
     return els.orderingInputs.find((input) => input.checked) || null;
@@ -219,21 +254,24 @@
     return `${date}T${clock}:${seconds}+05:30`;
   }
 
-  async function loadSurveys() {
+  async function loadSurveys({ silent = false } = {}) {
     state.controller?.abort();
     state.controller = new AbortController();
-    els.rows.innerHTML = `<tr><td colspan="${visibleColumnCount}"><div class="table-loader"><i></i><span>Fetching survey inventory…</span></div></td></tr>`;
-    els.cards.innerHTML = '<div class="mobile-loading">Fetching surveys…</div>';
+    if (!silent) {
+      els.rows.innerHTML = `<tr><td colspan="${visibleColumnCount}"><div class="table-loader"><i></i><span>Fetching survey inventory…</span></div></td></tr>`;
+      els.cards.innerHTML = '<div class="mobile-loading">Fetching surveys…</div>';
+    }
     try {
       const response = await fetch(`/api/v1/surveys/?${queryString()}`, { signal: state.controller.signal });
       if (!response.ok) throw new Error(`Request failed (${response.status})`);
       const data = await response.json();
       state.results = data.results || [];
       state.pages = Math.max(1, Math.ceil(data.count / state.pageSize));
-      if (state.page > state.pages) { state.page = state.pages; return loadSurveys(); }
+      if (state.page > state.pages) { state.page = state.pages; return loadSurveys({ silent }); }
       render(data.count);
     } catch (error) {
       if (error.name === 'AbortError') return;
+      if (silent) return;
       els.rows.innerHTML = `<tr><td colspan="${visibleColumnCount}"><div class="error-state"><strong>Could not load surveys</strong><span>${escapeHtml(error.message)}</span><button id="retryLoad">Try again</button></div></td></tr>`;
       els.cards.innerHTML = '';
       $('retryLoad')?.addEventListener('click', loadSurveys);
@@ -261,12 +299,14 @@
   function rowTemplate(survey) {
     const percent = Math.min(100, Number(survey.progress_percent || 0));
     const cells = [];
-    if (projectColumns.has('project_id')) cells.push(`<td><button class="id-link" data-copy="${escapeHtml(survey.local_id)}" title="Copy Project ID">${escapeHtml(survey.local_id)}</button></td>`);
-    if (projectColumns.has('survey')) cells.push(`<td><div class="survey-name"><strong>${escapeHtml(survey.name || 'Untitled survey')}</strong><span>${escapeHtml(survey.display_company_name || survey.company_name || 'InnovateMR')}</span></div></td>`);
+    const clientName = survey.client_name || survey.display_company_name || survey.company_name || 'Survey client';
+    const studyUrl = `/traffic-reports/?internal_id=${encodeURIComponent(survey.local_id)}`;
+    if (projectColumns.has('project_id')) cells.push(`<td><div class="project-id-stack">${canOpenProjectStudies ? `<a class="id-link project-study-link" href="${studyUrl}" title="View this project's traffic reports">${escapeHtml(survey.local_id)}</a>` : `<strong class="id-link">${escapeHtml(survey.local_id)}</strong>`}<small>${escapeHtml(clientName)}</small></div></td>`);
+    if (projectColumns.has('survey')) cells.push(`<td><div class="survey-name"><strong>${escapeHtml(survey.source_id ?? '—')}</strong><span>${survey.buyer_id ? escapeHtml(survey.buyer_id) : 'Buyer ID unavailable'}</span></div></td>`);
     if (projectColumns.has('market')) cells.push(`<td><span class="market-pill">${escapeHtml(survey.country_code || '—')} <i>${escapeHtml(survey.language_code || '')}</i></span><small class="country-name">${escapeHtml(survey.country || '')}</small></td>`);
     if (projectColumns.has('completes')) cells.push(`<td><div class="complete-value"><strong>${survey.completes.toLocaleString()} / ${survey.sample_size.toLocaleString()}</strong><span><i style="width:${percent}%"></i></span></div></td>`);
     if (projectColumns.has('cpi')) cells.push(`<td><strong class="cpi">${money(survey.cpi)}</strong></td>`);
-    if (projectColumns.has('loi_ir')) cells.push(`<td><div class="metric-pair"><span><b>${survey.loi ?? '—'}</b> min</span><span><b>${survey.incidence_rate ?? '—'}</b>%</span></div></td>`);
+    if (projectColumns.has('loi_ir')) cells.push(`<td><div class="metric-pair"><span><b>${survey.loi ?? '—'}</b> min</span><span><b>${survey.incidence_rate ?? '—'}</b>%</span></div><small class="survey-type-tag">${escapeHtml(survey.survey_type || survey.group_type || 'Type unavailable')}</small></td>`);
     if (projectColumns.has('entry_link')) cells.push(`<td><button class="copy-link" data-copy-link="${escapeHtml(survey.start_link)}">Copy link</button></td>`);
     if (projectColumns.has('modified')) cells.push(`<td><div class="source-timestamp">${sourceTimestamp(survey.source_modified_display, survey.source_modified_at)}</div><small class="created-date">Created ${escapeHtml(survey.source_created_display || formatDate(survey.source_created_at))}</small><small class="status ${survey.status}"><i></i>${escapeHtml(survey.status)}</small></td>`);
     if (projectColumns.has('actions')) cells.push(`<td><button class="eye-button" data-action="${escapeHtml(survey.local_id)}" aria-label="View details for ${escapeHtml(survey.name)}">◉</button></td>`);
@@ -275,14 +315,16 @@
 
   function cardTemplate(survey) {
     if (!projectColumns.size) return '<article class="survey-card"><div class="column-denied">No project columns are assigned to your account.</div></article>';
-    const top = `${projectColumns.has('project_id') ? `<button class="id-link" data-copy="${escapeHtml(survey.local_id)}">${escapeHtml(survey.local_id)}</button>` : ''}${projectColumns.has('modified') ? `<span class="status ${survey.status}"><i></i>${escapeHtml(survey.status)}</span>` : ''}`;
+    const clientName = survey.client_name || survey.display_company_name || survey.company_name || 'Survey client';
+    const studyUrl = `/traffic-reports/?internal_id=${encodeURIComponent(survey.local_id)}`;
+    const top = `${projectColumns.has('project_id') ? `${canOpenProjectStudies ? `<a class="id-link project-study-link" href="${studyUrl}">${escapeHtml(survey.local_id)}</a>` : `<strong class="id-link">${escapeHtml(survey.local_id)}</strong>`}<small class="project-card-client">${escapeHtml(clientName)}</small>` : ''}${projectColumns.has('modified') ? `<span class="status ${survey.status}"><i></i>${escapeHtml(survey.status)}</span>` : ''}`;
     const metrics = [];
     if (projectColumns.has('market')) metrics.push(`<span><small>Market</small><b>${escapeHtml(survey.country_code || '—')} ${escapeHtml(survey.language_code || '')}</b></span>`);
     if (projectColumns.has('completes')) metrics.push(`<span><small>Completes</small><b>${survey.completes} / ${survey.sample_size}</b></span>`);
     if (projectColumns.has('cpi')) metrics.push(`<span><small>CPI</small><b>${money(survey.cpi)}</b></span>`);
-    if (projectColumns.has('loi_ir')) metrics.push(`<span><small>LOI / IR</small><b>${survey.loi ?? '—'}m · ${survey.incidence_rate ?? '—'}%</b></span>`);
+    if (projectColumns.has('loi_ir')) metrics.push(`<span><small>LOI / IR · Type</small><b>${survey.loi ?? '—'}m · ${survey.incidence_rate ?? '—'}% · ${escapeHtml(survey.survey_type || survey.group_type || '—')}</b></span>`);
     const bottom = `${projectColumns.has('modified') ? `<div class="source-timestamp"><small>Updated</small>${sourceTimestamp(survey.source_modified_display, survey.source_modified_at)}</div>` : ''}${projectColumns.has('entry_link') ? `<button class="copy-link" data-copy-link="${escapeHtml(survey.start_link)}">Copy link</button>` : ''}`;
-    return `<article class="survey-card"><div class="card-top"><div>${top}</div>${projectColumns.has('actions') ? `<button class="eye-button" data-action="${escapeHtml(survey.local_id)}" aria-label="View survey details">◉</button>` : ''}</div>${projectColumns.has('survey') ? `<h3>${escapeHtml(survey.name || 'Untitled survey')}</h3><p>${escapeHtml(survey.display_company_name || survey.company_name || 'InnovateMR')} · IMR #${escapeHtml(survey.source_id)}</p>` : ''}${metrics.length ? `<div class="card-grid">${metrics.join('')}</div>` : ''}${bottom ? `<div class="card-bottom">${bottom}</div>` : ''}</article>`;
+    return `<article class="survey-card"><div class="card-top"><div>${top}</div>${projectColumns.has('actions') ? `<button class="eye-button" data-action="${escapeHtml(survey.local_id)}" aria-label="View survey details">◉</button>` : ''}</div>${projectColumns.has('survey') ? `<h3>${escapeHtml(survey.source_id ?? '—')}</h3><p>${survey.buyer_id ? escapeHtml(survey.buyer_id) : 'Buyer ID unavailable'}</p>` : ''}${metrics.length ? `<div class="card-grid">${metrics.join('')}</div>` : ''}${bottom ? `<div class="card-bottom">${bottom}</div>` : ''}</article>`;
   }
 
   function scheduleLoad() {
@@ -304,6 +346,7 @@
       if (search) { search.value = ''; search.dispatchEvent(new Event('input')); }
       updateMultiLabel(filter);
     });
+    updateBuyerOptions();
     resetCpiControl();
     closeMultiSelects(); closeCpiFilter(); state.page = 1; loadSurveys();
   });
@@ -398,18 +441,19 @@
 
   function renderQuotas(items) {
     if (!items.length) return '<div class="detail-empty"><div class="detail-empty-visual" aria-hidden="true"><span></span><span></span><span></span><i>✓</i></div><strong>No quota data</strong><p>This survey currently has no quota definitions.</p></div>';
-    return `<div class="detail-list">${items.map((quota, index) => `<article class="quota-item"><div class="detail-index">${String(index + 1).padStart(2, '0')}</div><div class="detail-main"><div class="detail-title"><strong>${escapeHtml(quota.name || quota.title || `Quota ${quota.quota_id || index + 1}`)}</strong><span class="quota-status">${escapeHtml(quota.status || 'Unknown')}</span></div><div class="quota-stats"><span><small>Target</small><b>${quota.sample_size}</b></span><span><small>Completed</small><b>${quota.completes}</b></span><span><small>Remaining</small><b>${quota.remaining}</b></span></div>${targetingBlocks(quota.targeting)}</div></article>`).join('')}</div>`;
+    return `<div class="quota-help"><strong>How to read this</strong><span>Remaining capacity is shown from the provider response. Target and completed totals appear only when the provider supplies them.</span></div><div class="detail-list">${items.map((quota, index) => `<article class="quota-item"><div class="detail-index">${String(index + 1).padStart(2, '0')}</div><div class="detail-main"><div class="detail-title"><div><strong>${escapeHtml(quota.name || quota.title || `Quota ${quota.quota_id || index + 1}`)}</strong><small class="quota-scope">${escapeHtml(quota.scope_label || 'Quota scope')} · limited by ${escapeHtml(quota.limit_type || 'Completes')}</small></div><span class="quota-status quota-status-${escapeHtml(String(quota.status || 'unknown').toLowerCase())}">${escapeHtml(quota.status || 'Unknown')}</span></div><div class="quota-stats"><span><small>Target</small><b>${quota.target_known ? escapeHtml(quota.sample_size) : '<em>Not provided</em>'}</b></span><span><small>Completed</small><b>${quota.completed_known ? escapeHtml(quota.completes) : '<em>Not provided</em>'}</b></span><span><small>Remaining</small><b>${escapeHtml(quota.remaining)}</b></span></div>${quotaTargeting(quota.targeting_details)}</div></article>`).join('')}</div>`;
   }
 
-  function targetingBlocks(targeting) {
-    const entries = Object.entries(targeting || {});
-    if (!entries.length) return '';
-    return `<div class="answer-chips">${entries.map(([key, options]) => `<div><label>${escapeHtml(key)}</label><span>${(options || []).map((option) => escapeHtml(option.OptionText || (option.ageStart != null ? `${option.ageStart}–${option.ageEnd}` : option.OptionId))).join(', ') || '—'}</span></div>`).join('')}</div>`;
+  function quotaTargeting(details) {
+    if (!details?.length) return '<div class="quota-targeting quota-targeting-overall"><strong>Overall quota</strong><span>Applies to every respondent entering this survey.</span></div>';
+    return `<div class="quota-targeting"><strong>Who this quota applies to</strong>${details.map(detail => `<div><label>${escapeHtml(detail.name)}</label><span>${(detail.values || []).map(escapeHtml).join(', ')}</span></div>`).join('')}</div>`;
   }
 
   function renderQuestions(items) {
     if (!items.length) return '<div class="detail-empty"><div class="detail-empty-visual" aria-hidden="true"><span></span><span></span><span></span><i>✓</i></div><strong>No pre-screening questions</strong><p>This survey does not require any targeting questions right now.</p></div>';
-    return `<div class="detail-list">${items.map((question, index) => `<article class="question-item"><div class="detail-index">${String(index + 1).padStart(2, '0')}</div><div class="detail-main"><div class="question-meta"><span>${escapeHtml(question.category || 'General')}</span><span>${escapeHtml(question.question_type || 'Question')}</span></div><h3>${escapeHtml(question.text || question.key)}</h3><small>${escapeHtml(question.key)}</small><div class="option-list">${(question.options || []).map((option) => `<span>${escapeHtml(option.OptionText || (option.ageStart != null ? `${option.ageStart}–${option.ageEnd}` : option.OptionId))}</span>`).join('') || '<em>No fixed options</em>'}</div></div></article>`).join('')}</div>`;
+    const hasQualifyingChoices = items.some(question => (question.options || []).some(option => option.Qualifies === true));
+    const legend = hasQualifyingChoices ? '<div class="targeting-legend"><strong>Provider targeting choices</strong><span><i>✓</i> Green answers match the provider-returned qualification.</span><span>Grey answers are outside the returned qualification.</span></div>' : '';
+    return `${legend}<div class="detail-list">${items.map((question, index) => `<article class="question-item"><div class="detail-index">${String(index + 1).padStart(2, '0')}</div><div class="detail-main"><div class="question-meta"><span>${escapeHtml(question.category || 'General')}</span><span>${escapeHtml(question.question_type || 'Question')}</span></div><h3>${escapeHtml(question.text || question.key)}</h3><small>${escapeHtml(question.key)}</small>${question.targeting_note ? `<div class="targeting-rule">${escapeHtml(question.targeting_note)}</div>` : ''}<div class="option-list">${(question.options || []).map((option) => { const label=escapeHtml(option.OptionText || (option.ageStart != null ? `${option.ageStart}–${option.ageEnd}` : option.OptionId)); const cls=option.Qualifies===true?'qualifying-option':option.Qualifies===false?'non-qualifying-option':''; return `<span class="${cls}">${option.Qualifies===true?'<b>✓</b> ':''}${label}</span>`; }).join('') || '<em>No fixed options</em>'}</div></div></article>`).join('')}</div>`;
   }
 
   els.export?.addEventListener('click', () => {
@@ -432,4 +476,10 @@
 
   updateCpiControl();
   loadSurveys();
+  window.setInterval(() => {
+    if (!document.hidden) loadSurveys({ silent: true });
+  }, 30000);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) loadSurveys({ silent: true });
+  });
 })();

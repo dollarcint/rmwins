@@ -1,6 +1,18 @@
+"""Django Admin registration for inventory, mappings and attempt audits."""
+
 from django.contrib import admin
 
-from .models import Survey, SurveyAttempt, SurveyQuota, SyncRun, TargetingQuestion
+from .models import (
+    CanonicalOption,
+    CanonicalQuestion,
+    ProviderOptionMapping,
+    ProviderQuestionMapping,
+    Survey,
+    SurveyAttempt,
+    SurveyQuota,
+    SyncRun,
+    TargetingQuestion,
+)
 
 
 class SurveyQuotaInline(admin.TabularInline):
@@ -17,28 +29,69 @@ class TargetingQuestionInline(admin.TabularInline):
 
 @admin.register(Survey)
 class SurveyAdmin(admin.ModelAdmin):
-    list_display = ["local_id", "client", "source_id", "company_name", "name", "country_code", "language_code", "completes", "sample_size", "status", "source_modified_at"]
-    search_fields = ["local_id", "source_id", "company_name", "name"]
-    list_filter = ["status", "client", "company_name", "country_code", "language_code", "has_quota"]
-    readonly_fields = ["local_id", "source_id", "raw_data", "created_at", "updated_at", "last_seen_at", "detail_synced_at"]
+    list_display = ["local_id", "client", "integration", "source_key", "company_name", "name", "country_code", "language_code", "completes", "sample_size", "status", "source_modified_at"]
+    search_fields = ["local_id", "source_key", "source_id", "company_name", "name"]
+    list_filter = ["status", "client", "integration", "company_name", "country_code", "language_code", "has_quota"]
+    readonly_fields = ["local_id", "source_id", "source_key", "raw_data", "created_at", "updated_at", "last_seen_at", "detail_synced_at"]
     inlines = [SurveyQuotaInline, TargetingQuestionInline]
 
 
 @admin.register(SyncRun)
 class SyncRunAdmin(admin.ModelAdmin):
-    list_display = ["id", "started_at", "status", "unique_surveys", "created", "updated", "closed", "detail_failures"]
+    list_display = ["id", "integration", "started_at", "status", "unique_surveys", "created", "updated", "closed", "detail_failures"]
     readonly_fields = [field.name for field in SyncRun._meta.fields]
 
 
 @admin.register(SurveyAttempt)
 class SurveyAttemptAdmin(admin.ModelAdmin):
     list_display = [
-        "rid", "survey", "platform_user", "vendor", "client", "status", "status_source", "initiated_at", "loi_seconds", "initiation_ip",
+        "rid", "prescreener_uid", "survey", "platform_user", "vendor", "client", "status", "status_source", "initiated_at", "loi_seconds", "initiation_ip",
         "callback_ip", "entry_browser", "entry_device", "is_verified",
     ]
     search_fields = [
-        "rid", "user_id", "platform_user__username", "platform_user__email", "survey__local_id",
-        "survey__source_id", "initiation_ip", "callback_ip",
+        "rid", "prescreener_uid", "user_id", "platform_user__username", "platform_user__email", "survey__local_id",
+        "survey__source_key", "survey__source_id", "initiation_ip", "callback_ip",
     ]
     list_filter = ["status", "status_source", "supplier_code", "entry_device", "entry_browser", "is_verified", "initiated_at"]
     readonly_fields = [field.name for field in SurveyAttempt._meta.fields]
+
+
+class CanonicalOptionInline(admin.TabularInline):
+    model = CanonicalOption
+    extra = 0
+
+
+@admin.register(CanonicalQuestion)
+class CanonicalQuestionAdmin(admin.ModelAdmin):
+    list_display = ["code", "label", "value_type", "is_active", "updated_at"]
+    search_fields = ["code", "label", "description"]
+    list_filter = ["value_type", "is_active"]
+    inlines = [CanonicalOptionInline]
+
+
+class ProviderOptionMappingInline(admin.TabularInline):
+    model = ProviderOptionMapping
+    extra = 0
+    autocomplete_fields = ["canonical_option"]
+
+
+@admin.register(ProviderQuestionMapping)
+class ProviderQuestionMappingAdmin(admin.ModelAdmin):
+    list_display = [
+        "provider_code", "external_question_id", "external_question_key",
+        "canonical_question", "country_code", "language_code", "is_active",
+    ]
+    search_fields = [
+        "provider_code", "external_question_id", "external_question_key",
+        "canonical_question__code", "canonical_question__label",
+    ]
+    list_filter = ["provider_code", "country_code", "language_code", "is_active"]
+    autocomplete_fields = ["canonical_question"]
+    inlines = [ProviderOptionMappingInline]
+
+
+@admin.register(CanonicalOption)
+class CanonicalOptionAdmin(admin.ModelAdmin):
+    list_display = ["question", "code", "label", "normalized_value", "is_active"]
+    search_fields = ["question__code", "code", "label", "normalized_value"]
+    list_filter = ["question", "is_active"]

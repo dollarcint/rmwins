@@ -1,6 +1,6 @@
 # Architecture
 
-The UAT vendor/client allocation extension is documented in `vendor-allocation.md`. It adds client ownership, commercial policy, two-level quantity allocation and immutable attempt CPI snapshots without replacing the existing survey synchronization or respondent tracking tables.
+The vendor/client allocation and internal organization model is documented in `vendor-allocation.md`. It adds client ownership, commercial policy, quantity allocation, Branch → Sub-branch → Shift routing and immutable attempt CPI snapshots without replacing the existing survey synchronization or respondent tracking tables.
 
 ## Boundary and responsibilities
 
@@ -25,7 +25,7 @@ flowchart LR
 
 ### `Survey`
 
-One row per InnovateMR `surveyId`. `source_id` is unique. `local_id` is an immutable, indexed 14-digit public identifier. `company_name` identifies the supplier source and supports future multi-supplier filtering. Core inventory fields are normalized for filters and reporting while `raw_data` preserves the complete upstream payload for future fields and debugging.
+One row per client/provider survey. `source_key` is the canonical string provider identifier and is unique together with its integration; `source_id` remains a nullable numeric compatibility field for InnovateMR and other numeric providers. `local_id` is an immutable, indexed 14-digit public identifier. `buyer_id` normalizes the provider's buyer/sub-client identifier. `survey_type` normalizes known `groupType` values (`Consumer`/`B2C` to `B2C`, `Business`/`B2B` to `B2B`) while preserving the original value in `group_type`. Core inventory fields are normalized for filters and reporting while `raw_data` preserves the complete upstream payload for future fields and debugging.
 
 `source_created_at` and `source_modified_at` retain upstream timestamps. `created_at` and `updated_at` are database audit timestamps. `last_seen_at` records inventory presence. A missing survey is marked `closed`, not deleted.
 
@@ -43,11 +43,13 @@ Immutable operational history with endpoint counts, merged total, create/update/
 
 ### `SurveyAttempt`
 
-One record per respondent journey. RID is a random 10-character identifier and is supplied as both InnovateMR PID and `trackId`. The row connects survey and user ID, captures pre-screening answers, supplier code derived from the allocated entry link, initiation/submission/redirect/callback timestamps, entry and exit IPs, entry/exit browser-device-OS-user-agent snapshots, safe client hints, callback count, terminal status and measured LOI. Browser callbacks are unverified until a trusted notification or hash confirms them.
+One record per respondent journey. RID is a random 10-character identifier and is supplied as both InnovateMR PID and `trackId`. The row connects survey and user ID, captures pre-screening answers, supplier code derived from the allocated entry link, initiation/submission/redirect/callback timestamps, entry and exit IPs, entry/exit browser-device-OS-user-agent snapshots, safe client hints, callback count, terminal status and measured LOI. Browser callbacks are unverified until a trusted notification or hash confirms them. `source_cpi_snapshot` remains immutable after entry and `cpi_snapshot_source` records whether it was captured live or recovered during the legacy backfill. Revenue sums completed snapshots, so later inventory CPI changes cannot rewrite historical revenue.
+
+Employee roles have a configurable `cpi_visibility_percent` (default 100). It changes only what that role can see in Projects, Studies and exports; it does not mutate source CPI, historical revenue storage, or vendor commercial allocations.
 
 The responsive Studies UI deliberately renders a compact operational subset. Its filtered CSV stream joins attempt, survey, platform-user, employee-profile and role context and includes the full audit payload. Streaming iteration keeps large exports memory-bounded, while CSV formula escaping prevents spreadsheet formula injection.
 
-The User Hits report derives its metrics from these immutable attempt rows. Each result represents one platform user and one IST calendar date. All attempts initiated on that date count as hits; status `1` attempts count as completes. Desktop, mobile and tablet use the captured entry-device classification, while missing legacy device audit data remains explicitly unclassified. Branch resolves from the user's company/vendor ownership chain and sub-branch from the employee department, with stable fallbacks for older profiles.
+The User Hits report derives its metrics from these immutable attempt rows. Each result represents one platform user and one IST calendar date. All attempts initiated on that date count as hits; status `1` attempts count as completes. Desktop, mobile and tablet use the captured entry-device classification, while missing legacy device audit data remains explicitly unclassified. Branch, Sub-branch and Shift resolve from `EmployeeProfile.organization_unit`; stable text-field fallbacks remain for legacy unassigned profiles.
 
 ### `LocalIdSequence`
 
@@ -67,7 +69,7 @@ For production volume, use PostgreSQL and Redis, run at least one dedicated work
 
 ## Security
 
-- The supplier token comes from process environment only and is sent in `x-access-token` over HTTPS.
+- Generic provider tokens are encrypted at rest or resolved from process environment and sent only to their configured HTTPS endpoint. RFG APID/secret values remain in environment variables and requests use timestamped HMAC-SHA1 authentication.
 - It is never serialized, rendered, logged intentionally, or stored in survey payloads.
 - Raw upstream errors are kept server-side.
-- Production should add organization authentication/authorization around UI and REST routes before exposing the service beyond a trusted network.
+- Organization UI, component controls and REST actions use function-level permissions; querysets are additionally restricted to the current super-admin or internal-vendor workspace.

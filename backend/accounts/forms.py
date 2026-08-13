@@ -1,3 +1,5 @@
+"""Validated login and one-time first-administrator setup forms."""
+
 from django import forms
 from django.contrib.auth import get_user_model
 from django.contrib.auth.forms import AuthenticationForm
@@ -19,7 +21,7 @@ class WorkspaceAuthenticationForm(AuthenticationForm):
         commercial = getattr(user, "vendor_commercial_profile", None)
         if not commercial or not commercial.is_active or not commercial.panel_access_enabled:
             raise ValidationError(
-                "Panel access is not enabled for this vendor account.",
+                "Panel access is not enabled for this supplier account.",
                 code="panel_access_disabled",
             )
 

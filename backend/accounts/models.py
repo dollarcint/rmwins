@@ -1,4 +1,7 @@
+"""Database models for roles, function grants and employee workspace identity."""
+
 from django.conf import settings
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 
 
@@ -23,6 +26,13 @@ class Role(models.Model):
     slug = models.SlugField(max_length=80, unique=True)
     description = models.TextField(blank=True)
     rank = models.PositiveSmallIntegerField(default=10)
+    cpi_visibility_percent = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=100,
+        validators=[MinValueValidator(0), MaxValueValidator(100)],
+        help_text="Percentage of CPI visible to employee accounts assigned this role.",
+    )
     is_system = models.BooleanField(default=False)
     is_active = models.BooleanField(default=True)
     created_by = models.ForeignKey(
@@ -57,8 +67,8 @@ class RoleFunctionPermission(models.Model):
 class EmployeeProfile(models.Model):
     class AccountType(models.TextChoices):
         EMPLOYEE = "employee", "Employee"
-        INTERNAL_VENDOR = "internal_vendor", "Internal vendor"
-        EXTERNAL_VENDOR = "external_vendor", "External vendor"
+        INTERNAL_VENDOR = "internal_vendor", "Internal supplier"
+        EXTERNAL_VENDOR = "external_vendor", "External supplier"
 
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="employee_profile")
     role = models.ForeignKey(Role, null=True, blank=True, on_delete=models.SET_NULL, related_name="employees")
@@ -69,6 +79,13 @@ class EmployeeProfile(models.Model):
     company_name = models.CharField(max_length=160, blank=True)
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="created_employee_profiles"
+    )
+    organization_unit = models.ForeignKey(
+        "vendors.OrganizationUnit",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="members",
     )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
