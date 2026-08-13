@@ -837,6 +837,23 @@ def _prescreener_questions(survey, submitted_data=None, *, qualifying_options_on
                 else set(allowed_values).intersection(alias_allowed)
             )
         for option in question.options:
+            if not isinstance(option, dict):
+                value = str(option).strip()
+                if not value:
+                    continue
+                if qualifying_options_only and allowed_values and value not in allowed_values:
+                    continue
+                options.append({"value": value, "label": value})
+                age_span = re.fullmatch(
+                    r"(\d{1,3})\s*(?:-|\u2013|to)\s*(\d{1,3})",
+                    value,
+                    re.IGNORECASE,
+                )
+                if age_span:
+                    start, end = int(age_span.group(1)), int(age_span.group(2))
+                    if 0 <= start <= end <= 125:
+                        age_ranges.append({"ageStart": start, "ageEnd": end})
+                continue
             option_id = option.get("OptionId")
             if option.get("ageStart") is not None:
                 label = f"{option.get('ageStart')}–{option.get('ageEnd')}"
@@ -1032,7 +1049,8 @@ def _collect_prescreener_answers(request, survey):
             matched = [
                 str(option.get("OptionId"))
                 for option in question.options
-                if option.get("ageStart") is not None
+                if isinstance(option, dict)
+                and option.get("ageStart") is not None
                 and int(option["ageStart"]) <= numeric_value <= int(option["ageEnd"])
                 and option.get("OptionId") is not None
             ]

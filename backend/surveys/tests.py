@@ -529,6 +529,19 @@ class SurveyFlowTests(TestCase):
         self.assertEqual(attempt.exit_os, "Android 14")
         self.assertIsNotNone(attempt.loi_seconds)
 
+    def test_biobrain_primitive_option_values_render_without_server_error(self):
+        self.question.options = ["18-60"]
+        self.question.question_type = "4"
+        self.question.text = ""
+        self.question.key = "59"
+        self.question.save(update_fields=["options", "question_type", "text", "key"])
+        attempt = create_attempt(self.survey, self.platform_user, None)
+
+        response = self.client.get(reverse("survey-start"), {"rid": attempt.rid})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, 'name="question_')
+
     def test_repeated_submission_keeps_the_first_redirect_immutable(self):
         start = self.client.get(reverse("survey-start"), {
             "surveyId": self.survey.source_id,
