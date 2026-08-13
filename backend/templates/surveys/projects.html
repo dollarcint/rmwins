@@ -37,8 +37,8 @@
   <div class="field multi-field">
     <label id="statusLabel">Status</label>
     <div class="multi-select" data-multi-filter="status">
-      <button class="multi-trigger" type="button" aria-labelledby="statusLabel" aria-expanded="false"><span>All statuses</span><i>⌄</i></button>
-      <div class="multi-menu" hidden><div class="multi-options"><label><input type="checkbox" value="live"><span>Live</span></label><label><input type="checkbox" value="closed"><span>Closed</span></label></div></div>
+      <button class="multi-trigger" type="button" aria-labelledby="statusLabel" aria-expanded="false"><span>Live</span><i>⌄</i></button>
+      <div class="multi-menu" hidden><div class="multi-options"><label><input type="checkbox" value="live" checked><span>Live</span></label><label><input type="checkbox" value="closed"><span>Closed</span></label></div></div>
     </div>
   </div>
   {% endif %}
@@ -130,7 +130,7 @@
       <thead><tr>
         {% if 'project_id' in project_columns %}<th>Project ID</th>{% endif %}
         {% if 'survey' in project_columns %}<th>Survey ID</th>{% endif %}
-        {% if 'market' in project_columns %}<th>Market</th>{% endif %}
+        {% if 'market' in project_columns %}<th>Country</th>{% endif %}
         {% if 'completes' in project_columns %}<th>Completes</th>{% endif %}
         {% if 'cpi' in project_columns %}<th>CPI</th>{% endif %}
         {% if 'loi_ir' in project_columns %}<th>LOI / IR</th>{% endif %}
@@ -166,4 +166,4 @@
   <div class="drawer-content" id="drawerContent"></div>
 </aside>
 {% endblock %}
-{% block scripts %}<script src="{% static 'surveys/projects.js' %}?v=22" defer></script>{% endblock %}
+{% block scripts %}<script src="{% static 'surveys/projects.js' %}?v=23" defer></script>{% endblock %}

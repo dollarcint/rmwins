@@ -44,6 +44,27 @@ class ConfigurableProviderClientTests(SimpleTestCase):
         self.assertNotIn("x-access-token", session.calls[0][1]["headers"])
         self.assertEqual((surveys[0]["surveyId"], surveys[0]["surveyName"], surveys[0]["CPI"]), (44, "Bio study", 2.5))
 
+    def test_biobrain_resolves_language_id_to_country(self):
+        session = CapturingSession(
+            {
+                "status": "ok", "hasError": False,
+                "Surveys": [{"SurveyId": 44, "Name": "Bio study", "LanguageId": 3}],
+            },
+            {
+                "status": "ok", "hasError": False,
+                "Languages": [{"Id": "3", "Name": "English - United States", "CountryCode": "US"}],
+            },
+        )
+
+        survey = InnovateMRClient(
+            token="secret", session=session, integration=integration()
+        ).get_allocated_surveys()[0]
+
+        self.assertEqual(session.calls[1][0], "https://partner-api.voqall.com/api/v1/collection/languages")
+        self.assertEqual(survey["CountryCode"], "US")
+        self.assertEqual(survey["Country"], "United States")
+        self.assertEqual(survey["Language"], "English")
+
     def test_biobrain_detail_endpoints_are_configurable(self):
         session = CapturingSession({"hasError": False, "Quotas": [{"QuotaId": 7, "Conditions": []}]}, {"hasError": False, "Qualifications": [{"QualificationId": 9, "OptionIds": [1, 2]}]})
         client = InnovateMRClient(token="secret", session=session, integration=integration())

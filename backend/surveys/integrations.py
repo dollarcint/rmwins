@@ -214,10 +214,40 @@ class InnovateMRClient:
         normalized["_provider_name"] = getattr(getattr(self.integration, "client", None), "name", self.provider_code)
         return normalized
 
+    def _enrich_biobrain_market(self, surveys: list[dict[str, Any]]) -> None:
+        """Resolve Bio Brain's LanguageId into displayable country/language fields."""
+        language_ids = {
+            str(item.get("LanguageId") or "").strip()
+            for item in surveys
+            if str(item.get("LanguageId") or "").strip()
+        }
+        if not language_ids:
+            return
+        api_root = self.base_url[:-8] if self.base_url.lower().endswith("/surveys") else self.base_url
+        try:
+            payload = self._get(f"{api_root}/collection/languages")
+            rows = self._result_list(payload, "Languages")
+        except InnovateMRAPIError:
+            logger.warning("Could not resolve Bio Brain language/country collection", exc_info=True)
+            return
+        languages = {str(row.get("Id") or "").strip(): row for row in rows}
+        for survey in surveys:
+            language = languages.get(str(survey.get("LanguageId") or "").strip())
+            if not language:
+                continue
+            display_name = str(language.get("Name") or "").strip()
+            language_name, separator, country_name = display_name.partition(" - ")
+            survey["CountryCode"] = str(language.get("CountryCode") or "").strip().upper()
+            survey["Country"] = country_name.strip() if separator else display_name
+            survey["Language"] = language_name.strip() if separator else display_name
+
     def get_allocated_surveys(self) -> list[dict[str, Any]]:
         endpoint = self._endpoint("inventory_endpoint", "/supply/getAllocatedSurveys", "")
         key = str(self._config("inventory_result_key", "") or ("Surveys" if self.is_biobrain else "result"))
-        return [self._normalize_survey(item) for item in self._result_list(self._get(endpoint), key)]
+        surveys = [self._normalize_survey(item) for item in self._result_list(self._get(endpoint), key)]
+        if self.is_biobrain:
+            self._enrich_biobrain_market(surveys)
+        return surveys
 
     def test_connection(self) -> dict[str, Any]:
         surveys = self.get_allocated_surveys()
