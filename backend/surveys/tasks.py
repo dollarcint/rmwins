@@ -43,6 +43,7 @@ def dispatch_due_integrations_task():
         | Q(provider_code="cint", last_test_status="success")
     ).only(
         "id", "provider_code", "sync_interval_seconds", "last_sync_started_at",
+        "last_sync_finished_at",
         "credential_env_key", "encrypted_api_token",
     )
     for integration in integrations:
@@ -57,7 +58,8 @@ def dispatch_due_integrations_task():
             "cint": settings.CLIENT_INTEGRATION_CINT_SYNC_INTERVAL_SECONDS,
         }.get(integration.provider_code, integration.sync_interval_seconds)
         interval_seconds = max(60, interval_seconds)
-        due_at = (integration.last_sync_started_at or (now - timedelta(days=1))) + timedelta(
+        last_activity = integration.last_sync_finished_at or integration.last_sync_started_at
+        due_at = (last_activity or (now - timedelta(days=1))) + timedelta(
             seconds=interval_seconds
         )
         if due_at <= now:

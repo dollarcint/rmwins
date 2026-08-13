@@ -186,6 +186,31 @@ class SurveySyncTests(TestCase):
             {innovate.pk, rfg.pk},
         )
 
+    @override_settings(CLIENT_INTEGRATION_INNOVATEMR_SYNC_INTERVAL_SECONDS=150)
+    @patch("surveys.tasks.sync_client_integration_task.delay")
+    def test_dispatcher_waits_full_interval_after_a_slow_sync_finishes(self, delay):
+        from .tasks import dispatch_due_integrations_task
+
+        ClientIntegration.objects.all().delete()
+        now = timezone.now()
+        client = Client.objects.create(
+            code="slow-innovate", name="Slow Innovate", provider_code="innovatemr"
+        )
+        integration = ClientIntegration.objects.create(
+            client=client,
+            name="Slow Innovate automatic",
+            provider_code="innovatemr",
+            base_url="https://supplier.innovatemr.net/api/v2",
+            last_sync_started_at=now - timedelta(minutes=5),
+            last_sync_finished_at=now - timedelta(seconds=30),
+            last_sync_status="success",
+        )
+
+        result = dispatch_due_integrations_task()
+
+        self.assertNotIn(integration.pk, result["queued"])
+        delay.assert_not_called()
+
 
     @patch("surveys.tasks.sync_client_integration_task.delay")
     def test_hidden_biobrain_is_queued_only_after_its_api_key_exists(self, delay):
