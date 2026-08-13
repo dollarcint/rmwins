@@ -60,6 +60,7 @@ if test ! -d "$CHECKOUT_DIR/.git"; then
 else
     git -C "$CHECKOUT_DIR" remote set-url origin "$REPOSITORY_URL"
     git -C "$CHECKOUT_DIR" fetch --prune origin "$DEPLOY_BRANCH"
+    git -C "$CHECKOUT_DIR" reset --hard HEAD
     git -C "$CHECKOUT_DIR" checkout -B "$DEPLOY_BRANCH" "origin/$DEPLOY_BRANCH"
     git -C "$CHECKOUT_DIR" reset --hard "origin/$DEPLOY_BRANCH"
 fi
