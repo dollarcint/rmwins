@@ -46,7 +46,9 @@ ssh root@82.29.166.173 "bash /usr/local/sbin/deploy-alessar"
 ```
 
 MariaDB is health-checked but is intentionally not restarted for routine code
-deployments. A lock prevents two deployments from running at the same time.
+deployments. Rebuildable Django cache databases are cleared after the isolated
+Redis restart so stale project counts and filter options cannot return. A lock
+prevents two deployments from running at the same time.
 
 Internal endpoint checks:
 

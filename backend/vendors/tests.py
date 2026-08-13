@@ -588,6 +588,18 @@ class OrganizationHierarchyTests(TestCase):
         with self.assertRaisesMessage(AllocationUnavailable, "not assigned"):
             resolve_vendor_survey_context(employee, self.survey_b)
 
+    def test_superuser_remains_unscoped_when_assigned_to_an_organization_unit(self):
+        branch, _, _ = self.create_tree(self.owner, "owner")
+        EmployeeProfile.objects.filter(user=self.owner).update(organization_unit=branch)
+
+        response = self.owner_api.get(reverse("survey-list"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            {row["source_id"] for row in response.data["results"]},
+            {self.survey_a.source_id, self.survey_b.source_id},
+        )
+
     def test_shift_client_grants_override_broader_branch_grants(self):
         branch, _, shift = self.create_tree(self.owner, "shift-override")
         OrganizationClientAccess.objects.bulk_create([

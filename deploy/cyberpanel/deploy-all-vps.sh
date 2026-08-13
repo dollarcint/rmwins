@@ -130,6 +130,11 @@ systemctl restart alessar-frontend.service
 sleep 8
 
 log "Running service and HTTP health checks"
+# Redis databases 2 and 3 contain only rebuildable Django caches. Redis is
+# persistent for Celery, so clear these cache databases after a restart to
+# prevent an old project count/filter snapshot from becoming authoritative.
+redis-cli -p 6381 -n 2 FLUSHDB >/dev/null
+redis-cli -p 6381 -n 3 FLUSHDB >/dev/null
 SUPERVISOR_STATUS="$(runuser -u "$BACKEND_USER" -- env HOME="$BACKEND_HOME" \
     "$SUPERVISORCTL" -c "$SUPERVISOR_CONFIG" status)"
 printf '%s\n' "$SUPERVISOR_STATUS"

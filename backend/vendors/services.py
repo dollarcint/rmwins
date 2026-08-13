@@ -136,6 +136,9 @@ def organization_client_ids_for_user(user) -> set[int] | None:
     Root and unassigned accounts remain unscoped for backward compatibility.
     """
 
+    if user.is_superuser:
+        user._organization_client_ids_cache = None
+        return None
     if hasattr(user, "_organization_client_ids_cache"):
         return user._organization_client_ids_cache
     profile = EmployeeProfile.objects.select_related(
