@@ -1305,11 +1305,7 @@ def survey_start(request):
         answers, errors = _collect_prescreener_answers(request, attempt.survey)
         if not errors:
             try:
-                if (
-                    attempt.survey.integration_id
-                    and attempt.survey.integration.provider_code == "rfg"
-                ):
-                    ensure_attempt_prescreener_uid(attempt)
+                prescreener_uid = ensure_attempt_prescreener_uid(attempt)
                 if settings.PRESCREENER_VAULT_ENABLED:
                     capture_prescreener_submission(attempt, answers)
                 provider = (
@@ -1346,7 +1342,12 @@ def survey_start(request):
                     outbound_url = (
                         provider.build_outbound_url(attempt.survey, attempt, answers)
                         if provider
-                        else build_outbound_url(attempt.survey.entry_link, attempt.rid, answers)
+                        else build_outbound_url(
+                            attempt.survey.entry_link,
+                            attempt.rid,
+                            answers,
+                            prescreener_uid=prescreener_uid,
+                        )
                     )
                     if not _mark_attempt_redirected(attempt, answers, outbound_url):
                         return HttpResponseRedirect(

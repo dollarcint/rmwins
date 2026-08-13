@@ -26,7 +26,7 @@ from .services import (
     replace_survey_details,
     sync_surveys,
 )
-from .survey_flow import create_attempt
+from .survey_flow import build_outbound_url, create_attempt
 
 
 def xlsx_rows(response, sheet_number=1):
@@ -541,6 +541,29 @@ class SurveyFlowTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, 'name="question_')
+
+    def test_biobrain_outbound_template_uses_rid_and_prescreener_uid(self):
+        template = (
+            "https://rf.voqall.com/l?vq_sid=survey-guid&vq_vid=vendor-guid"
+            "&vq_token=[#vq_tid#]&vq_uid=[#vq_tUid#]\"\""
+        )
+
+        outbound = build_outbound_url(
+            template,
+            "Aa1Bb2Cc3D",
+            {},
+            prescreener_uid="Ab1C-de2F-Gh3I-jK4L",
+        )
+        parts = urlsplit(outbound)
+        params = parse_qs(parts.query)
+
+        self.assertEqual(parts.fragment, "")
+        self.assertEqual(params["vq_token"], ["Aa1Bb2Cc3D"])
+        self.assertEqual(params["vq_uid"], ["Ab1C-de2F-Gh3I-jK4L"])
+        self.assertNotIn("PID", params)
+        self.assertNotIn("trackId", params)
+        self.assertNotIn("[#vq_", outbound.lower())
+        self.assertFalse(outbound.endswith(('"', "'")))
 
     def test_repeated_submission_keeps_the_first_redirect_immutable(self):
         start = self.client.get(reverse("survey-start"), {

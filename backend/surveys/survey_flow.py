@@ -226,24 +226,58 @@ def create_attempt(survey: Survey, platform_user, ip_address: str | None, client
     raise RuntimeError("Could not allocate a unique RID")
 
 
-def build_outbound_url(entry_link: str, rid: str, answers: dict) -> str:
-    """Use the exact allocated entry link, replacing PID and adding trackId/profile answers."""
-    parts = urlsplit(entry_link)
+def build_outbound_url(
+    entry_link: str,
+    rid: str,
+    answers: dict,
+    *,
+    prescreener_uid: str = "",
+) -> str:
+    """Build legacy/provider-template links with the attempt's stable identifiers."""
+    # Voqall sends literal ``[#vq_*#]`` placeholders. Their ``#`` characters
+    # must be replaced before urlsplit(), otherwise Python treats the rest of
+    # the query string as a URL fragment.
+    prepared_link = (entry_link or "").strip().rstrip("\"'")
+    prepared_link = re.sub(r"\[#vq_tid#\]", rid, prepared_link, flags=re.IGNORECASE)
+    prepared_link = re.sub(
+        r"\[#vq_tuid#\]",
+        prescreener_uid or rid,
+        prepared_link,
+        flags=re.IGNORECASE,
+    )
+
+    parts = urlsplit(prepared_link)
     query = parse_qsl(parts.query, keep_blank_values=True)
     outbound: list[tuple[str, str]] = []
     has_pid = False
+    has_vq_token = False
+    has_vq_uid = False
+    hostname = (parts.hostname or "").lower()
+    is_voqall = hostname == "voqall.com" or hostname.endswith(".voqall.com")
 
     for key, value in query:
         lowered = key.lower()
-        if lowered == "pid":
+        if is_voqall and lowered == "vq_token":
+            outbound.append((key, rid))
+            has_vq_token = True
+        elif is_voqall and lowered == "vq_uid":
+            outbound.append((key, prescreener_uid or rid))
+            has_vq_uid = True
+        elif lowered == "pid":
             outbound.append((key, rid))
             has_pid = True
         elif lowered != "trackid":
             outbound.append((key, value))
 
-    if not has_pid:
-        outbound.append(("PID", rid))
-    outbound.append(("trackId", rid))
+    if is_voqall:
+        if not has_vq_token:
+            outbound.append(("vq_token", rid))
+        if not has_vq_uid:
+            outbound.append(("vq_uid", prescreener_uid or rid))
+    else:
+        if not has_pid:
+            outbound.append(("PID", rid))
+        outbound.append(("trackId", rid))
 
     for answer in answers.values():
         question_key = answer.get("question_key")
