@@ -34,6 +34,20 @@ alessar-web      RUNNING
 alessar-worker   RUNNING
 ```
 
+## One-command deployment after pushing `main`
+
+The root deploy wrapper fetches GitHub `main`, builds React as `aless4284`,
+updates Django as `apial8464`, runs both database migrations, collects static
+files, restarts the frontend plus the complete backend Supervisor group, and
+checks both public domains:
+
+```powershell
+ssh root@82.29.166.173 "bash /usr/local/sbin/deploy-alessar"
+```
+
+MariaDB is health-checked but is intentionally not restarted for routine code
+deployments. A lock prevents two deployments from running at the same time.
+
 Internal endpoint checks:
 
 ```powershell
