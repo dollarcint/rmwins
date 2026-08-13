@@ -38,4 +38,3 @@ class Migration(migrations.Migration):
     operations = [
         migrations.RunPython(restrict_dashboard, migrations.RunPython.noop),
     ]
-
