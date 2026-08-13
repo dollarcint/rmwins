@@ -1,6 +1,7 @@
 """Dedicated InnovateMR HTTP client used by legacy sync and reconciliation."""
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlparse
@@ -273,11 +274,66 @@ class InnovateMRClient:
         key=str(self._config("quota_result_key", "") or ("Quotas" if self.is_biobrain else "result")); items=self._result_list(self._get(endpoint.format(survey_id=survey_id)), key)
         return [{**item, "id": item.get("QuotaId"), "targeting": {"Conditions": item.get("Conditions", [])}} for item in items] if self.is_biobrain else items
 
-    def get_survey_targeting(self, survey_id: int) -> list[dict[str, Any]]:
+    def _biobrain_qualification_detail(self, language_id: Any, qualification_id: Any) -> dict[str, Any]:
+        if language_id in (None, "") or qualification_id in (None, ""):
+            return {}
+        api_root = self.base_url[:-8] if self.base_url.lower().endswith("/surveys") else self.base_url
+        payload = self._get(
+            f"{api_root}/collection/languages/{language_id}/qualifications/{qualification_id}"
+        )
+        rows = self._result_list(payload, "Qualification")
+        return rows[0] if rows else {}
+
+    def get_survey_targeting(self, survey_id: int, language_id: Any = None) -> list[dict[str, Any]]:
         endpoint=self._endpoint("targeting_endpoint_template", "/supply/getSurveyTargeting/{survey_id}", "")
         if not endpoint: return []
         key=str(self._config("targeting_result_key", "") or ("Qualifications" if self.is_biobrain else "result")); items=self._result_list(self._get(endpoint.format(survey_id=survey_id)), key)
-        return [{**item, "QuestionId": item.get("QualificationId"), "QuestionKey": str(item.get("QualificationId") or ""), "QuestionType": str(item.get("QualificationTypeId") or ""), "Options": item.get("OptionIds", [])} for item in items] if self.is_biobrain else items
+        if not self.is_biobrain:
+            return items
+        normalized = []
+        for item in items:
+            qualification_id = item.get("QualificationId")
+            try:
+                detail = self._biobrain_qualification_detail(language_id, qualification_id)
+            except InnovateMRAPIError:
+                logger.warning(
+                    "Could not resolve Bio Brain qualification detail survey=%s qualification=%s",
+                    survey_id,
+                    qualification_id,
+                    exc_info=True,
+                )
+                detail = {}
+            allowed_values = item.get("OptionCodes") or item.get("OptionIds") or []
+            options = [
+                {
+                    "OptionId": option.get("OptionCode"),
+                    "OptionText": option.get("OptionText") or str(option.get("OptionCode") or ""),
+                }
+                for option in (detail.get("Options") or [])
+                if isinstance(option, dict)
+            ]
+            age_ranges = []
+            if str(detail.get("Code") or "").upper() == "AGE":
+                for value in allowed_values:
+                    match = re.fullmatch(
+                        r"(\d{1,3})\s*(?:-|\u2013|to)\s*(\d{1,3})",
+                        str(value),
+                        re.IGNORECASE,
+                    )
+                    if match:
+                        age_ranges.append({"min": int(match.group(1)), "max": int(match.group(2))})
+            normalized.append({
+                **item,
+                "QuestionId": qualification_id,
+                "QuestionKey": str(detail.get("Code") or qualification_id or ""),
+                "QuestionText": str(detail.get("QuestionText") or ""),
+                "QuestionType": str(detail.get("TypeName") or item.get("QualificationTypeId") or ""),
+                "QuestionCategory": "Profile",
+                "Options": options,
+                "targeting_choices": [str(value) for value in allowed_values],
+                "targeting_age_ranges": age_ranges,
+            })
+        return normalized
 
     def get_survey_transactions_by_pid(self, survey_id: int, pid: str) -> list[dict[str, Any]]:
         endpoint=self._endpoint("transaction_endpoint_template", "/supply/getSurveyTransactionsByCond/{survey_id}/{pid}", "")

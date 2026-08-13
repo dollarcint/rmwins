@@ -1219,6 +1219,10 @@ def survey_start(request):
         stale = survey.targeting_synced_at is None or (
             survey.source_modified_at and survey.targeting_synced_at < survey.source_modified_at
         )
+        if provider_code in {"biobrain", "voqall"} and survey.targeting_questions.filter(
+            Q(text="") | Q(key__regex=r"^\d+$")
+        ).exists():
+            stale = True
         if supports_lazy_entry_link:
             stale = stale or not survey.entry_link
         if is_rfg:

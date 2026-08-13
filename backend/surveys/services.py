@@ -170,7 +170,13 @@ def replace_survey_quotas(client: InnovateMRClient, survey: Survey) -> None:
 
 def replace_survey_targeting(client: InnovateMRClient, survey: Survey) -> None:
     try:
-        targeting = client.get_survey_targeting(survey.source_id)
+        if getattr(client, "is_biobrain", False):
+            targeting = client.get_survey_targeting(
+                survey.source_id,
+                language_id=(survey.raw_data or {}).get("LanguageId"),
+            )
+        else:
+            targeting = client.get_survey_targeting(survey.source_id)
     except InnovateMRNotFound:
         targeting = []
     with transaction.atomic():

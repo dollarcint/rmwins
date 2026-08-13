@@ -71,6 +71,42 @@ class ConfigurableProviderClientTests(SimpleTestCase):
         self.assertEqual(client.get_quota_for_survey(44)[0]["id"], 7); self.assertEqual(client.get_survey_targeting(44)[0]["QuestionId"], 9)
         self.assertTrue(session.calls[0][0].endswith("/survey-quotas/44")); self.assertTrue(session.calls[1][0].endswith("/survey-qualifications/44"))
 
+    def test_biobrain_targeting_uses_language_specific_question_details(self):
+        session = CapturingSession(
+            {
+                "hasError": False,
+                "Qualifications": [{
+                    "QualificationId": 60,
+                    "QualificationTypeId": 1,
+                    "OptionIds": [58],
+                    "OptionCodes": ["2"],
+                }],
+            },
+            {
+                "hasError": False,
+                "Qualification": [{
+                    "Id": "60", "Code": "GENDER",
+                    "QuestionText": "What is your gender?",
+                    "TypeId": 1, "TypeName": "Single Punch",
+                    "Options": [
+                        {"OptionCode": 1, "OptionText": "Male"},
+                        {"OptionCode": 2, "OptionText": "Female"},
+                    ],
+                }],
+            },
+        )
+
+        question = InnovateMRClient(
+            token="secret", session=session, integration=integration()
+        ).get_survey_targeting(44, language_id=3)[0]
+
+        self.assertTrue(session.calls[1][0].endswith("/collection/languages/3/qualifications/60"))
+        self.assertEqual(question["QuestionKey"], "GENDER")
+        self.assertEqual(question["QuestionText"], "What is your gender?")
+        self.assertEqual(question["QuestionType"], "Single Punch")
+        self.assertEqual(question["Options"][1], {"OptionId": 2, "OptionText": "Female"})
+        self.assertEqual(question["targeting_choices"], ["2"])
+
     def test_custom_provider_field_mapping(self):
         session = CapturingSession({"data": {"items": [{"id": 8, "title": "Custom study"}]}})
         configured = integration(provider_code="custom", base_url="https://example.test/api", inventory_endpoint="surveys", auth_header_name="X-API-Key", inventory_result_key="data.items", field_mapping={"surveyId": "id", "surveyName": "title"})
