@@ -24,7 +24,7 @@ from .models import (
     VendorAPIKey,
     VendorSurveyAllocation,
 )
-from .credentials import set_integration_token
+from .credentials import set_integration_env_key, set_integration_token
 
 
 class VendorDirectorySerializer(serializers.ModelSerializer):
@@ -337,6 +337,7 @@ class ClientIntegrationSerializer(serializers.ModelSerializer):
 
     def update(self, instance, validated_data):
         token = validated_data.pop("api_token", None)
+        previous_env_key = instance.credential_env_key
         connection_fields = {
             "provider_code", "base_url", "credential_env_key", "credential_env_keys",
             "supplier_code", "config",
@@ -348,6 +349,11 @@ class ClientIntegrationSerializer(serializers.ModelSerializer):
         instance = super().update(instance, validated_data)
         if token is not None:
             set_integration_token(instance, token)
+        elif (
+            "credential_env_key" in validated_data
+            and instance.credential_env_key != previous_env_key
+        ):
+            set_integration_env_key(instance, instance.credential_env_key)
         if connection_changed and instance.provider_code in {"rfg", "cint"}:
             instance.last_test_status = ""
             instance.last_test_error = "Connection settings changed; test the connection again."

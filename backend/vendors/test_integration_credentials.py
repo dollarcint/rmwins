@@ -1,7 +1,14 @@
+from unittest.mock import patch
+
 from django.test import TestCase, override_settings
 
 from surveys.models import Survey
-from vendors.credentials import resolve_integration_token, set_integration_token
+from vendors.credentials import (
+    reconcile_all_integration_credentials,
+    resolve_integration_token,
+    set_integration_env_key,
+    set_integration_token,
+)
 from vendors.models import Client, ClientIntegration
 from vendors.serializers import ClientIntegrationSerializer
 
@@ -41,6 +48,55 @@ class ClientIntegrationCredentialTests(TestCase):
         self.assertEqual(survey_a.entry_link, "")
         self.assertEqual(survey_a.raw_data, {})
         self.assertEqual(survey_b.entry_link, "https://b.test/start")
+
+    def test_switching_to_same_environment_token_preserves_data(self):
+        set_integration_token(self.integration_a, "token-one")
+        survey = Survey.objects.create(
+            integration=self.integration_a,
+            client=self.client_a,
+            source_id=42,
+            entry_link="https://a.test/start",
+            raw_data={"a": 1},
+        )
+        with patch.dict("os.environ", {"CLIENT_A_API_KEY": "token-one"}):
+            changed, cleared = set_integration_env_key(self.integration_a, "CLIENT_A_API_KEY")
+            self.integration_a.refresh_from_db()
+            self.assertFalse(changed)
+            self.assertEqual(cleared, 0)
+            self.assertFalse(self.integration_a.encrypted_api_token)
+            self.assertEqual(self.integration_a.credential_env_key, "CLIENT_A_API_KEY")
+            self.assertEqual(resolve_integration_token(self.integration_a), "token-one")
+        survey.refresh_from_db()
+        self.assertEqual(survey.entry_link, "https://a.test/start")
+
+    def test_changed_environment_token_stays_environment_backed(self):
+        with patch.dict("os.environ", {"CLIENT_A_API_KEY": "token-one"}):
+            set_integration_env_key(self.integration_a, "CLIENT_A_API_KEY")
+        survey = Survey.objects.create(
+            integration=self.integration_a,
+            client=self.client_a,
+            source_id=42,
+            entry_link="https://a.test/start",
+            raw_data={"a": 1},
+        )
+        with patch.dict("os.environ", {"CLIENT_A_API_KEY": "replacement-token"}):
+            result = reconcile_all_integration_credentials()
+            self.integration_a.refresh_from_db()
+            self.assertEqual(result, {"checked": 1, "changed": 1, "cleared": 1})
+            self.assertFalse(self.integration_a.encrypted_api_token)
+            self.assertEqual(self.integration_a.credential_env_key, "CLIENT_A_API_KEY")
+            self.assertEqual(resolve_integration_token(self.integration_a), "replacement-token")
+        survey.refresh_from_db()
+        self.assertEqual(survey.entry_link, "")
+        self.assertEqual(survey.raw_data, {})
+
+    def test_saving_database_token_disables_environment_source(self):
+        self.integration_a.credential_env_key = "CLIENT_A_API_KEY"
+        self.integration_a.save(update_fields=["credential_env_key"])
+        set_integration_token(self.integration_a, "token-one")
+        self.integration_a.refresh_from_db()
+        self.assertEqual(self.integration_a.credential_env_key, "")
+        self.assertTrue(self.integration_a.encrypted_api_token)
 
     def test_same_provider_source_id_is_unique_per_integration(self):
         Survey.objects.create(integration=self.integration_a, client=self.client_a, source_id=508)
