@@ -4,6 +4,8 @@ from django.db import migrations
 def seed_biobrain(apps, schema_editor):
     Client = apps.get_model("vendors", "Client")
     ClientIntegration = apps.get_model("vendors", "ClientIntegration")
+    if ClientIntegration.objects.filter(provider_code__in=("biobrain", "voqall")).exists():
+        return
     client, created = Client.objects.get_or_create(
         code="biobrain",
         defaults={
