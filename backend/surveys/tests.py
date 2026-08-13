@@ -565,6 +565,43 @@ class SurveyFlowTests(TestCase):
         self.assertNotIn("[#vq_", outbound.lower())
         self.assertFalse(outbound.endswith(('"', "'")))
 
+    @override_settings(
+        ALLOWED_HOSTS=["testserver"],
+        PUBLIC_RESULT_BASE_URL="https://alessarsolutions.in",
+    )
+    def test_biobrain_callback_resolves_vq_token_and_hides_uid_from_result_url(self):
+        client = Client.objects.create(code="bio-callback", name="Bio Callback", provider_code="biobrain")
+        integration = ClientIntegration.objects.create(
+            client=client,
+            name="Bio callback integration",
+            provider_code="biobrain",
+            base_url="https://partner-api.voqall.com/api/v1/surveys",
+        )
+        self.survey.client = client
+        self.survey.integration = integration
+        self.survey.save(update_fields=["client", "integration"])
+        attempt = create_attempt(self.survey, self.platform_user, None)
+
+        response = self.client.get(
+            reverse("biobrain-survey-return", kwargs={"status_code": 4}),
+            {
+                "vq_token": attempt.rid,
+                "vq_uid": attempt.prescreener_uid,
+                "status_id": "4",
+            },
+        )
+
+        self.assertRedirects(
+            response,
+            f"https://alessarsolutions.in/survey?status=4&rid={attempt.rid}",
+            fetch_redirect_response=False,
+        )
+        self.assertNotIn(attempt.prescreener_uid, response["Location"])
+        attempt.refresh_from_db()
+        self.assertEqual(attempt.status, SurveyAttempt.Status.QUALITY_TERMINATED)
+        self.assertEqual(attempt.status_source, "biobrain_browser_callback")
+        self.assertEqual(attempt.callback_count, 1)
+
     def test_repeated_submission_keeps_the_first_redirect_immutable(self):
         start = self.client.get(reverse("survey-start"), {
             "surveyId": self.survey.source_id,

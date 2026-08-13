@@ -19,6 +19,7 @@ ALLOWED_HOSTS = [value.strip() for value in os.getenv("DJANGO_ALLOWED_HOSTS", "l
 API_DOCS_BASIC_USERNAME = os.getenv("API_DOCS_BASIC_USERNAME", "").strip()
 API_DOCS_BASIC_PASSWORD = os.getenv("API_DOCS_BASIC_PASSWORD", "")
 PUBLIC_APP_BASE_URL = os.getenv("PUBLIC_APP_BASE_URL", "").strip().rstrip("/")
+PUBLIC_RESULT_BASE_URL = os.getenv("PUBLIC_RESULT_BASE_URL", PUBLIC_APP_BASE_URL).strip().rstrip("/")
 
 INSTALLED_APPS = [
     "django.contrib.admin",

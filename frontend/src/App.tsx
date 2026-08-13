@@ -5,10 +5,15 @@ import Contact from './components/Contact';
 import Footer from './components/Footer';
 import Navbar from './components/Navbar';
 import LoginPage from './components/LoginPage';
+import SurveyStatusPage from './components/SurveyStatusPage';
 
 function App() {
   if (window.location.pathname.replace(/\/$/, '') === '/login') {
     return <LoginPage />;
+  }
+
+  if (window.location.pathname.replace(/\/$/, '') === '/survey') {
+    return <SurveyStatusPage />;
   }
 
   return (

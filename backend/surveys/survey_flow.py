@@ -299,7 +299,9 @@ def status_rid_from_request(request) -> str:
     matched attempt's canonical ``SurveyAttempt.rid``.
     """
 
-    for name in ("tid", "TID", "trackId", "rid", "RID", "pid", "PID", "qsid", "QSID"):
+    for name in (
+        "vq_token", "VQ_TOKEN", "tid", "TID", "trackId", "rid", "RID", "pid", "PID", "qsid", "QSID"
+    ):
         value = request.GET.get(name)
         if value:
             return value.strip()

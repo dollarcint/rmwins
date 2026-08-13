@@ -19,6 +19,7 @@ from .views import (
     prescreener_data_export,
     termination_reasons_page,
     user_hits_page,
+    biobrain_survey_return,
     survey_start,
     RFGCallbackAPIView,
     rfg_result,
@@ -35,6 +36,7 @@ router.register("survey-attempts", SurveyAttemptViewSet, basename="survey-attemp
 
 urlpatterns = [
     path("survey/start", survey_start, name="survey-start"),
+    path("survey/return/s<int:status_code>/", biobrain_survey_return, name="biobrain-survey-return"),
     path("survey/rfg/callback", RFGCallbackAPIView.as_view(), name="rfg-callback"),
     path("survey/rfg/result", rfg_result, name="rfg-result"),
     path("survey", survey_status, name="survey-status"),

@@ -1551,6 +1551,79 @@ class RFGCallbackAPIView(APIView):
         })
 
 
+def _record_browser_result(attempt, status_code, request, *, source="browser_callback"):
+    """Record the first browser outcome while keeping callback retries idempotent."""
+
+    ip_address = get_request_ip(request)
+    with transaction.atomic():
+        attempt = SurveyAttempt.objects.select_for_update().get(pk=attempt.pk)
+        now = timezone.now()
+        exit_client_data = get_request_client_data(request)
+        if attempt.callback_at is None:
+            attempt.callback_at = now
+            attempt.callback_ip = ip_address
+            attempt.loi_seconds = attempt.calculate_loi_seconds(now)
+            attempt.status = status_code
+            attempt.exit_user_agent = exit_client_data.get("user_agent", "")
+            attempt.exit_browser = exit_client_data.get("browser", "")
+            attempt.exit_device = exit_client_data.get("device", "")
+            attempt.exit_os = exit_client_data.get("os", "")
+            attempt.exit_client_data = exit_client_data
+            attempt.status_source = source
+        attempt.last_callback_at = now
+        attempt.callback_count += 1
+        attempt.save(update_fields=[
+            "callback_at", "callback_ip", "loi_seconds", "status", "exit_user_agent", "exit_browser",
+            "exit_device", "exit_os", "exit_client_data", "status_source", "last_callback_at",
+            "callback_count", "updated_at"
+        ])
+        finalize_attempt_capacity(attempt)
+    return attempt
+
+
+@require_http_methods(["GET"])
+def biobrain_survey_return(request, status_code):
+    """Accept Voqall's return URL using only ``vq_token`` as our canonical RID."""
+
+    status_code = str(status_code)
+    query_status = request.GET.get("status_id", "").strip()
+    rid = (request.GET.get("vq_token") or request.GET.get("VQ_TOKEN") or "").strip()
+    if (
+        status_code not in STATUS_PAGES
+        or (query_status and query_status != status_code)
+        or len(rid) != 10
+        or not rid.isalnum()
+    ):
+        return render(request, "surveys/flow_error.html", {
+            "title": "Invalid Bio Brain callback",
+            "message": "A matching status (1–4) and valid RID token are required.",
+        }, status=400)
+
+    attempt = SurveyAttempt.objects.filter(
+        rid=rid,
+        survey__integration__provider_code="biobrain",
+    ).first()
+    if attempt is None:
+        return render(request, "surveys/flow_error.html", {
+            "title": "Survey attempt not found",
+            "message": "This RID could not be attached to a Bio Brain survey attempt.",
+        }, status=404)
+
+    attempt = _record_browser_result(
+        attempt,
+        status_code,
+        request,
+        source="biobrain_browser_callback",
+    )
+    recorded_status = attempt.status if attempt.status in STATUS_PAGES else status_code
+    result_base_url = settings.PUBLIC_RESULT_BASE_URL or settings.PUBLIC_APP_BASE_URL
+    if not result_base_url:
+        result_base_url = request.build_absolute_uri("/").rstrip("/")
+    return HttpResponseRedirect(
+        f"{result_base_url}/survey?{urlencode({'status': recorded_status, 'rid': attempt.rid})}"
+    )
+
+
 @require_http_methods(["GET"])
 def survey_status(request):
     status_code = request.GET.get("status", "").strip()
@@ -1562,34 +1635,12 @@ def survey_status(request):
             "message": "A valid status (1–4) and RID are required.",
         }, status=400)
 
-    # Public callbacks now accept only the canonical 10-character attempt RID.
+    # Public callbacks resolve only the canonical 10-character attempt RID.
     attempt = SurveyAttempt.objects.filter(rid=callback_identifier).first()
     canonical_rid = attempt.rid if attempt else callback_identifier
     ip_address = get_request_ip(request)
     if attempt:
-        with transaction.atomic():
-            attempt = SurveyAttempt.objects.select_for_update().get(pk=attempt.pk)
-            now = timezone.now()
-            exit_client_data = get_request_client_data(request)
-            if attempt.callback_at is None:
-                attempt.callback_at = now
-                attempt.callback_ip = ip_address
-                attempt.loi_seconds = attempt.calculate_loi_seconds(now)
-                attempt.status = status_code
-                attempt.exit_user_agent = exit_client_data.get("user_agent", "")
-                attempt.exit_browser = exit_client_data.get("browser", "")
-                attempt.exit_device = exit_client_data.get("device", "")
-                attempt.exit_os = exit_client_data.get("os", "")
-                attempt.exit_client_data = exit_client_data
-                attempt.status_source = "browser_callback"
-            attempt.last_callback_at = now
-            attempt.callback_count += 1
-            attempt.save(update_fields=[
-                "callback_at", "callback_ip", "loi_seconds", "status", "exit_user_agent", "exit_browser",
-                "exit_device", "exit_os", "exit_client_data", "status_source", "last_callback_at",
-                "callback_count", "updated_at"
-            ])
-            finalize_attempt_capacity(attempt)
+        attempt = _record_browser_result(attempt, status_code, request)
         status_label = attempt.get_status_display()
     else:
         status_label = "Unknown attempt"
