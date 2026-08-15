@@ -47,7 +47,21 @@ class EnligneProviderTests(SimpleTestCase):
         }
         session = Mock()
         session.get.return_value = response
-        provider = EnligneProvider(self.integration(), session=session)
+        detail_client = Mock()
+        detail_client.get_allocated_surveys.return_value = [{
+            "surveyId": 15800967,
+            "N": 1000,
+            "supCmps": 27,
+            "remainingN": 973,
+            "numberOfStarts": 80,
+            "Country": "United States",
+            "Language": "English",
+            "LanguageCode": "EN",
+            "isQuota": True,
+        }]
+        provider = EnligneProvider(
+            self.integration(), session=session, detail_client=detail_client
+        )
         provider._lms_records = Mock(return_value={
             "LMS-100": {
                 "lms_survey_id": "LMS-100", "survey_id": "15800967",
@@ -69,8 +83,27 @@ class EnligneProviderTests(SimpleTestCase):
         self.assertEqual(str(normalized.values["cpi"]), "1.65")
         self.assertEqual(normalized.values["loi"], 15)
         self.assertEqual(str(normalized.values["incidence_rate"]), "80")
+        self.assertEqual(normalized.values["sample_size"], 1000)
+        self.assertEqual(normalized.values["completes"], 27)
+        self.assertEqual(normalized.values["remaining"], 973)
+        self.assertEqual(normalized.values["country"], "United States")
+        self.assertEqual(normalized.values["country_code"], "US")
+        self.assertIsNone(normalized.values["detail_synced_at"])
         self.assertIn("survey_id=LMS-100", normalized.values["entry_link"])
         self.assertIn("user_id=kanik", normalized.values["entry_link"])
+
+    @patch.dict("os.environ", {"ENLIGNE_DB_PASSWORD": "secret"})
+    @patch("surveys.providers.enligne.replace_survey_details")
+    def test_details_use_original_innovatemr_client(self, replace_details):
+        detail_client = Mock()
+        provider = EnligneProvider(
+            self.integration(), session=Mock(), detail_client=detail_client
+        )
+        survey = SimpleNamespace(source_id=15800967)
+
+        provider.refresh_details(survey)
+
+        replace_details.assert_called_once_with(detail_client, survey)
 
     @patch.dict("os.environ", {"ENLIGNE_DB_PASSWORD": "secret"})
     def test_outbound_link_sends_fixed_user_only_and_never_rid(self):

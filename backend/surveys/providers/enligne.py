@@ -9,7 +9,10 @@ import pymysql
 import requests
 from django.utils import timezone
 
+from surveys.integrations import InnovateMRAPIError, InnovateMRClient
 from surveys.models import Survey
+from surveys.services import replace_survey_details
+from vendors.models import ClientIntegration
 
 from .base import (
     NormalizedSurvey,
@@ -29,7 +32,7 @@ class EnligneProvider(SurveyProvider):
     minimum_sync_interval_seconds = 30
     credential_fields = (("db_password", "Lakshaya DB password environment key"),)
 
-    def __init__(self, integration, *, session=None, db_connect=None):
+    def __init__(self, integration, *, session=None, db_connect=None, detail_client=None):
         super().__init__(integration, session=session or requests.Session())
         self.feed_url = str(integration.base_url or "").strip()
         parsed = urlsplit(self.feed_url)
@@ -65,7 +68,41 @@ class EnligneProvider(SurveyProvider):
         if self.company_filter not in {"innovatemr", "voqall", "prime"}:
             raise ProviderConfigurationError("Enligne company filter is invalid.")
         self.db_connect = db_connect or pymysql.connect
+        self.detail_client = detail_client
         self.inventory_failures = []
+
+    def _innovate_client(self):
+        """Resolve the original InnovateMR API only for enrichment/details."""
+
+        if self.detail_client is not None:
+            return self.detail_client
+        configured_id = (self.integration.config or {}).get("detail_integration_id")
+        integrations = ClientIntegration.objects.filter(
+            client_id=self.integration.client_id,
+            provider_code="innovatemr",
+        ).exclude(pk=self.integration.pk)
+        if configured_id:
+            integrations = integrations.filter(pk=configured_id)
+        detail_integration = integrations.order_by("pk").first()
+        if detail_integration is None:
+            raise ProviderConfigurationError(
+                "Enligne requires the client's original InnovateMR API integration for details."
+            )
+        self.detail_client = InnovateMRClient(integration=detail_integration)
+        return self.detail_client
+
+    def _innovate_inventory(self):
+        """Index live InnovateMR metadata without using it as inventory authority."""
+
+        try:
+            rows = self._innovate_client().get_allocated_surveys()
+        except InnovateMRAPIError as exc:
+            raise ProviderError("InnovateMR enrichment request failed.") from exc
+        return {
+            str(row.get("surveyId") or "").strip(): self._json_safe(row)
+            for row in rows
+            if str(row.get("surveyId") or "").strip()
+        }
 
     def _connection(self):
         """Open a short-lived DB connection; all adapter SQL is SELECT-only."""
@@ -153,6 +190,7 @@ class EnligneProvider(SurveyProvider):
         feed_rows = self._feed_rows()
         lms_ids = list(dict.fromkeys(str(row["survey_id"]) for row in feed_rows))
         records = self._lms_records(lms_ids)
+        innovate_inventory = self._innovate_inventory()
         inventory = []
         self.inventory_failures = []
         for row in feed_rows:
@@ -167,7 +205,11 @@ class EnligneProvider(SurveyProvider):
             if not actual_survey_id:
                 self.inventory_failures.append({"lms_survey_id": lms_id, "reason": "missing_survey_id"})
                 continue
-            inventory.append({**self._json_safe(row), "_lms": metadata})
+            inventory.append({
+                **self._json_safe(row),
+                "_lms": metadata,
+                "_innovate": innovate_inventory.get(actual_survey_id, {}),
+            })
         return inventory
 
     def test_connection(self):
@@ -218,11 +260,13 @@ class EnligneProvider(SurveyProvider):
 
     def normalize_inventory_item(self, payload, seen_at):
         metadata = payload.get("_lms") if isinstance(payload.get("_lms"), dict) else {}
+        innovate = payload.get("_innovate") if isinstance(payload.get("_innovate"), dict) else {}
         source_key = str(metadata.get("survey_id") or "").strip()
         if not source_key:
             raise ProviderError("Enligne LMS metadata is missing the actual survey ID.")
         lms_id = str(payload.get("survey_id") or "").strip()
-        country = str(payload.get("country") or metadata.get("surveyLocalization") or "").strip().upper()
+        country_code = str(payload.get("country") or metadata.get("surveyLocalization") or "").strip().upper()
+        country_name = str(innovate.get("Country") or country_code).strip()
         loi = self._integer(metadata.get("loi"))
         ir = self._decimal(metadata.get("ir"))
         modified = None
@@ -237,11 +281,12 @@ class EnligneProvider(SurveyProvider):
                 except (TypeError, ValueError):
                     pass
         raw_data = {
-            "feed": {key: value for key, value in payload.items() if key != "_lms"},
+            "feed": {key: value for key, value in payload.items() if key not in {"_lms", "_innovate"}},
             "lms": metadata,
+            "innovatemr": innovate,
             "lms_survey_id": lms_id,
             "actual_survey_id": source_key,
-            "adapter": "enligne_innovatemr_v1",
+            "adapter": "enligne_innovatemr_v2",
         }
         return NormalizedSurvey(
             source_key=source_key,
@@ -252,18 +297,28 @@ class EnligneProvider(SurveyProvider):
                 "company_name": "InnovateMR",
                 "name": str(metadata.get("survey_name") or payload.get("name") or "Enligne Survey"),
                 "status": Survey.Status.LIVE,
+                "sample_size": self._integer(innovate.get("N")) or 0,
+                "completes": self._integer(innovate.get("supCmps")) or 0,
+                "remaining": self._integer(innovate.get("remainingN")) or 0,
+                "starts": self._integer(innovate.get("numberOfStarts")) or 0,
                 "cpi": self._money(payload.get("payout")),
                 "loi": loi,
                 "incidence_rate": ir,
-                "country": country,
-                "country_code": country,
+                "country": country_name,
+                "country_code": country_code,
+                "language": str(innovate.get("Language") or ""),
+                "language_code": str(innovate.get("LanguageCode") or "").upper(),
+                "group_type": str(innovate.get("groupType") or ""),
+                "buyer_id": str(innovate.get("BuyerId") or innovate.get("buyerId") or ""),
+                "device_type": str(innovate.get("deviceType") or ""),
+                "has_quota": bool(innovate.get("isQuota")),
                 "entry_link": self._hosted_link(payload.get("entry_url")),
                 "source_created_at": modified,
                 "source_modified_at": modified,
                 "last_seen_at": seen_at,
-                "detail_synced_at": seen_at,
-                "quota_synced_at": seen_at,
-                "targeting_synced_at": seen_at,
+                "detail_synced_at": None,
+                "quota_synced_at": None,
+                "targeting_synced_at": None,
                 "raw_data": raw_data,
             },
         )
@@ -271,21 +326,16 @@ class EnligneProvider(SurveyProvider):
     def prepare_inventory_item(self, normalized, existing_survey=None):
         # Detail timestamps describe the feed/DB snapshot, not the current sync
         # clock. Preserve them so unchanged rows remain unchanged on later runs.
-        if existing_survey is not None:
+        if (
+            existing_survey is not None
+            and (existing_survey.raw_data or {}).get("adapter") == "enligne_innovatemr_v2"
+        ):
             for field in ("detail_synced_at", "quota_synced_at", "targeting_synced_at"):
                 normalized.values[field] = getattr(existing_survey, field) or normalized.values[field]
         return normalized
 
     def refresh_details(self, survey):
-        now = timezone.now()
-        Survey.objects.filter(pk=survey.pk).update(
-            detail_synced_at=now,
-            quota_synced_at=now,
-            targeting_synced_at=now,
-        )
-        survey.detail_synced_at = now
-        survey.quota_synced_at = now
-        survey.targeting_synced_at = now
+        replace_survey_details(self._innovate_client(), survey)
 
     def build_outbound_url(self, survey, attempt, answers):
         """Use the Enligne hosted link with fixed user_id=kanik and no Alessar RID."""
