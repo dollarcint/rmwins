@@ -161,8 +161,8 @@ def build_excel_response(filename: str, sheets: list[ExcelSheet]) -> FileRespons
         style_id = len(workbook_sheets) + 1
         archive.writestr("xl/_rels/workbook.xml.rels", f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{relationships}<Relationship Id="rId{style_id}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>''')
         archive.writestr("xl/styles.xml", _styles_xml())
-        archive.writestr("docProps/core.xml", '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:creator>Exchange Hub</dc:creator><dc:title>Exchange Hub export</dc:title></cp:coreProperties>''')
-        archive.writestr("docProps/app.xml", '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Application>Exchange Hub</Application></Properties>''')
+        archive.writestr("docProps/core.xml", '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?><cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:creator>Alessar Solutions</dc:creator><dc:title>Alessar Solutions export</dc:title></cp:coreProperties>''')
+        archive.writestr("docProps/app.xml", '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Application>Alessar Solutions</Application></Properties>''')
         for index, sheet in enumerate(workbook_sheets, 1):
             _sheet_xml(archive, f"xl/worksheets/sheet{index}.xml", sheet)
     output.seek(0)
