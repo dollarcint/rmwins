@@ -252,9 +252,10 @@ def refresh_client_integration_details(integration: ClientIntegration, *, limit=
         integration=integration,
         status=Survey.Status.LIVE,
     )
-    if integration.provider_code == "cint":
-        # Cint's list endpoints do not expose a modified timestamp and quota
-        # capacity is real-time, so rotate through the oldest detail snapshots.
+    if integration.provider_code in {"cint", "enligne"}:
+        # These inventory feeds do not carry complete targeting/quota detail.
+        # Rotate through the oldest snapshots so detail hydration continues
+        # after the initial backfill without creating an API request burst.
         candidates = candidates.order_by("detail_synced_at", "pk")[:batch]
     else:
         candidates = candidates.filter(
