@@ -300,7 +300,7 @@ def status_rid_from_request(request) -> str:
     """
 
     for name in (
-        "vq_token", "VQ_TOKEN", "tid", "TID", "trackId", "rid", "RID", "pid", "PID", "qsid", "QSID"
+        "vq_token", "VQ_TOKEN", "tid", "TID", "trackId", "rid", "RID", "pid", "PID", "qsid", "QSID", "lid", "LID"
     ):
         value = request.GET.get(name)
         if value:

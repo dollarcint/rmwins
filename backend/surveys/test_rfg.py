@@ -721,3 +721,30 @@ class ResearchForGoodIntegrationTests(TestCase):
         self.assertNotContains(response, attempt.prescreener_uid)
         attempt.refresh_from_db()
         self.assertEqual(attempt.status, SurveyAttempt.Status.TERMINATED)
+
+    def test_generic_status_accepts_lid_alias_as_platform_rid(self):
+        survey = Survey.objects.create(
+            client=self.client_record,
+            integration=self.integration,
+            source_key="RFG123456-lid",
+            country_code="US",
+            status=Survey.Status.LIVE,
+        )
+        attempt = SurveyAttempt.objects.create(
+            rid="Lid123Rid9",
+            prescreener_uid="Uid1-Prov-Lid2-0005",
+            survey=survey,
+            user_id="42",
+            status=SurveyAttempt.Status.REDIRECTED,
+        )
+
+        response = self.client.get("/survey", {
+            "status": "2",
+            "lid": attempt.rid,
+        })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, attempt.rid)
+        self.assertNotContains(response, attempt.prescreener_uid)
+        attempt.refresh_from_db()
+        self.assertEqual(attempt.status, SurveyAttempt.Status.TERMINATED)

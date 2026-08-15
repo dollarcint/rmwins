@@ -242,7 +242,7 @@ class EnligneProvider(SurveyProvider):
         amount = cls._decimal(value)
         return amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) if amount is not None else None
 
-    def _hosted_link(self, value):
+    def _hosted_link(self, value, track_id: str = ""):
         parts = urlsplit(str(value or "").strip())
         if parts.scheme != "https" or parts.hostname not in {"enlignesurvey.com", "www.enlignesurvey.com"}:
             raise ProviderError("Enligne feed supplied an invalid hosted entry URL.")
@@ -252,10 +252,16 @@ class EnligneProvider(SurveyProvider):
             if key.lower() == "user_id":
                 query.append((key, self.outbound_user_id))
                 has_user_id = True
+            elif key.lower() in {"trackid", "lid"}:
+                if track_id:
+                    continue
+                query.append((key, item))
             else:
                 query.append((key, item))
         if not has_user_id:
             query.append(("user_id", self.outbound_user_id))
+        if track_id:
+            query.append(("trackId", track_id))
         return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
 
     def normalize_inventory_item(self, payload, seen_at):
@@ -338,6 +344,6 @@ class EnligneProvider(SurveyProvider):
         replace_survey_details(self._innovate_client(), survey)
 
     def build_outbound_url(self, survey, attempt, answers):
-        """Use the Enligne hosted link with fixed user_id=kanik and no Alessar RID."""
+        """Use the Enligne hosted link with fixed user_id=kanik and attempt RID tracking."""
 
-        return self._hosted_link(survey.entry_link)
+        return self._hosted_link(survey.entry_link, track_id=attempt.rid)

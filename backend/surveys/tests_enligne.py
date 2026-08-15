@@ -120,9 +120,9 @@ class EnligneProviderTests(SimpleTestCase):
 
         self.assertIn("user_id=kanik", outbound)
         self.assertIn("survey_id=LMS-100", outbound)
-        self.assertNotIn(attempt.rid, outbound)
+        self.assertIn(f"trackId={attempt.rid}", outbound)
         self.assertNotIn("PID=", outbound)
-        self.assertNotIn("trackId=", outbound)
+        self.assertEqual(outbound.count("trackId="), 1)
 
     @patch.dict("os.environ", {"ENLIGNE_DB_PASSWORD": "secret"})
     def test_lakshaya_lookup_executes_select_only(self):
