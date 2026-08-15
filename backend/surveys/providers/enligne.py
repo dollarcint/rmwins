@@ -1,7 +1,7 @@
 """Enligne hosted-feed adapter backed by read-only Lakshaya LMS metadata."""
 
 from datetime import date, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -195,6 +195,11 @@ class EnligneProvider(SurveyProvider):
         except (TypeError, ValueError):
             return None
 
+    @classmethod
+    def _money(cls, value):
+        amount = cls._decimal(value)
+        return amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) if amount is not None else None
+
     def _hosted_link(self, value):
         parts = urlsplit(str(value or "").strip())
         if parts.scheme != "https" or parts.hostname not in {"enlignesurvey.com", "www.enlignesurvey.com"}:
@@ -247,7 +252,7 @@ class EnligneProvider(SurveyProvider):
                 "company_name": "InnovateMR",
                 "name": str(metadata.get("survey_name") or payload.get("name") or "Enligne Survey"),
                 "status": Survey.Status.LIVE,
-                "cpi": self._decimal(payload.get("payout")),
+                "cpi": self._money(payload.get("payout")),
                 "loi": loi,
                 "incidence_rate": ir,
                 "country": country,

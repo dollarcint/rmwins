@@ -32,7 +32,7 @@ class EnligneProviderTests(SimpleTestCase):
                 {
                     "survey_id": "LMS-100",
                     "name": "Enligne Survey",
-                    "payout": "1.25",
+                    "payout": "1.645",
                     "entry_url": "https://enlignesurvey.com/start_survey?survey_id=LMS-100&user_id={userId}&company=innovatemr",
                     "country": "US",
                 },
@@ -66,7 +66,7 @@ class EnligneProviderTests(SimpleTestCase):
         self.assertEqual(len(inventory), 1)
         self.assertEqual(normalized.source_key, "15800967")
         self.assertEqual(normalized.numeric_source_id, 15800967)
-        self.assertEqual(str(normalized.values["cpi"]), "1.25")
+        self.assertEqual(str(normalized.values["cpi"]), "1.65")
         self.assertEqual(normalized.values["loi"], 15)
         self.assertEqual(str(normalized.values["incidence_rate"]), "80")
         self.assertIn("survey_id=LMS-100", normalized.values["entry_link"])
