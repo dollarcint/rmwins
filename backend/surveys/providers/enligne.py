@@ -11,7 +11,7 @@ from django.utils import timezone
 
 from surveys.integrations import InnovateMRAPIError, InnovateMRClient
 from surveys.models import Survey
-from surveys.services import replace_survey_details
+from surveys.services import parse_upstream_datetime, replace_survey_details
 from vendors.models import ClientIntegration
 
 from .base import (
@@ -287,8 +287,20 @@ class EnligneProvider(SurveyProvider):
         country_name = str(innovate.get("Country") or country_code).strip()
         loi = self._integer(metadata.get("loi"))
         ir = self._decimal(metadata.get("ir"))
-        created_at = self._parse_datetime(metadata.get("createdAt"))
-        modified = self._parse_datetime(metadata.get("updatedAt")) or created_at
+        # Lakshaya rows frequently have NULL createdAt/updatedAt values.  The
+        # actual survey ID lets us use the matched InnovateMR inventory row as
+        # the authoritative timestamp fallback without trusting the feed.
+        created_display = metadata.get("createdAt") or innovate.get("createdDate")
+        modified_display = metadata.get("updatedAt") or innovate.get("modifiedDate")
+        created_at = (
+            self._parse_datetime(metadata.get("createdAt"))
+            or parse_upstream_datetime(innovate.get("createdDate"))
+        )
+        modified = (
+            self._parse_datetime(metadata.get("updatedAt"))
+            or parse_upstream_datetime(innovate.get("modifiedDate"))
+            or created_at
+        )
         raw_data = {
             "feed": {key: value for key, value in payload.items() if key not in {"_lms", "_innovate"}},
             "lms": metadata,
@@ -296,8 +308,8 @@ class EnligneProvider(SurveyProvider):
             "lms_survey_id": lms_id,
             "actual_survey_id": source_key,
             "adapter": "enligne_innovatemr_v2",
-            "createdDate": metadata.get("createdAt"),
-            "modifiedDate": metadata.get("updatedAt"),
+            "createdDate": created_display,
+            "modifiedDate": modified_display or created_display,
             "source_created_at": created_at.isoformat() if created_at else None,
             "source_modified_at": modified.isoformat() if modified else None,
         }

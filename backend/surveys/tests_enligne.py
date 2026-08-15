@@ -58,6 +58,8 @@ class EnligneProviderTests(SimpleTestCase):
             "Language": "English",
             "LanguageCode": "EN",
             "isQuota": True,
+            "createdDate": "08/05/2026, 11:06:59 am PST",
+            "modifiedDate": "08/10/2026, 2:13:12 am PST",
         }]
         provider = EnligneProvider(
             self.integration(), session=session, detail_client=detail_client
@@ -88,6 +90,16 @@ class EnligneProviderTests(SimpleTestCase):
         self.assertEqual(normalized.values["remaining"], 973)
         self.assertEqual(normalized.values["country"], "United States")
         self.assertEqual(normalized.values["country_code"], "US")
+        self.assertIsNotNone(normalized.values["source_created_at"])
+        self.assertIsNotNone(normalized.values["source_modified_at"])
+        self.assertEqual(
+            normalized.raw_data["createdDate"],
+            "08/05/2026, 11:06:59 am PST",
+        )
+        self.assertEqual(
+            normalized.raw_data["modifiedDate"],
+            "08/10/2026, 2:13:12 am PST",
+        )
         self.assertIsNone(normalized.values["detail_synced_at"])
         self.assertIn("survey_id=LMS-100", normalized.values["entry_link"])
         self.assertIn("user_id=kanik", normalized.values["entry_link"])
