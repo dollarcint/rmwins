@@ -281,10 +281,32 @@ class SurveyListSerializer(serializers.ModelSerializer):
         return round((obj.completes / obj.sample_size) * 100, 1) if obj.sample_size else 0
 
     def get_source_created_display(self, obj) -> str | None:
-        return obj.raw_data.get("createdDate") or None
+        raw_data = obj.raw_data or {}
+        return (
+            raw_data.get("createdDate")
+            or raw_data.get("source_created_at")
+            or self._serialize_datetime_display(obj.source_created_at)
+        )
 
     def get_source_modified_display(self, obj) -> str | None:
-        return obj.raw_data.get("modifiedDate") or obj.raw_data.get("lastModified") or None
+        raw_data = obj.raw_data or {}
+        return (
+            raw_data.get("modifiedDate")
+            or raw_data.get("lastModified")
+            or raw_data.get("source_modified_at")
+            or self._serialize_datetime_display(obj.source_modified_at)
+        )
+
+    @staticmethod
+    def _serialize_datetime_display(value):
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value
+        try:
+            return value.isoformat()
+        except AttributeError:
+            return str(value)
 
     def _pricing(self, obj):
         request = self.context.get("request")

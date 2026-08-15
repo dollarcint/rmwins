@@ -134,6 +134,18 @@ class EnligneProvider(SurveyProvider):
             return [EnligneProvider._json_safe(item) for item in value]
         return value
 
+    @staticmethod
+    def _parse_datetime(raw):
+        if raw is None or raw == "":
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if timezone.is_naive(parsed):
+                parsed = timezone.make_aware(parsed)
+            return parsed
+        except (TypeError, ValueError):
+            return None
+
     def _feed_rows(self):
         try:
             response = self.session.get(
@@ -275,17 +287,8 @@ class EnligneProvider(SurveyProvider):
         country_name = str(innovate.get("Country") or country_code).strip()
         loi = self._integer(metadata.get("loi"))
         ir = self._decimal(metadata.get("ir"))
-        modified = None
-        for key in ("updatedAt", "createdAt"):
-            raw = metadata.get(key)
-            if raw:
-                try:
-                    modified = datetime.fromisoformat(str(raw))
-                    if timezone.is_naive(modified):
-                        modified = timezone.make_aware(modified)
-                    break
-                except (TypeError, ValueError):
-                    pass
+        created_at = self._parse_datetime(metadata.get("createdAt"))
+        modified = self._parse_datetime(metadata.get("updatedAt")) or created_at
         raw_data = {
             "feed": {key: value for key, value in payload.items() if key not in {"_lms", "_innovate"}},
             "lms": metadata,
@@ -293,6 +296,10 @@ class EnligneProvider(SurveyProvider):
             "lms_survey_id": lms_id,
             "actual_survey_id": source_key,
             "adapter": "enligne_innovatemr_v2",
+            "createdDate": metadata.get("createdAt"),
+            "modifiedDate": metadata.get("updatedAt"),
+            "source_created_at": created_at.isoformat() if created_at else None,
+            "source_modified_at": modified.isoformat() if modified else None,
         }
         return NormalizedSurvey(
             source_key=source_key,
@@ -319,7 +326,7 @@ class EnligneProvider(SurveyProvider):
                 "device_type": str(innovate.get("deviceType") or ""),
                 "has_quota": bool(innovate.get("isQuota")),
                 "entry_link": self._hosted_link(payload.get("entry_url")),
-                "source_created_at": modified,
+                "source_created_at": created_at,
                 "source_modified_at": modified,
                 "last_seen_at": seen_at,
                 "detail_synced_at": None,
