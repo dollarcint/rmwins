@@ -227,7 +227,7 @@ class SurveySyncTests(TestCase):
             base_url="https://enlignesurvey.com/get/api_feed/feed-id",
             scheduled_sync_enabled=True,
             sync_interval_seconds=30,
-            last_sync_started_at=now - timedelta(seconds=31),
+            last_sync_started_at=now - timedelta(seconds=29, milliseconds=250),
             last_sync_finished_at=now - timedelta(seconds=5),
             last_sync_status="success",
         )

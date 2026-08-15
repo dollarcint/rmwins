@@ -68,7 +68,11 @@ def dispatch_due_integrations_task():
         due_at = (last_activity or (now - timedelta(days=1))) + timedelta(
             seconds=interval_seconds
         )
-        if due_at <= now:
+        # The worker records its real start a few milliseconds after the
+        # dispatcher tick. Without this tolerance, a 30-second Enligne job can
+        # miss the next tick and accidentally run once per minute.
+        due_tolerance = timedelta(seconds=1) if integration.provider_code == "enligne" else timedelta()
+        if due_at <= now + due_tolerance:
             ClientIntegration.objects.filter(pk=integration.pk).update(
                 last_sync_started_at=now, last_sync_status="queued", last_sync_error="",
             )
