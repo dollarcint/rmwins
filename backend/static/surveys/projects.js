@@ -37,7 +37,15 @@
   };
 
   const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[char]));
-  const formatDate = (value) => value ? new Intl.DateTimeFormat('en-IN', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value)) : '—';
+  const formatDate = (value) => {
+    if (!value) return '—';
+    const formatted = new Intl.DateTimeFormat('en-IN', {
+      day: '2-digit', month: 'short', year: 'numeric',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true,
+      timeZone: 'Asia/Kolkata',
+    }).format(new Date(value));
+    return `${formatted} IST`;
+  };
   const money = (value) => value == null ? '—' : `$${Number(value).toFixed(2)}`;
   const filterDefaults = {
     country: 'All countries', status: 'All statuses', company: 'All clients', client_name: 'All clients',
@@ -308,7 +316,7 @@
     if (projectColumns.has('cpi')) cells.push(`<td><strong class="cpi">${money(survey.cpi)}</strong></td>`);
     if (projectColumns.has('loi_ir')) cells.push(`<td><div class="metric-pair"><span><b>${survey.loi ?? '—'}</b> min</span><span><b>${survey.incidence_rate ?? '—'}</b>%</span></div><small class="survey-type-tag">${escapeHtml(survey.survey_type || survey.group_type || 'Type unavailable')}</small></td>`);
     if (projectColumns.has('entry_link')) cells.push(`<td><button class="copy-link" data-copy-link="${escapeHtml(survey.start_link)}">Copy link</button></td>`);
-    if (projectColumns.has('modified')) cells.push(`<td><div class="source-timestamp">${sourceTimestamp(survey.source_modified_display, survey.source_modified_at)}</div><small class="created-date">Created ${escapeHtml(survey.source_created_display || formatDate(survey.source_created_at))}</small><small class="status ${survey.status}"><i></i>${escapeHtml(survey.status)}</small></td>`);
+    if (projectColumns.has('modified')) cells.push(`<td><div class="source-timestamp">${sourceTimestamp(survey.source_modified_display, survey.source_modified_at)}</div><small class="created-date">Created ${escapeHtml(formatDate(survey.source_created_at))}</small><small class="status ${survey.status}"><i></i>${escapeHtml(survey.status)}</small></td>`);
     if (projectColumns.has('actions')) cells.push(`<td><button class="eye-button" data-action="${escapeHtml(survey.local_id)}" aria-label="View details for ${escapeHtml(survey.name)}">◉</button></td>`);
     return `<tr>${cells.length ? cells.join('') : '<td><div class="column-denied">No project columns are assigned to your account.</div></td>'}</tr>`;
   }
