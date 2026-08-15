@@ -377,6 +377,44 @@ class SurveyAPITests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["count"], 2)
 
+    def test_inactive_integration_inventory_is_hidden_when_replaced(self):
+        client = Client.objects.create(
+            code="replace-innovate", name="InnovateMR", provider_code="innovatemr"
+        )
+        old_integration = ClientIntegration.objects.create(
+            client=client,
+            name="Primary InnovateMR",
+            provider_code="innovatemr",
+            base_url="https://supplier.innovatemr.net/api/v2",
+            is_active=False,
+        )
+        replacement = ClientIntegration.objects.create(
+            client=client,
+            name="Enligne InnovateMR Feed",
+            provider_code="enligne",
+            base_url="https://enlignesurvey.com/get/api_feed/feed-id",
+            is_active=True,
+        )
+        self.survey.client = client
+        self.survey.integration = old_integration
+        self.survey.save(update_fields=["client", "integration"])
+        visible = Survey.objects.create(
+            client=client,
+            integration=replacement,
+            source_id=self.survey.source_id,
+            source_key=self.survey.source_key,
+            country="GB",
+            country_code="GB",
+            status=Survey.Status.LIVE,
+        )
+
+        response = self.api.get(reverse("survey-list"), {"search": str(self.survey.source_id)})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(response.data["results"][0]["local_id"], visible.local_id)
+        self.assertEqual(response.data["results"][0]["country_code"], "GB")
+
     def test_buyer_and_survey_type_filters_are_server_side(self):
         self.survey.buyer_id = "3690"
         self.survey.group_type = "Consumer"

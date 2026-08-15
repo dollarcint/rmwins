@@ -303,7 +303,10 @@ def dashboard_page(request):
 @function_permission_required("projects.view")
 def projects_page(request):
     codes = effective_permission_codes(request.user)
-    visible_surveys = scope_surveys_for_user(Survey.objects.all(), request.user)
+    inventory_surveys = Survey.objects.filter(
+        Q(integration__isnull=True) | Q(integration__is_active=True)
+    )
+    visible_surveys = scope_surveys_for_user(inventory_surveys, request.user)
     is_client_scoped_panel = bool(
         vendor_scope_user_id(request.user) or organization_client_ids_for_user(request.user) is not None
     )
@@ -1751,7 +1754,10 @@ class SurveyViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = [HasFunctionPermission]
 
     def get_queryset(self):
-        queryset = scope_surveys_for_user(super().get_queryset(), self.request.user)
+        inventory = super().get_queryset().filter(
+            Q(integration__isnull=True) | Q(integration__is_active=True)
+        )
+        queryset = scope_surveys_for_user(inventory, self.request.user)
         if self.action == "retrieve":
             queryset = queryset.prefetch_related("quotas", "targeting_questions")
         return queryset
