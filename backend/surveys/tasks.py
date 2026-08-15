@@ -59,7 +59,12 @@ def dispatch_due_integrations_task():
         }.get(integration.provider_code, integration.sync_interval_seconds)
         minimum_interval_seconds = 30 if integration.provider_code == "enligne" else 60
         interval_seconds = max(minimum_interval_seconds, interval_seconds)
-        last_activity = integration.last_sync_finished_at or integration.last_sync_started_at
+        if integration.provider_code == "enligne":
+            # Enligne's 30-second interval is start-to-start. The integration
+            # lease still prevents overlap if a fetch takes longer than usual.
+            last_activity = integration.last_sync_started_at or integration.last_sync_finished_at
+        else:
+            last_activity = integration.last_sync_finished_at or integration.last_sync_started_at
         due_at = (last_activity or (now - timedelta(days=1))) + timedelta(
             seconds=interval_seconds
         )

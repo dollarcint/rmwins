@@ -211,6 +211,32 @@ class SurveySyncTests(TestCase):
         self.assertNotIn(integration.pk, result["queued"])
         delay.assert_not_called()
 
+    @patch("surveys.tasks.sync_client_integration_task.delay")
+    def test_enligne_dispatcher_uses_a_30_second_start_to_start_interval(self, delay):
+        from .tasks import dispatch_due_integrations_task
+
+        ClientIntegration.objects.all().delete()
+        now = timezone.now()
+        client = Client.objects.create(
+            code="enligne-innovate", name="Enligne Innovate", provider_code="innovatemr"
+        )
+        integration = ClientIntegration.objects.create(
+            client=client,
+            name="Enligne automatic",
+            provider_code="enligne",
+            base_url="https://enlignesurvey.com/get/api_feed/feed-id",
+            scheduled_sync_enabled=True,
+            sync_interval_seconds=30,
+            last_sync_started_at=now - timedelta(seconds=31),
+            last_sync_finished_at=now - timedelta(seconds=5),
+            last_sync_status="success",
+        )
+
+        result = dispatch_due_integrations_task()
+
+        self.assertIn(integration.pk, result["queued"])
+        delay.assert_called_once_with(integration.pk)
+
 
     @patch("surveys.tasks.sync_client_integration_task.delay")
     def test_hidden_biobrain_is_queued_only_after_its_api_key_exists(self, delay):

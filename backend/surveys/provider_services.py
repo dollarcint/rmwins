@@ -136,6 +136,7 @@ def sync_client_integration(integration: ClientIntegration, *, refresh_details=F
         run.detail_failures += len(getattr(provider, "inventory_failures", []))
 
         with transaction.atomic():
+            enligne_unchanged_ids = []
             for source_key, normalized in normalized_rows.items():
                 survey = Survey.objects.filter(integration=integration, source_key=source_key).first()
                 _preserve_provider_local_state(integration, survey, normalized)
@@ -163,10 +164,20 @@ def sync_client_integration(integration: ClientIntegration, *, refresh_details=F
                     run.updated += 1
                     touched.append(survey)
                 else:
-                    survey.last_seen_at = now
-                    survey.integration = integration
-                    survey.save(update_fields=["last_seen_at", "integration", "updated_at"])
+                    if integration.provider_code == "enligne":
+                        enligne_unchanged_ids.append(survey.pk)
+                    else:
+                        survey.last_seen_at = now
+                        survey.integration = integration
+                        survey.save(update_fields=["last_seen_at", "integration", "updated_at"])
                     run.unchanged += 1
+
+            if enligne_unchanged_ids:
+                # A 30-second feed must not issue thousands of one-row UPDATEs.
+                Survey.objects.filter(pk__in=enligne_unchanged_ids).update(
+                    last_seen_at=now,
+                    updated_at=now,
+                )
 
             if provider.close_missing_inventory_items:
                 run.closed = Survey.objects.filter(
