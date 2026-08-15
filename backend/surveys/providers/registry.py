@@ -7,11 +7,13 @@ def _provider_classes():
     """Import specialized adapters lazily to avoid provider/model import cycles."""
 
     from .cint import CintProvider
+    from .enligne import EnligneProvider
     from .rfg import ResearchForGoodProvider
 
     return {
         ResearchForGoodProvider.code: ResearchForGoodProvider,
         CintProvider.code: CintProvider,
+        EnligneProvider.code: EnligneProvider,
     }
 
 

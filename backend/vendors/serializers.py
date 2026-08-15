@@ -3,6 +3,7 @@
 from decimal import Decimal
 import ipaddress
 import re
+from urllib.parse import urlsplit
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError as DjangoValidationError
@@ -299,6 +300,44 @@ class ClientIntegrationSerializer(serializers.ModelSerializer):
                 getattr(self.instance, "transaction_result_key", ""),
             ) or "").strip():
                 attrs["transaction_result_key"] = "result"
+        elif provider_key == "enligne":
+            parsed = urlsplit(base_url)
+            if (
+                parsed.scheme != "https"
+                or parsed.hostname not in {"enlignesurvey.com", "www.enlignesurvey.com"}
+                or not re.fullmatch(r"/get/api_feed/[A-Za-z0-9-]+/?", parsed.path)
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise serializers.ValidationError({
+                    "base_url": "Use the complete HTTPS Enligne /get/api_feed/<feed-id> URL."
+                })
+            credential_env_key = str(attrs.get(
+                "credential_env_key", getattr(self.instance, "credential_env_key", "")
+            ) or "").strip()
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", credential_env_key):
+                raise serializers.ValidationError({
+                    "credential_env_key": "Use the environment-variable name containing the Lakshaya DB password."
+                })
+            config = attrs.get("config", getattr(self.instance, "config", {})) or {}
+            allowed_config = {
+                "db_host", "db_port", "db_name", "db_user", "company_filter",
+                "outbound_user_id", "timeout_seconds", "detail_refresh_batch",
+            }
+            unexpected = set(config) - allowed_config
+            if unexpected:
+                raise serializers.ValidationError({
+                    "config": f"Unsupported Enligne settings: {', '.join(sorted(unexpected))}."
+                })
+            if not str(config.get("db_user") or "").strip():
+                raise serializers.ValidationError({"config": "Enligne db_user is required."})
+            if str(config.get("company_filter") or "innovatemr").lower() not in {"innovatemr", "voqall", "prime"}:
+                raise serializers.ValidationError({"config": "Enligne company_filter is invalid."})
+            if not re.fullmatch(r"[A-Za-z0-9_.@-]+", str(config.get("outbound_user_id") or "kanik")):
+                raise serializers.ValidationError({"config": "Enligne outbound_user_id is invalid."})
+            attrs.setdefault("sync_interval_seconds", 150)
+            attrs.setdefault("scheduled_sync_enabled", False)
+            set_default("inventory_result_key", "data")
         elif provider_key in {"biobrain", "voqall"} or "voqall.com" in base_url.lower():
             api_root = base_url[:-8] if base_url.lower().endswith("/surveys") else base_url
             current_inventory = attrs.get(

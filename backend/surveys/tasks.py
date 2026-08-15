@@ -180,7 +180,11 @@ def sync_innovatemr_surveys_task():
 
 @shared_task(name="surveys.refresh_stale_details")
 def refresh_stale_details_task():
-    integration = ClientIntegration.objects.filter(is_active=True, client__is_active=True).order_by("id").first()
+    integration = ClientIntegration.objects.filter(
+        is_active=True,
+        client__is_active=True,
+        provider_code__in=("innovatemr", "biobrain", "voqall"),
+    ).order_by("id").first()
     if not integration:
         return {"status": "skipped", "reason": "no active integration"}
     api = InnovateMRClient(integration=integration)
@@ -204,7 +208,7 @@ def reconcile_pending_attempts_task():
     lookback = now - timedelta(hours=settings.INNOVATEMR_ATTEMPT_RECONCILE_LOOKBACK_HOURS)
     pending = SurveyAttempt.objects.select_related("survey__integration").filter(
         status=SurveyAttempt.Status.REDIRECTED, callback_at__isnull=True, initiated_at__gte=lookback,
-    ).exclude(survey__integration__provider_code__in=("rfg", "cint")).filter(
+    ).exclude(survey__integration__provider_code__in=("rfg", "cint", "enligne")).filter(
         Q(upstream_checked_at__isnull=True) | Q(upstream_checked_at__lte=retry_before)
     ).order_by(
         "upstream_checked_at", "-initiated_at"

@@ -63,7 +63,8 @@ def provider_preview(integration: ClientIntegration, limit: int = 10) -> dict:
 def test_provider_connection(integration: ClientIntegration) -> dict:
     now = timezone.now()
     try:
-        result = get_provider(integration).test_connection()
+        provider = get_provider(integration)
+        result = provider.test_connection()
     except Exception as exc:
         ClientIntegration.objects.filter(pk=integration.pk).update(
             last_tested_at=now,
@@ -77,7 +78,7 @@ def test_provider_connection(integration: ClientIntegration) -> dict:
         last_test_status="success",
         last_test_error="",
         scheduled_sync_enabled=True,
-        sync_interval_seconds=60,
+        sync_interval_seconds=provider.minimum_sync_interval_seconds,
     )
     return result
 
