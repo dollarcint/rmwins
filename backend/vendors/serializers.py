@@ -335,7 +335,7 @@ class ClientIntegrationSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({"config": "Enligne company_filter is invalid."})
             if not re.fullmatch(r"[A-Za-z0-9_.@-]+", str(config.get("outbound_user_id") or "kanik")):
                 raise serializers.ValidationError({"config": "Enligne outbound_user_id is invalid."})
-            attrs.setdefault("sync_interval_seconds", 150)
+            attrs.setdefault("sync_interval_seconds", 30)
             attrs.setdefault("scheduled_sync_enabled", False)
             set_default("inventory_result_key", "data")
         elif provider_key in {"biobrain", "voqall"} or "voqall.com" in base_url.lower():
@@ -412,7 +412,7 @@ class ProviderCatalogSerializer(serializers.Serializer):
     code = serializers.CharField()
     label = serializers.CharField()
     default_base_url = serializers.URLField(allow_blank=True)
-    minimum_sync_interval_seconds = serializers.IntegerField(min_value=60)
+    minimum_sync_interval_seconds = serializers.IntegerField(min_value=30)
     credential_fields = ProviderCredentialFieldSerializer(many=True)
 
 

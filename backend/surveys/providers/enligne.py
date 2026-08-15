@@ -26,7 +26,7 @@ class EnligneProvider(SurveyProvider):
     code = "enligne"
     label = "Enligne hosted InnovateMR"
     default_base_url = "https://enlignesurvey.com/get/api_feed/"
-    minimum_sync_interval_seconds = 150
+    minimum_sync_interval_seconds = 30
     credential_fields = (("db_password", "Lakshaya DB password environment key"),)
 
     def __init__(self, integration, *, session=None, db_connect=None):

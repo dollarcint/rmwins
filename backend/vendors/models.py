@@ -79,8 +79,8 @@ class ClientIntegration(models.Model):
     scheduled_sync_enabled = models.BooleanField(default=False)
     sync_interval_seconds = models.PositiveIntegerField(
         default=60,
-        validators=[MinValueValidator(60)],
-        help_text="Minimum interval between inventory syncs for this integration.",
+        validators=[MinValueValidator(30)],
+        help_text="Minimum interval between inventory syncs (30 seconds; some providers require 60).",
     )
     detail_refresh_batch = models.PositiveSmallIntegerField(
         default=3,

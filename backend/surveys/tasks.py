@@ -57,7 +57,8 @@ def dispatch_due_integrations_task():
             "rfg": settings.CLIENT_INTEGRATION_RFG_SYNC_INTERVAL_SECONDS,
             "cint": settings.CLIENT_INTEGRATION_CINT_SYNC_INTERVAL_SECONDS,
         }.get(integration.provider_code, integration.sync_interval_seconds)
-        interval_seconds = max(60, interval_seconds)
+        minimum_interval_seconds = 30 if integration.provider_code == "enligne" else 60
+        interval_seconds = max(minimum_interval_seconds, interval_seconds)
         last_activity = integration.last_sync_finished_at or integration.last_sync_started_at
         due_at = (last_activity or (now - timedelta(days=1))) + timedelta(
             seconds=interval_seconds
