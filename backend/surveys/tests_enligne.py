@@ -1,9 +1,14 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from django.test import SimpleTestCase
+from django.contrib.auth import get_user_model
+from django.test import SimpleTestCase, TestCase, override_settings
+from django.urls import reverse
 from django.utils import timezone
 
+from vendors.models import Client, ClientIntegration
+
+from .models import Survey, SurveyAttempt
 from .providers.enligne import EnligneProvider
 
 
@@ -118,7 +123,7 @@ class EnligneProviderTests(SimpleTestCase):
         replace_details.assert_called_once_with(detail_client, survey)
 
     @patch.dict("os.environ", {"ENLIGNE_DB_PASSWORD": "secret"})
-    def test_outbound_link_sends_fixed_user_only_and_never_rid(self):
+    def test_outbound_link_embeds_rid_in_user_id_and_track_id(self):
         provider = EnligneProvider(self.integration(), session=Mock())
         survey = SimpleNamespace(
             entry_link=(
@@ -130,7 +135,7 @@ class EnligneProviderTests(SimpleTestCase):
 
         outbound = provider.build_outbound_url(survey, attempt, {})
 
-        self.assertIn("user_id=kanik", outbound)
+        self.assertIn("user_id=kanik_Aa1Bb2Cc3D", outbound)
         self.assertIn("survey_id=LMS-100", outbound)
         self.assertIn(f"trackId={attempt.rid}", outbound)
         self.assertNotIn("PID=", outbound)
@@ -170,3 +175,86 @@ class EnligneProviderTests(SimpleTestCase):
 
         self.assertTrue(executed)
         self.assertTrue(all(statement.upper().startswith("SELECT ") for statement in executed))
+
+
+@override_settings(ENLIGNE_POSTBACK_TOKEN="shared-secret")
+class EnlignePostbackTests(TestCase):
+    def setUp(self):
+        client = Client.objects.create(
+            code="enligne-postback",
+            name="Enligne Postback",
+            provider_code="innovatemr",
+        )
+        integration = ClientIntegration.objects.create(
+            client=client,
+            name="Enligne integration",
+            provider_code="enligne",
+            base_url="https://enlignesurvey.com/get/api_feed/feed-id",
+        )
+        survey = Survey.objects.create(
+            client=client,
+            integration=integration,
+            source_id=16000001,
+            source_key="16000001",
+            name="Tracked survey",
+        )
+        self.attempt = SurveyAttempt.objects.create(
+            rid="Aa1Bb2Cc3D",
+            survey=survey,
+            platform_user=get_user_model().objects.create_user(
+                username="enligne-postback-user",
+                password="unused-password",
+            ),
+            user_id="enligne-postback-user",
+            status=SurveyAttempt.Status.REDIRECTED,
+        )
+
+    def postback(self, **overrides):
+        params = {
+            "token": "shared-secret",
+            "status": "1",
+            "lid": "kanik_Aa1Bb2Cc3D",
+            **overrides,
+        }
+        return self.client.get(reverse("enligne-survey-postback"), params)
+
+    def test_verified_lid_postback_records_terminal_status(self):
+        response = self.postback()
+
+        self.assertEqual(response.status_code, 200)
+        self.attempt.refresh_from_db()
+        self.assertEqual(self.attempt.status, SurveyAttempt.Status.COMPLETED)
+        self.assertEqual(self.attempt.status_source, "enligne_s2s_postback")
+        self.assertTrue(self.attempt.is_verified)
+        self.assertEqual(self.attempt.callback_count, 1)
+        self.assertEqual(
+            self.attempt.upstream_transaction_data["enligne_postback"]["lid"],
+            "kanik_Aa1Bb2Cc3D",
+        )
+        self.assertNotIn(
+            "token",
+            self.attempt.upstream_transaction_data["enligne_postback"],
+        )
+
+    def test_retry_is_idempotent_and_does_not_replace_first_verified_status(self):
+        first = self.postback()
+        retry = self.postback(status="2")
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(retry.status_code, 200)
+        self.assertTrue(retry.json()["duplicate"])
+        self.attempt.refresh_from_db()
+        self.assertEqual(self.attempt.status, SurveyAttempt.Status.COMPLETED)
+        self.assertEqual(self.attempt.callback_count, 2)
+
+    def test_constant_kanik_lid_is_rejected_as_ambiguous(self):
+        response = self.postback(lid="kanik")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["error"], "invalid_lid")
+
+    def test_invalid_shared_token_is_rejected(self):
+        response = self.postback(token="wrong-secret")
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.json()["error"], "invalid_token")

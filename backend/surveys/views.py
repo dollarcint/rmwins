@@ -18,11 +18,13 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import DatabaseError, transaction
 from django.db.models import Count, Max, Q, Sum
-from django.http import HttpResponse, HttpResponseRedirect, StreamingHttpResponse
+from django.http import HttpResponse, HttpResponseRedirect, JsonResponse, StreamingHttpResponse
 from django.core.paginator import Paginator
 from django.shortcuts import render
 from django.urls import reverse
 from django.utils import timezone
+from django.utils.crypto import constant_time_compare
+from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.types import OpenApiTypes
@@ -1625,6 +1627,86 @@ def biobrain_survey_return(request, status_code):
     return HttpResponseRedirect(
         f"{result_base_url}/survey?{urlencode({'status': recorded_status, 'rid': attempt.rid})}"
     )
+
+
+def _enligne_rid_from_identifier(value):
+    """Resolve either a bare RID or Enligne's ``KANIK_<RID>`` LID value."""
+
+    identifier = str(value or "").strip()
+    if re.fullmatch(r"[A-Za-z0-9]{10}", identifier):
+        return identifier
+    match = re.search(r"(?:^|[_-])([A-Za-z0-9]{10})$", identifier)
+    return match.group(1) if match else ""
+
+
+@csrf_exempt
+@require_http_methods(["GET", "POST"])
+def enligne_survey_postback(request):
+    """Record Enligne's server-to-server status hit without a browser redirect."""
+
+    configured_token = settings.ENLIGNE_POSTBACK_TOKEN
+    supplied_token = (request.GET.get("token") or request.POST.get("token") or "").strip()
+    if not configured_token:
+        return JsonResponse({"ok": False, "error": "postback_not_configured"}, status=503)
+    if not constant_time_compare(supplied_token, configured_token):
+        return JsonResponse({"ok": False, "error": "invalid_token"}, status=403)
+
+    params = request.GET.copy()
+    params.update(request.POST)
+    status_code = str(params.get("status") or params.get("status_id") or "").strip()
+    if status_code not in STATUS_PAGES:
+        return JsonResponse({"ok": False, "error": "invalid_status"}, status=400)
+
+    identifier = next((
+        str(params.get(name) or "").strip()
+        for name in ("rid", "RID", "trackId", "trackid", "lid", "LID")
+        if params.get(name)
+    ), "")
+    rid = _enligne_rid_from_identifier(identifier)
+    if not rid:
+        return JsonResponse({"ok": False, "error": "invalid_lid"}, status=400)
+
+    attempt = SurveyAttempt.objects.filter(
+        rid=rid,
+        survey__integration__provider_code="enligne",
+    ).first()
+    if attempt is None:
+        return JsonResponse({"ok": False, "error": "attempt_not_found"}, status=404)
+
+    safe_payload = {
+        key: value for key, value in params.dict().items()
+        if key.lower() != "token"
+    }
+    ip_address = get_request_ip(request)
+    with transaction.atomic():
+        attempt = SurveyAttempt.objects.select_for_update().get(pk=attempt.pk)
+        now = timezone.now()
+        first_verified_result = not attempt.is_verified
+        if first_verified_result:
+            if attempt.callback_at is None:
+                attempt.callback_at = now
+                attempt.loi_seconds = attempt.calculate_loi_seconds(now)
+            attempt.status = status_code
+            attempt.callback_ip = ip_address
+            attempt.status_source = "enligne_s2s_postback"
+            attempt.is_verified = True
+            transaction_data = dict(attempt.upstream_transaction_data or {})
+            transaction_data["enligne_postback"] = safe_payload
+            attempt.upstream_transaction_data = transaction_data
+        attempt.last_callback_at = now
+        attempt.callback_count += 1
+        attempt.save(update_fields=[
+            "status", "callback_at", "last_callback_at", "callback_ip", "callback_count",
+            "status_source", "is_verified", "loi_seconds", "upstream_transaction_data", "updated_at",
+        ])
+        finalize_attempt_capacity(attempt)
+
+    return JsonResponse({
+        "ok": True,
+        "rid": attempt.rid,
+        "status": attempt.status,
+        "duplicate": not first_verified_result,
+    })
 
 
 @require_http_methods(["GET"])
