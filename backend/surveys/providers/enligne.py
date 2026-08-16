@@ -259,24 +259,21 @@ class EnligneProvider(SurveyProvider):
         if parts.scheme != "https" or parts.hostname not in {"enlignesurvey.com", "www.enlignesurvey.com"}:
             raise ProviderError("Enligne feed supplied an invalid hosted entry URL.")
         query = []
-        tracked_user_id = (
-            f"{self.outbound_user_id}_{track_id}" if track_id else self.outbound_user_id
-        )
         has_user_id = False
         for key, item in parse_qsl(parts.query, keep_blank_values=True):
             if key.lower() == "user_id":
-                query.append((key, tracked_user_id))
+                query.append((key, self.outbound_user_id))
                 has_user_id = True
-            elif key.lower() in {"trackid", "lid"}:
+            elif key.lower() in {"trackid", "aff_sub", "lid"}:
                 if track_id:
                     continue
                 query.append((key, item))
             else:
                 query.append((key, item))
         if not has_user_id:
-            query.append(("user_id", tracked_user_id))
+            query.append(("user_id", self.outbound_user_id))
         if track_id:
-            query.append(("trackId", track_id))
+            query.append(("aff_sub", track_id))
         return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
 
     def normalize_inventory_item(self, payload, seen_at):
@@ -366,6 +363,6 @@ class EnligneProvider(SurveyProvider):
         replace_survey_details(self._innovate_client(), survey)
 
     def build_outbound_url(self, survey, attempt, answers):
-        """Use an Enligne user ID containing the attempt RID for LID postbacks."""
+        """Keep Enligne's required user ID fixed and track the attempt in aff_sub."""
 
         return self._hosted_link(survey.entry_link, track_id=attempt.rid)

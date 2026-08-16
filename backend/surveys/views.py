@@ -1651,7 +1651,7 @@ def enligne_survey_postback(request):
 
     identifier = next((
         str(params.get(name) or "").strip()
-        for name in ("rid", "RID", "trackId", "trackid", "lid", "LID")
+        for name in ("rid", "RID", "aff_sub", "AFF_SUB", "trackId", "trackid", "lid", "LID")
         if params.get(name)
     ), "")
     rid = _enligne_rid_from_identifier(identifier)

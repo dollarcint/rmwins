@@ -123,7 +123,7 @@ class EnligneProviderTests(SimpleTestCase):
         replace_details.assert_called_once_with(detail_client, survey)
 
     @patch.dict("os.environ", {"ENLIGNE_DB_PASSWORD": "secret"})
-    def test_outbound_link_embeds_rid_in_user_id_and_track_id(self):
+    def test_outbound_link_keeps_user_id_fixed_and_tracks_rid_in_aff_sub(self):
         provider = EnligneProvider(self.integration(), session=Mock())
         survey = SimpleNamespace(
             entry_link=(
@@ -135,11 +135,13 @@ class EnligneProviderTests(SimpleTestCase):
 
         outbound = provider.build_outbound_url(survey, attempt, {})
 
-        self.assertIn("user_id=kanik_Aa1Bb2Cc3D", outbound)
+        self.assertIn("user_id=kanik", outbound)
         self.assertIn("survey_id=LMS-100", outbound)
-        self.assertIn(f"trackId={attempt.rid}", outbound)
+        self.assertIn(f"aff_sub={attempt.rid}", outbound)
+        self.assertNotIn("user_id=kanik_", outbound)
+        self.assertNotIn("trackId=", outbound)
         self.assertNotIn("PID=", outbound)
-        self.assertEqual(outbound.count("trackId="), 1)
+        self.assertEqual(outbound.count("aff_sub="), 1)
 
     @patch.dict("os.environ", {"ENLIGNE_DB_PASSWORD": "secret"})
     def test_lakshaya_lookup_executes_select_only(self):
@@ -211,10 +213,13 @@ class EnlignePostbackTests(TestCase):
     def postback(self, **overrides):
         params = {
             "status": "1",
-            "lid": "kanik_Aa1Bb2Cc3D",
+            "lid": "Aa1Bb2Cc3D",
             **overrides,
         }
-        return self.client.get(reverse("enligne-survey-postback"), params)
+        return self.client.get(
+            reverse("enligne-survey-postback"),
+            {key: value for key, value in params.items() if value is not None},
+        )
 
     def test_verified_lid_postback_records_terminal_status(self):
         response = self.postback()
@@ -227,8 +232,16 @@ class EnlignePostbackTests(TestCase):
         self.assertEqual(self.attempt.callback_count, 1)
         self.assertEqual(
             self.attempt.upstream_transaction_data["enligne_postback"]["lid"],
-            "kanik_Aa1Bb2Cc3D",
+            "Aa1Bb2Cc3D",
         )
+
+    def test_direct_aff_sub_postback_is_also_accepted(self):
+        response = self.postback(lid=None, aff_sub="Aa1Bb2Cc3D")
+
+        self.assertEqual(response.status_code, 200)
+        self.attempt.refresh_from_db()
+        self.assertEqual(self.attempt.status, SurveyAttempt.Status.COMPLETED)
+        self.assertTrue(self.attempt.is_verified)
 
     def test_retry_is_idempotent_and_does_not_replace_first_verified_status(self):
         first = self.postback()
