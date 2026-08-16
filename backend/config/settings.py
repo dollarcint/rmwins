@@ -20,7 +20,6 @@ API_DOCS_BASIC_USERNAME = os.getenv("API_DOCS_BASIC_USERNAME", "").strip()
 API_DOCS_BASIC_PASSWORD = os.getenv("API_DOCS_BASIC_PASSWORD", "")
 PUBLIC_APP_BASE_URL = os.getenv("PUBLIC_APP_BASE_URL", "").strip().rstrip("/")
 PUBLIC_RESULT_BASE_URL = os.getenv("PUBLIC_RESULT_BASE_URL", PUBLIC_APP_BASE_URL).strip().rstrip("/")
-ENLIGNE_POSTBACK_TOKEN = os.getenv("ENLIGNE_POSTBACK_TOKEN", "").strip()
 
 INSTALLED_APPS = [
     "django.contrib.admin",

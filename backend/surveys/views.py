@@ -23,7 +23,6 @@ from django.core.paginator import Paginator
 from django.shortcuts import render
 from django.urls import reverse
 from django.utils import timezone
-from django.utils.crypto import constant_time_compare
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 from django_filters.rest_framework import DjangoFilterBackend
@@ -1644,13 +1643,6 @@ def _enligne_rid_from_identifier(value):
 def enligne_survey_postback(request):
     """Record Enligne's server-to-server status hit without a browser redirect."""
 
-    configured_token = settings.ENLIGNE_POSTBACK_TOKEN
-    supplied_token = (request.GET.get("token") or request.POST.get("token") or "").strip()
-    if not configured_token:
-        return JsonResponse({"ok": False, "error": "postback_not_configured"}, status=503)
-    if not constant_time_compare(supplied_token, configured_token):
-        return JsonResponse({"ok": False, "error": "invalid_token"}, status=403)
-
     params = request.GET.copy()
     params.update(request.POST)
     status_code = str(params.get("status") or params.get("status_id") or "").strip()
@@ -1673,10 +1665,7 @@ def enligne_survey_postback(request):
     if attempt is None:
         return JsonResponse({"ok": False, "error": "attempt_not_found"}, status=404)
 
-    safe_payload = {
-        key: value for key, value in params.dict().items()
-        if key.lower() != "token"
-    }
+    safe_payload = params.dict()
     ip_address = get_request_ip(request)
     with transaction.atomic():
         attempt = SurveyAttempt.objects.select_for_update().get(pk=attempt.pk)

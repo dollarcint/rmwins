@@ -2,7 +2,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from django.contrib.auth import get_user_model
-from django.test import SimpleTestCase, TestCase, override_settings
+from django.test import SimpleTestCase, TestCase
 from django.urls import reverse
 from django.utils import timezone
 
@@ -177,7 +177,6 @@ class EnligneProviderTests(SimpleTestCase):
         self.assertTrue(all(statement.upper().startswith("SELECT ") for statement in executed))
 
 
-@override_settings(ENLIGNE_POSTBACK_TOKEN="shared-secret")
 class EnlignePostbackTests(TestCase):
     def setUp(self):
         client = Client.objects.create(
@@ -211,7 +210,6 @@ class EnlignePostbackTests(TestCase):
 
     def postback(self, **overrides):
         params = {
-            "token": "shared-secret",
             "status": "1",
             "lid": "kanik_Aa1Bb2Cc3D",
             **overrides,
@@ -231,10 +229,6 @@ class EnlignePostbackTests(TestCase):
             self.attempt.upstream_transaction_data["enligne_postback"]["lid"],
             "kanik_Aa1Bb2Cc3D",
         )
-        self.assertNotIn(
-            "token",
-            self.attempt.upstream_transaction_data["enligne_postback"],
-        )
 
     def test_retry_is_idempotent_and_does_not_replace_first_verified_status(self):
         first = self.postback()
@@ -252,9 +246,3 @@ class EnlignePostbackTests(TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["error"], "invalid_lid")
-
-    def test_invalid_shared_token_is_rejected(self):
-        response = self.postback(token="wrong-secret")
-
-        self.assertEqual(response.status_code, 403)
-        self.assertEqual(response.json()["error"], "invalid_token")
