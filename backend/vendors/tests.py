@@ -142,6 +142,23 @@ class VendorFoundationTests(TestCase):
         self.assertEqual(visible_cpi, Decimal("7.00"))
         self.assertEqual(applied_cut, Decimal("30.00"))
 
+    def test_manager_role_cpi_is_capped_at_five_without_changing_lower_values(self):
+        role = Role.objects.get(slug="manager")
+        role.cpi_visibility_percent = Decimal("60.00")
+        role.save(update_fields=["cpi_visibility_percent"])
+        EmployeeProfile.objects.filter(user=self.employee).update(role=role)
+        self.employee.employee_profile.refresh_from_db()
+
+        visible_cpi, applied_cut = survey_pricing_for_user(self.employee, self.survey)
+
+        self.assertEqual(visible_cpi, Decimal("5.00"))
+        self.assertEqual(applied_cut, Decimal("50.00"))
+        self.survey.cpi = Decimal("4.25")
+        self.survey.save(update_fields=["cpi"])
+        visible_cpi, applied_cut = survey_pricing_for_user(self.employee, self.survey)
+        self.assertEqual(visible_cpi, Decimal("4.25"))
+        self.assertEqual(applied_cut, Decimal("0.00"))
+
     def test_reservation_freezes_cpi_and_completion_consumes_both_limits(self):
         attempt = self.attempt("Ua1Bb2Cc3D")
         reservation = reserve_attempt_capacity(attempt, self.external_survey_allocation)

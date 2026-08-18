@@ -23,6 +23,7 @@ from .models import (
 
 
 MONEY_QUANTUM = Decimal("0.01")
+MANAGER_CPI_CAP = Decimal("5.00")
 
 
 class AllocationUnavailable(ValueError):
@@ -279,13 +280,33 @@ def survey_pricing_for_user(user, survey: Survey) -> tuple[Decimal | None, Decim
             and profile.account_type == EmployeeProfile.AccountType.EMPLOYEE
             and role
         ):
-            visible_percent = min(Decimal("100.00"), max(Decimal("0.00"), role.cpi_visibility_percent))
+            # Managers see the source project CPI unchanged up to the fixed
+            # ceiling. Their configurable percentage remains applicable to
+            # reporting paths, but must not reduce lower Project CPI values.
+            visible_percent = (
+                Decimal("100.00")
+                if role.slug == "manager"
+                else min(Decimal("100.00"), max(Decimal("0.00"), role.cpi_visibility_percent))
+            )
             role_cut = Decimal("100.00") - visible_percent
             base_cut = existing_cut or Decimal("0.00")
             combined_cut = Decimal("100.00") - (
                 (Decimal("100.00") - base_cut) * visible_percent / Decimal("100.00")
             )
-            return payable_cpi(price, role_cut), combined_cut.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
+            visible_price = payable_cpi(price, role_cut)
+            if role.slug == "manager" and visible_price is not None and visible_price > MANAGER_CPI_CAP:
+                current_price = Decimal(price)
+                if current_price > 0:
+                    cap_cut = Decimal("100.00") - (
+                        MANAGER_CPI_CAP * Decimal("100.00") / current_price
+                    )
+                    combined_cut = Decimal("100.00") - (
+                        (Decimal("100.00") - base_cut)
+                        * (Decimal("100.00") - cap_cut)
+                        / Decimal("100.00")
+                    )
+                visible_price = MANAGER_CPI_CAP
+            return visible_price, combined_cut.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
         return price, existing_cut
 
     if not vendor_scope_user_id(user):

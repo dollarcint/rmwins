@@ -444,6 +444,24 @@ class SurveyAPITests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual([item["local_id"] for item in response.data["results"]], [higher.local_id])
 
+    def test_manager_sees_high_cpi_project_capped_at_five(self):
+        profile = self.user.employee_profile
+        manager_role = Role.objects.get(slug="manager")
+        manager_role.cpi_visibility_percent = Decimal("60.00")
+        manager_role.save(update_fields=["cpi_visibility_percent"])
+        profile.role = manager_role
+        profile.save(update_fields=["role"])
+        self.survey.cpi = Decimal("10.00")
+        self.survey.save(update_fields=["cpi"])
+
+        response = self.api.get(reverse("survey-list"), {"search": self.survey.local_id})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 1)
+        self.assertEqual(Decimal(response.data["results"][0]["cpi"]), Decimal("5.00"))
+        self.survey.refresh_from_db()
+        self.assertEqual(self.survey.cpi, Decimal("10.00"))
+
     def test_project_export_uses_filters_and_column_permissions(self):
         UserFunctionOverride.objects.create(
             user=self.user,
