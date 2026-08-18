@@ -2,6 +2,7 @@ import csv
 import os
 import zipfile
 from datetime import datetime, time, timedelta
+from decimal import Decimal
 from io import BytesIO, StringIO
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlsplit
