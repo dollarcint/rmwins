@@ -48,6 +48,8 @@ from vendors.services import (
     resolve_vendor_survey_context,
     organization_client_ids_for_user,
     scope_surveys_for_user,
+    visible_amount_for_user,
+    visible_cpi_for_user,
 )
 from vendors.access import is_external_vendor_scope, vendor_scope_user_id
 
@@ -2045,12 +2047,9 @@ class SurveyAttemptViewSet(viewsets.ReadOnlyModelViewSet):
         completed = summary["completed"]
         ir_denominator = completed + summary["survey_terminated"]
         classified = summary["desktop"] + summary["mobile"] + summary["tablet"]
-        profile = getattr(self.request.user, "employee_profile", None)
-        role = getattr(profile, "role", None) if profile else None
-        if profile and profile.account_type == "employee" and role and not self.request.user.is_superuser:
-            summary["total_revenue"] = (
-                summary["total_revenue"] * role.cpi_visibility_percent / Decimal("100.00")
-            ).quantize(Decimal("0.01"))
+        summary["total_revenue"] = visible_amount_for_user(
+            self.request.user, summary["total_revenue"]
+        )
         card_access = _component_access(
             effective_permission_codes(self.request.user), STUDY_CARD_PERMISSIONS
         )
@@ -2409,18 +2408,10 @@ def _attempt_excel_rows(queryset, requesting_user=None):
         16, 18, 42, 16, 16, 22, 22, 22, 22, 22,
     ]
     hide_source_cpi = is_external_vendor_scope(requesting_user)
-    requesting_profile = getattr(requesting_user, "employee_profile", None) if requesting_user else None
-    requesting_role = getattr(requesting_profile, "role", None) if requesting_profile else None
-    visible_percent = (
-        requesting_role.cpi_visibility_percent
-        if requesting_profile and requesting_profile.account_type == "employee" and requesting_role and not requesting_user.is_superuser
-        else Decimal("100.00")
-    )
-
     def visible_cpi(value):
         if hide_source_cpi or value is None:
             return None
-        return (Decimal(value) * visible_percent / Decimal("100.00")).quantize(Decimal("0.01"))
+        return visible_cpi_for_user(requesting_user, value)
 
     def rows():
         for attempt in queryset.iterator(chunk_size=1000):
@@ -2446,7 +2437,7 @@ def _attempt_excel_rows(queryset, requesting_user=None):
                 attempt.loi_seconds,
                 visible_cpi(survey.cpi),
                 visible_cpi(attempt.source_cpi_snapshot),
-                attempt.payable_cpi_snapshot,
+                visible_cpi_for_user(requesting_user, attempt.payable_cpi_snapshot),
                 (supplier.get_full_name() or supplier.username) if supplier else "",
                 (user.get_full_name() or user.username) if user else "Deleted user",
                 attempt.entry_device,
@@ -2523,18 +2514,10 @@ def _attempt_csv_rows(queryset, requesting_user=None):
     writer = csv.writer(_CsvEcho())
     yield "\ufeff" + writer.writerow(headers)
     hide_source_cpi = is_external_vendor_scope(requesting_user)
-    requesting_profile = getattr(requesting_user, "employee_profile", None) if requesting_user else None
-    requesting_role = getattr(requesting_profile, "role", None) if requesting_profile else None
-    visible_percent = (
-        requesting_role.cpi_visibility_percent
-        if requesting_profile and requesting_profile.account_type == "employee" and requesting_role and not requesting_user.is_superuser
-        else Decimal("100.00")
-    )
-
     def visible_cpi(value):
         if hide_source_cpi or value is None:
             return ""
-        return (Decimal(value) * visible_percent / Decimal("100.00")).quantize(Decimal("0.01"))
+        return visible_cpi_for_user(requesting_user, value)
 
     for attempt in queryset.iterator(chunk_size=1000):
         outcome = provider_outcome(attempt) if attempt.status in {
@@ -2563,7 +2546,8 @@ def _attempt_csv_rows(queryset, requesting_user=None):
             survey.language_code, attempt.supplier_code,
             visible_cpi(survey.cpi),
             visible_cpi(attempt.source_cpi_snapshot),
-            attempt.cpi_snapshot_source, attempt.cpi_cut_percent_snapshot, attempt.payable_cpi_snapshot, attempt.cpi_currency_snapshot,
+            attempt.cpi_snapshot_source, attempt.cpi_cut_percent_snapshot,
+            visible_cpi_for_user(requesting_user, attempt.payable_cpi_snapshot), attempt.cpi_currency_snapshot,
             survey.loi, attempt.loi_seconds,
             attempt.initiation_ip, attempt.callback_ip, attempt.entry_browser, attempt.exit_browser,
             attempt.entry_device, attempt.exit_device, attempt.entry_os, attempt.exit_os,

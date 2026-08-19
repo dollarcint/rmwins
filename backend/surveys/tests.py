@@ -1020,11 +1020,38 @@ class StudiesTrackingTests(TestCase):
         scoped_api = APIClient()
         scoped_api.force_authenticate(self.kanik)
 
+        projects = scoped_api.get(reverse("survey-list"), {"search": str(self.survey.source_id)})
         response = scoped_api.get(reverse("survey-attempt-list"), {"status": SurveyAttempt.Status.COMPLETED})
 
+        self.assertEqual(projects.status_code, 200)
+        self.assertEqual(str(projects.data["results"][0]["cpi"]), "1.75")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(str(response.data["results"][0]["source_cpi_snapshot"]), "1.75")
+        self.assertEqual(str(response.data["results"][0]["payable_cpi_snapshot"]), "1.75")
         self.assertEqual(str(response.data["summary"]["total_revenue"]), "1.75")
+
+    def test_manager_uses_same_cut_and_cap_in_projects_and_traffic(self):
+        role = Role.objects.get(slug="manager")
+        role.cpi_visibility_percent = "60.00"
+        role.save(update_fields=["cpi_visibility_percent"])
+        EmployeeProfile.objects.filter(user=self.kanik).update(role=role)
+        self.survey.cpi = "10.00"
+        self.survey.save(update_fields=["cpi"])
+        self.complete.source_cpi_snapshot = "10.00"
+        self.complete.payable_cpi_snapshot = "10.00"
+        self.complete.save(update_fields=["source_cpi_snapshot", "payable_cpi_snapshot", "updated_at"])
+        manager = get_user_model().objects.get(pk=self.kanik.pk)
+        scoped_api = APIClient()
+        scoped_api.force_authenticate(manager)
+
+        projects = scoped_api.get(reverse("survey-list"), {"search": str(self.survey.source_id)})
+        traffic = scoped_api.get(reverse("survey-attempt-list"), {"search": self.complete.rid})
+
+        self.assertEqual(projects.status_code, 200)
+        self.assertEqual(traffic.status_code, 200)
+        self.assertEqual(str(projects.data["results"][0]["cpi"]), "5.00")
+        self.assertEqual(str(traffic.data["results"][0]["source_cpi_snapshot"]), "5.00")
+        self.assertEqual(str(traffic.data["results"][0]["payable_cpi_snapshot"]), "5.00")
 
     def test_summary_tracks_all_outcomes_and_completed_device_types(self):
         SurveyAttempt.objects.create(

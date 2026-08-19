@@ -211,6 +211,53 @@ def scope_surveys_for_user(queryset, user):
     return scoped
 
 
+def role_cpi_visibility_percent(user) -> Decimal:
+    """Return the configured CPI percentage visible to an employee role."""
+
+    profile = getattr(user, "employee_profile", None)
+    role = getattr(profile, "role", None) if profile else None
+    if (
+        not getattr(user, "is_superuser", False)
+        and profile
+        and profile.account_type == EmployeeProfile.AccountType.EMPLOYEE
+        and role
+    ):
+        return min(
+            Decimal("100.00"),
+            max(Decimal("0.00"), Decimal(role.cpi_visibility_percent)),
+        )
+    return Decimal("100.00")
+
+
+def visible_amount_for_user(user, value) -> Decimal | None:
+    """Apply employee role visibility to a monetary total without a per-CPI cap."""
+
+    if value is None:
+        return None
+    visible_percent = role_cpi_visibility_percent(user)
+    return (
+        Decimal(value) * visible_percent / Decimal("100.00")
+    ).quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
+
+
+def visible_cpi_for_user(user, value) -> Decimal | None:
+    """Apply the single role CPI policy used by projects, reports and exports."""
+
+    visible_cpi = visible_amount_for_user(user, value)
+    profile = getattr(user, "employee_profile", None)
+    role = getattr(profile, "role", None) if profile else None
+    if (
+        visible_cpi is not None
+        and not getattr(user, "is_superuser", False)
+        and profile
+        and profile.account_type == EmployeeProfile.AccountType.EMPLOYEE
+        and role
+        and role.slug == "manager"
+    ):
+        visible_cpi = min(visible_cpi, MANAGER_CPI_CAP)
+    return visible_cpi
+
+
 def resolve_vendor_survey_context(user, survey: Survey, *, require_capacity=True, for_update=False):
     """Resolve the supplier's active client grant and mandatory project allocation."""
 
@@ -272,42 +319,18 @@ def survey_pricing_for_user(user, survey: Survey) -> tuple[Decimal | None, Decim
     """Return request-visible CPI and applied cut without exposing source CPI to external suppliers."""
 
     def apply_employee_role_percentage(price, existing_cut):
-        profile = getattr(user, "employee_profile", None)
-        role = getattr(profile, "role", None) if profile else None
-        if (
-            not getattr(user, "is_superuser", False)
-            and profile
-            and profile.account_type == EmployeeProfile.AccountType.EMPLOYEE
-            and role
-        ):
-            # Managers see the source project CPI unchanged up to the fixed
-            # ceiling. Their configurable percentage remains applicable to
-            # reporting paths, but must not reduce lower Project CPI values.
-            visible_percent = (
-                Decimal("100.00")
-                if role.slug == "manager"
-                else min(Decimal("100.00"), max(Decimal("0.00"), role.cpi_visibility_percent))
-            )
-            role_cut = Decimal("100.00") - visible_percent
-            base_cut = existing_cut or Decimal("0.00")
-            combined_cut = Decimal("100.00") - (
-                (Decimal("100.00") - base_cut) * visible_percent / Decimal("100.00")
-            )
-            visible_price = payable_cpi(price, role_cut)
-            if role.slug == "manager" and visible_price is not None and visible_price > MANAGER_CPI_CAP:
-                current_price = Decimal(price)
-                if current_price > 0:
-                    cap_cut = Decimal("100.00") - (
-                        MANAGER_CPI_CAP * Decimal("100.00") / current_price
-                    )
-                    combined_cut = Decimal("100.00") - (
-                        (Decimal("100.00") - base_cut)
-                        * (Decimal("100.00") - cap_cut)
-                        / Decimal("100.00")
-                    )
-                visible_price = MANAGER_CPI_CAP
-            return visible_price, combined_cut.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
-        return price, existing_cut
+        visible_price = visible_cpi_for_user(user, price)
+        if price is None or visible_price == price:
+            return visible_price, existing_cut
+        current_price = Decimal(price)
+        base_cut = Decimal(existing_cut or 0)
+        if current_price <= 0:
+            return visible_price, base_cut.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
+        role_visible_ratio = visible_price / current_price
+        combined_cut = Decimal("100.00") - (
+            (Decimal("100.00") - base_cut) * role_visible_ratio
+        )
+        return visible_price, combined_cut.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
 
     if not vendor_scope_user_id(user):
         return apply_employee_role_percentage(survey.cpi, None)

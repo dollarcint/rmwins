@@ -9,7 +9,7 @@ from django.db.models import Avg, Count, Max, Q, Sum
 from django.utils import timezone
 
 from accounts.access import activity_visible_user_ids
-from accounts.models import EmployeeProfile
+from vendors.services import visible_amount_for_user, visible_cpi_for_user
 
 from .filters import SurveyAttemptFilter
 from .models import SurveyAttempt
@@ -61,17 +61,7 @@ def dashboard_client_options(queryset):
 
 
 def _visible_revenue(user, value):
-    value = value or Decimal("0.00")
-    profile = getattr(user, "employee_profile", None)
-    role = getattr(profile, "role", None) if profile else None
-    if (
-        profile
-        and profile.account_type == EmployeeProfile.AccountType.EMPLOYEE
-        and role
-        and not user.is_superuser
-    ):
-        value = value * role.cpi_visibility_percent / Decimal("100.00")
-    return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return visible_amount_for_user(user, value or Decimal("0.00"))
 
 
 def _month_shift(value, offset):
@@ -272,9 +262,10 @@ def _permission_scoped_performance(queryset, range_window, user, card_access):
         point_revenue = _visible_revenue(user, point["revenue"])
         point["revenue"] = point_revenue if card_access.get("revenue") else None
         point["average_cpi"] = (
-            (point_revenue / point["completes"]).quantize(
-                Decimal("0.01"), rounding=ROUND_HALF_UP
-            ) if point["completes"] else Decimal("0.00")
+            visible_cpi_for_user(
+                user,
+                point["revenue"] / point["completes"] if point["completes"] else Decimal("0.00"),
+            )
         ) if card_access.get("average_cpi") else None
         point["rpc"] = (
             (point_revenue / point["hits"]).quantize(
@@ -333,8 +324,9 @@ def build_dashboard_payload(
         "average_loi_seconds": round(totals["average_loi"] or 0),
         "revenue": visible_revenue,
         "average_cpi": (
-            visible_revenue / totals["completes"]
-        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) if totals["completes"] else Decimal("0.00"),
+            visible_cpi_for_user(user, totals["revenue"] / totals["completes"])
+            if totals["completes"] else Decimal("0.00")
+        ),
         "rpc": (
             visible_revenue / totals["hits"]
         ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) if totals["hits"] else Decimal("0.00"),
