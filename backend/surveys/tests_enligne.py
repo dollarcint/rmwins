@@ -243,6 +243,23 @@ class EnlignePostbackTests(TestCase):
         self.assertEqual(self.attempt.status, SurveyAttempt.Status.COMPLETED)
         self.assertTrue(self.attempt.is_verified)
 
+    def test_generic_survey_callback_prefers_aff_sub_over_constant_rid(self):
+        response = self.client.get(
+            reverse("survey-status"),
+            {"status": "1", "aff_sub": self.attempt.rid, "rid": "kanik"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.attempt.refresh_from_db()
+        self.assertEqual(self.attempt.status, SurveyAttempt.Status.COMPLETED)
+        self.assertEqual(self.attempt.status_source, "enligne_s2s_postback")
+        self.assertTrue(self.attempt.is_verified)
+        self.assertEqual(self.attempt.callback_count, 1)
+        self.assertEqual(
+            self.attempt.upstream_transaction_data["enligne_postback"]["aff_sub"],
+            self.attempt.rid,
+        )
+
     def test_retry_is_idempotent_and_does_not_replace_first_verified_status(self):
         first = self.postback()
         retry = self.postback(status="2")

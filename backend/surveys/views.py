@@ -1667,7 +1667,24 @@ def enligne_survey_postback(request):
     if attempt is None:
         return JsonResponse({"ok": False, "error": "attempt_not_found"}, status=404)
 
-    safe_payload = params.dict()
+    attempt, first_verified_result = _record_enligne_s2s_result(
+        attempt,
+        status_code,
+        request,
+        params.dict(),
+    )
+
+    return JsonResponse({
+        "ok": True,
+        "rid": attempt.rid,
+        "status": attempt.status,
+        "duplicate": not first_verified_result,
+    })
+
+
+def _record_enligne_s2s_result(attempt, status_code, request, payload):
+    """Persist one verified Enligne result received on either callback route."""
+
     ip_address = get_request_ip(request)
     with transaction.atomic():
         attempt = SurveyAttempt.objects.select_for_update().get(pk=attempt.pk)
@@ -1682,7 +1699,7 @@ def enligne_survey_postback(request):
             attempt.status_source = "enligne_s2s_postback"
             attempt.is_verified = True
             transaction_data = dict(attempt.upstream_transaction_data or {})
-            transaction_data["enligne_postback"] = safe_payload
+            transaction_data["enligne_postback"] = payload
             attempt.upstream_transaction_data = transaction_data
         attempt.last_callback_at = now
         attempt.callback_count += 1
@@ -1691,19 +1708,20 @@ def enligne_survey_postback(request):
             "status_source", "is_verified", "loi_seconds", "upstream_transaction_data", "updated_at",
         ])
         finalize_attempt_capacity(attempt)
-
-    return JsonResponse({
-        "ok": True,
-        "rid": attempt.rid,
-        "status": attempt.status,
-        "duplicate": not first_verified_result,
-    })
+    return attempt, first_verified_result
 
 
 @require_http_methods(["GET"])
 def survey_status(request):
     status_code = request.GET.get("status", "").strip()
-    callback_identifier = status_rid_from_request(request)
+    enligne_identifier = (
+        request.GET.get("aff_sub") or request.GET.get("AFF_SUB") or ""
+    ).strip()
+    callback_identifier = (
+        _enligne_rid_from_identifier(enligne_identifier)
+        if enligne_identifier
+        else status_rid_from_request(request)
+    )
     page = STATUS_PAGES.get(status_code)
     if page is None or not callback_identifier:
         return render(request, "surveys/flow_error.html", {
@@ -1712,10 +1730,21 @@ def survey_status(request):
         }, status=400)
 
     # Public callbacks resolve only the canonical 10-character attempt RID.
-    attempt = SurveyAttempt.objects.filter(rid=callback_identifier).first()
+    attempts = SurveyAttempt.objects.filter(rid=callback_identifier)
+    if enligne_identifier:
+        attempts = attempts.filter(survey__integration__provider_code="enligne")
+    attempt = attempts.first()
     canonical_rid = attempt.rid if attempt else callback_identifier
     ip_address = get_request_ip(request)
-    if attempt:
+    if attempt and enligne_identifier:
+        attempt, _ = _record_enligne_s2s_result(
+            attempt,
+            status_code,
+            request,
+            request.GET.dict(),
+        )
+        status_label = attempt.get_status_display()
+    elif attempt:
         attempt = _record_browser_result(attempt, status_code, request)
         status_label = attempt.get_status_display()
     else:
