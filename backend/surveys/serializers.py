@@ -315,7 +315,7 @@ class SurveyListSerializer(serializers.ModelSerializer):
     class Meta:
         model = Survey
         fields = [
-            "id", "local_id", "survey_id", "supplier_id", "client", "client_name", "display_company_name", "source_id", "provider_code", "company_name", "name", "status", "sample_size", "completes", "remaining",
+            "id", "local_id", "survey_id", "supplier_id", "client", "client_name", "display_company_name", "source_id", "provider_code", "inventory_source", "company_name", "name", "status", "sample_size", "completes", "remaining",
             "starts", "cpi", "cpi_cut_percent", "vendor_pricing", "loi", "incidence_rate", "country", "country_code", "country_label",
             "language", "language_code", "group_type", "buyer_id", "survey_type", "device_type", "entry_link", "start_link", "has_quota",
             "source_created_at", "source_modified_at", "source_created_display", "source_modified_display",
@@ -397,6 +397,8 @@ class SurveyListSerializer(serializers.ModelSerializer):
         return obj.source_identifier
 
     def get_provider_code(self, obj) -> str:
+        if obj.inventory_source == Survey.InventorySource.MANUAL:
+            return Survey.InventorySource.MANUAL
         return obj.integration.provider_code if obj.integration_id else getattr(obj.client, "provider_code", "innovatemr")
 
     def get_display_company_name(self, obj) -> str:
@@ -494,7 +496,7 @@ class SurveyDetailSerializer(SurveyListSerializer):
 
     class Meta(SurveyListSerializer.Meta):
         fields = SurveyListSerializer.Meta.fields + [
-            "test_entry_link", "job_category", "is_pii_required", "is_recontact", "quotas", "targeting_questions"
+            "test_entry_link", "manual_rid_parameter", "job_category", "is_pii_required", "is_recontact", "quotas", "targeting_questions"
         ]
 
 

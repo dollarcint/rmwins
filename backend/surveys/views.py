@@ -17,7 +17,7 @@ from urllib.parse import quote, urlencode
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.db import DatabaseError, transaction
+from django.db import DatabaseError, IntegrityError, transaction
 from django.db.models import Count, F, IntegerField, Max, OuterRef, Q, Subquery, Sum, Value
 from django.db.models.functions import Coalesce
 from django.http import HttpResponse, HttpResponseRedirect, JsonResponse, StreamingHttpResponse
@@ -59,6 +59,7 @@ from vendors.access import is_external_vendor_scope, vendor_scope_user_id
 from vendors.models import VendorAPIKey
 
 from .filters import SurveyAttemptFilter, SurveyFilter
+from .forms import ManualSurveyForm
 from .dashboard import (
     build_dashboard_payload,
     dashboard_attempts,
@@ -420,6 +421,60 @@ def projects_page(request):
         "can_paginate_projects": "projects.control.pagination" in codes,
         "can_open_project_studies": "attempts.view" in codes and "studies.filter.project" in codes,
         "can_sort_cpi": can_sort_cpi, "cpi_min_bound": cpi_min, "cpi_max_bound": cpi_max,
+    })
+
+
+@function_permission_required("projects.manual.create")
+@require_http_methods(["GET", "POST"])
+def manual_survey_create(request):
+    """Create inventory for a client that supplies links instead of an API feed."""
+
+    created_survey = None
+    if request.method == "POST":
+        form = ManualSurveyForm(request.POST)
+        if form.is_valid():
+            try:
+                with transaction.atomic():
+                    created_survey = form.save(created_by=request.user)
+            except IntegrityError:
+                form.add_error(
+                    "source_key",
+                    "A manual survey with this client survey ID already exists.",
+                )
+            else:
+                return HttpResponseRedirect(
+                    f"{reverse('manual-survey-create')}?created={created_survey.local_id}"
+                )
+    else:
+        form = ManualSurveyForm(initial={
+            "rid_parameter": "pid",
+            "survey_type": "B2C",
+            "device_type": "All",
+        })
+        created_code = (request.GET.get("created") or "").strip()
+        if created_code:
+            created_survey = Survey.objects.filter(
+                local_id=created_code,
+                inventory_source=Survey.InventorySource.MANUAL,
+                created_by=request.user,
+            ).first()
+
+    start_link = ""
+    if created_survey:
+        start_query = urlencode({
+            "surveyId": created_survey.source_identifier,
+            "supplierCode": settings.PUBLIC_SUPPLIER_CODE,
+            "userId": request.user.pk,
+            "code": created_survey.local_id,
+        })
+        start_link = request.build_absolute_uri(
+            f"{reverse('survey-start')}?{start_query}"
+        )
+    return render(request, "surveys/manual_survey_form.html", {
+        "active_page": "manual-survey",
+        "form": form,
+        "created_survey": created_survey,
+        "start_link": start_link,
     })
 
 
@@ -1732,8 +1787,11 @@ def survey_start(request):
                         status_code=503,
                     )
 
-            stale = survey.targeting_synced_at is None or (
-                survey.source_modified_at and survey.targeting_synced_at < survey.source_modified_at
+            stale = survey.inventory_source != Survey.InventorySource.MANUAL and (
+                survey.targeting_synced_at is None or (
+                    survey.source_modified_at
+                    and survey.targeting_synced_at < survey.source_modified_at
+                )
             )
             if provider_code in {"biobrain", "voqall"} and survey.targeting_questions.filter(
                 Q(text="") | Q(key__regex=r"^\d+$")
@@ -1917,6 +1975,12 @@ def survey_start(request):
                             attempt.rid,
                             answers,
                             prescreener_uid=prescreener_uid,
+                            rid_parameter=(
+                                attempt.survey.manual_rid_parameter
+                                if attempt.survey.inventory_source
+                                == Survey.InventorySource.MANUAL
+                                else ""
+                            ),
                         )
                     )
                     if not _mark_attempt_redirected(attempt, answers, outbound_url):

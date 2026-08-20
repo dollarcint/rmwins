@@ -1,0 +1,117 @@
+{% extends 'surveys/base.html' %}
+{% load static %}
+
+{% block title %}Add Manual Survey · Survey Workspace{% endblock %}
+{% block header_title %}Add Manual Survey{% endblock %}
+{% block extra_head %}<link rel="stylesheet" href="{% static 'surveys/manual-survey.css' %}?v=1">{% endblock %}
+
+{% block content %}
+<section class="manual-shell">
+  <header class="manual-head">
+    <div>
+      <p class="eyebrow">Manual inventory</p>
+      <h1>Add a client survey link</h1>
+      <p>Create the same RM Wins project and respondent journey used by API inventory, without configuring a feed.</p>
+    </div>
+    <a class="manual-secondary" href="{% url 'projects' %}">View projects</a>
+  </header>
+
+  {% if created_survey %}
+  <article class="manual-success" aria-live="polite">
+    <span class="success-mark" aria-hidden="true">✓</span>
+    <div>
+      <p class="eyebrow">Survey added</p>
+      <h2>{{ created_survey.name }}</h2>
+      <dl>
+        <div><dt>Internal Project ID</dt><dd>{{ created_survey.local_id }}</dd></div>
+        <div><dt>Client Survey ID</dt><dd>{{ created_survey.source_key }}</dd></div>
+        <div><dt>Source CPI</dt><dd>${{ created_survey.cpi|floatformat:2 }}</dd></div>
+        <div><dt>RID parameter</dt><dd>{{ created_survey.manual_rid_parameter }}</dd></div>
+      </dl>
+      <label class="created-link"><span>RM Wins start link</span><span><input id="createdStartLink" value="{{ start_link }}" readonly><button type="button" id="copyCreatedLink">Copy</button></span></label>
+      <p class="success-note">Every respondent gets a fresh RM Wins RID. The client link receives it in <strong>{{ created_survey.manual_rid_parameter }}</strong> only after the existing pre-screen flow completes.</p>
+      <div class="success-actions"><a class="manual-primary" href="{% url 'manual-survey-create' %}">Add another survey</a><a class="manual-secondary" href="{% url 'projects' %}?search={{ created_survey.local_id }}">Open in Projects</a></div>
+    </div>
+  </article>
+  {% else %}
+  <div class="manual-layout">
+    <form method="post" class="manual-form" novalidate>
+      {% csrf_token %}
+      <div class="form-intro"><div><p class="eyebrow">Survey details</p><h2>Inventory source</h2></div><span>All fields marked * are required</span></div>
+      {% if form.non_field_errors %}<div class="manual-error" role="alert">{{ form.non_field_errors }}</div>{% endif %}
+
+      <div class="manual-grid">
+        <label class="wide"><span>Client *</span>{{ form.client }}{% for error in form.client.errors %}<small class="field-error">{{ error }}</small>{% endfor %}</label>
+        <label><span>Client survey ID *</span>{{ form.source_key }}{% if form.source_key.help_text %}<small>{{ form.source_key.help_text }}</small>{% endif %}{% for error in form.source_key.errors %}<small class="field-error">{{ error }}</small>{% endfor %}</label>
+        <label><span>Buyer / sub-client ID</span>{{ form.buyer_id }}{% for error in form.buyer_id.errors %}<small class="field-error">{{ error }}</small>{% endfor %}</label>
+        <label class="wide"><span>Survey name *</span>{{ form.name }}{% for error in form.name.errors %}<small class="field-error">{{ error }}</small>{% endfor %}</label>
+
+        <div class="section-divider wide"><strong>Client link &amp; RID</strong><small>The link is stored as a template; the actual RID is generated per respondent.</small></div>
+        <label class="wide"><span>Client entry link *</span>{{ form.entry_link }}{% if form.entry_link.help_text %}<small>{{ form.entry_link.help_text }}</small>{% endif %}{% for error in form.entry_link.errors %}<small class="field-error">{{ error }}</small>{% endfor %}</label>
+        <label><span>Respondent ID parameter *</span>{{ form.rid_parameter }}{% if form.rid_parameter.help_text %}<small>{{ form.rid_parameter.help_text }}</small>{% endif %}{% for error in form.rid_parameter.errors %}<small class="field-error">{{ error }}</small>{% endfor %}</label>
+        <div class="rid-preview"><span>Outbound example</span><code id="ridPreview">client-link?pid=RM_WINS_RID</code></div>
+
+        <div class="section-divider wide"><strong>Commercials &amp; fieldwork</strong><small>Enter the full client terms. Do not subtract a supplier cut here.</small></div>
+        <label><span>Source CPI (USD) *</span>{{ form.cpi }}{% if form.cpi.help_text %}<small>{{ form.cpi.help_text }}</small>{% endif %}{% for error in form.cpi.errors %}<small class="field-error">{{ error }}</small>{% endfor %}</label>
+        <label><span>Target completes *</span>{{ form.sample_size }}{% if form.sample_size.help_text %}<small>{{ form.sample_size.help_text }}</small>{% endif %}{% for error in form.sample_size.errors %}<small class="field-error">{{ error }}</small>{% endfor %}</label>
+        <label><span>LOI (minutes) *</span>{{ form.loi }}{% for error in form.loi.errors %}<small class="field-error">{{ error }}</small>{% endfor %}</label>
+        <label><span>Incidence rate (%) *</span>{{ form.incidence_rate }}{% for error in form.incidence_rate.errors %}<small class="field-error">{{ error }}</small>{% endfor %}</label>
+        <label><span>Survey type *</span>{{ form.survey_type }}{% for error in form.survey_type.errors %}<small class="field-error">{{ error }}</small>{% endfor %}</label>
+        <label><span>Device *</span>{{ form.device_type }}{% for error in form.device_type.errors %}<small class="field-error">{{ error }}</small>{% endfor %}</label>
+
+        <div class="section-divider wide"><strong>Market</strong><small>Codes are used by project filters and target-country checks.</small></div>
+        <label><span>Country name</span>{{ form.country }}{% for error in form.country.errors %}<small class="field-error">{{ error }}</small>{% endfor %}</label>
+        <label><span>Country code *</span>{{ form.country_code }}{% for error in form.country_code.errors %}<small class="field-error">{{ error }}</small>{% endfor %}</label>
+        <label><span>Language</span>{{ form.language }}{% for error in form.language.errors %}<small class="field-error">{{ error }}</small>{% endfor %}</label>
+        <label><span>Language code *</span>{{ form.language_code }}{% for error in form.language_code.errors %}<small class="field-error">{{ error }}</small>{% endfor %}</label>
+      </div>
+      <footer><a class="manual-secondary" href="{% url 'projects' %}">Cancel</a><button class="manual-primary" type="submit">Create manual survey</button></footer>
+    </form>
+
+    <aside class="manual-guide">
+      <div class="guide-icon" aria-hidden="true">RID</div>
+      <h2>What happens next?</h2>
+      <ol>
+        <li><span>1</span><div><strong>Project ID</strong><small>A unique 14-digit internal Project ID is generated automatically.</small></div></li>
+        <li><span>2</span><div><strong>Respondent RID</strong><small>Each hit gets a new RID and enters the normal pre-screen/traffic-report flow.</small></div></li>
+        <li><span>3</span><div><strong>Client redirect</strong><small>The RID is inserted into the selected query parameter before redirecting.</small></div></li>
+        <li><span>4</span><div><strong>CPI snapshot</strong><small>Source CPI and the effective supplier cut are frozen separately on the attempt.</small></div></li>
+      </ol>
+      <div class="cut-note"><strong>CPI cut is already connected</strong><p>Supplier default cut → client override → project override. The most specific active setting wins; manual inventory follows the same rule as API inventory.</p></div>
+    </aside>
+  </div>
+  {% endif %}
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(() => {
+  const parameter = document.querySelector('[name="rid_parameter"]');
+  const link = document.querySelector('[name="entry_link"]');
+  const preview = document.getElementById('ridPreview');
+  const updatePreview = () => {
+    if (!preview || !parameter) return;
+    const key = parameter.value.trim() || 'pid';
+    try {
+      const url = new URL(link && link.value ? link.value : 'https://client.example/start');
+      url.searchParams.set(key, 'RM_WINS_RID');
+      preview.textContent = url.toString();
+    } catch (_) {
+      preview.textContent = `client-link?${encodeURIComponent(key)}=RM_WINS_RID`;
+    }
+  };
+  parameter?.addEventListener('input', updatePreview);
+  link?.addEventListener('input', updatePreview);
+  updatePreview();
+
+  document.getElementById('copyCreatedLink')?.addEventListener('click', async (event) => {
+    const input = document.getElementById('createdStartLink');
+    if (!input) return;
+    try { await navigator.clipboard.writeText(input.value); }
+    catch (_) { input.select(); document.execCommand('copy'); }
+    event.currentTarget.textContent = 'Copied';
+  });
+})();
+</script>
+{% endblock %}

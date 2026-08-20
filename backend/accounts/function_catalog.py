@@ -46,6 +46,7 @@ FUNCTION_CATALOG = (
     ("projects.filter.date", "Use Date and time filter", "Projects - Filters", "Filter project created or modified timestamps with combined From and To controls.", ALL_ROLES),
     ("projects.filters.clear", "Clear project filters", "Projects - Filters", "Use the Clear filters action on Projects.", ALL_ROLES),
     ("projects.export", "Export projects workbook", "Projects - Actions", "Download all projects matching the permitted current filters as an Excel workbook.", ALL_ROLES),
+    ("projects.manual.create", "Add manual surveys", "Projects - Actions", "Create survey inventory from a client-supplied entry link when no API feed is available.", ADMIN_ROLES),
     ("survey_details.view", "View survey details", "Projects - Actions", "Open pre-screening and quota details.", ALL_ROLES),
     ("survey_links.copy", "Copy pre-screener links", "Projects - Actions", "Copy internal respondent start links.", ALL_ROLES),
     ("projects.control.page_size", "Change rows per page", "Projects - Page controls", "Change the number of project rows displayed per page.", ALL_ROLES),

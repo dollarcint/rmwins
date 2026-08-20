@@ -31,11 +31,19 @@ class TargetingQuestionInline(admin.TabularInline):
 
 @admin.register(Survey)
 class SurveyAdmin(admin.ModelAdmin):
-    list_display = ["local_id", "client", "integration", "source_key", "company_name", "name", "country_code", "language_code", "completes", "sample_size", "status", "source_modified_at"]
+    list_display = ["local_id", "inventory_source", "client", "integration", "source_key", "company_name", "name", "country_code", "language_code", "cpi", "completes", "sample_size", "status", "source_modified_at"]
     search_fields = ["local_id", "source_key", "source_id", "company_name", "name"]
-    list_filter = ["status", "client", "integration", "company_name", "country_code", "language_code", "has_quota"]
-    readonly_fields = ["local_id", "source_id", "source_key", "raw_data", "created_at", "updated_at", "last_seen_at", "detail_synced_at"]
+    list_filter = ["inventory_source", "status", "client", "integration", "company_name", "country_code", "language_code", "has_quota"]
+    readonly_fields = ["local_id", "source_id", "created_by", "raw_data", "created_at", "updated_at", "last_seen_at", "detail_synced_at"]
     inlines = [SurveyQuotaInline, TargetingQuestionInline]
+
+    def get_readonly_fields(self, request, obj=None):
+        fields = list(super().get_readonly_fields(request, obj))
+        if obj:
+            fields.append("inventory_source")
+        if obj and obj.inventory_source != Survey.InventorySource.MANUAL:
+            fields.extend(["source_key", "manual_rid_parameter"])
+        return fields
 
 
 @admin.register(SyncRun)

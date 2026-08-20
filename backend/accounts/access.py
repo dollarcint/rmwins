@@ -37,7 +37,7 @@ EXTERNAL_VENDOR_FORBIDDEN_CODES = frozenset({
     "studies.card.revenue", "dashboard.card.revenue",
     "dashboard.card.average_cpi", "dashboard.card.rpc",
     "dashboard.graph.finance_filters",
-    "sync.run",
+    "sync.run", "projects.manual.create",
 })
 
 

@@ -251,6 +251,7 @@ def build_outbound_url(
     answers: dict,
     *,
     prescreener_uid: str = "",
+    rid_parameter: str = "",
 ) -> str:
     """Build a provider link with stable routing IDs and mapped profile answers.
 
@@ -274,14 +275,18 @@ def build_outbound_url(
     query = parse_qsl(parts.query, keep_blank_values=True)
     outbound: list[tuple[str, str]] = []
     has_pid = False
+    has_manual_rid = False
     has_vq_token = False
     has_vq_uid = False
     hostname = (parts.hostname or "").lower()
     is_voqall = hostname == "voqall.com" or hostname.endswith(".voqall.com")
 
+    manual_rid_key = (rid_parameter or "").strip()
     reserved_keys = {
         "pid", "trackid", "survnum", "supcode", "vq_token", "vq_uid",
+        manual_rid_key.casefold(),
     }
+    reserved_keys.discard("")
     profile_pairs: list[tuple[str, str]] = []
     profile_keys: set[str] = set()
     seen_pairs: set[tuple[str, str]] = set()
@@ -300,24 +305,6 @@ def build_outbound_url(
             profile_pairs.append(pair)
             profile_keys.add(question_key.casefold())
 
-    reserved_keys = {"pid", "trackid", "survnum", "supcode"}
-    profile_pairs: list[tuple[str, str]] = []
-    profile_keys: set[str] = set()
-    seen_pairs: set[tuple[str, str]] = set()
-    for answer in answers.values():
-        question_key = str(answer.get("question_key") or "").strip()
-        if not question_key or question_key.casefold() in reserved_keys:
-            continue
-        for value in answer.get("upstream_values") or []:
-            if value is None or str(value).strip() == "":
-                continue
-            pair = (question_key, str(value).strip())
-            if pair in seen_pairs:
-                continue
-            seen_pairs.add(pair)
-            profile_pairs.append(pair)
-            profile_keys.add(question_key.casefold())
-
     for key, value in query:
         lowered = key.casefold()
         if is_voqall and lowered == "vq_token":
@@ -326,10 +313,17 @@ def build_outbound_url(
         elif is_voqall and lowered == "vq_uid":
             outbound.append((key, prescreener_uid or rid))
             has_vq_uid = True
+        elif manual_rid_key and lowered == manual_rid_key.casefold():
+            if not has_manual_rid:
+                outbound.append((key, rid))
+                has_manual_rid = True
         elif lowered == "pid":
-            outbound.append((key, rid))
-            has_pid = True
-        elif lowered != "trackid" and lowered not in profile_keys:
+            if manual_rid_key:
+                outbound.append((key, value))
+            else:
+                outbound.append((key, rid))
+                has_pid = True
+        elif (manual_rid_key or lowered != "trackid") and lowered not in profile_keys:
             outbound.append((key, value))
 
     if is_voqall:
@@ -337,6 +331,9 @@ def build_outbound_url(
             outbound.append(("vq_token", rid))
         if not has_vq_uid:
             outbound.append(("vq_uid", prescreener_uid or rid))
+    elif manual_rid_key:
+        if not has_manual_rid:
+            outbound.append((manual_rid_key, rid))
     else:
         if not has_pid:
             outbound.append(("PID", rid))

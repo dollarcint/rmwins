@@ -3,7 +3,7 @@
 from datetime import timedelta
 
 from django.conf import settings
-from django.core.validators import MinValueValidator
+from django.core.validators import MinValueValidator, RegexValidator
 from django.db import models, transaction
 from django.utils import timezone
 
@@ -57,6 +57,10 @@ class Survey(models.Model):
         LIVE = "live", "Live"
         CLOSED = "closed", "Closed"
 
+    class InventorySource(models.TextChoices):
+        API = "api", "API / synchronized"
+        MANUAL = "manual", "Manual link"
+
     local_id = models.CharField(max_length=14, unique=True, editable=False, db_index=True)
     client = models.ForeignKey(
         "vendors.Client",
@@ -83,6 +87,33 @@ class Survey(models.Model):
         blank=True,
         db_index=True,
         help_text="Provider survey identifier, including non-numeric IDs.",
+    )
+    inventory_source = models.CharField(
+        max_length=12,
+        choices=InventorySource.choices,
+        default=InventorySource.API,
+        db_index=True,
+    )
+    manual_rid_parameter = models.CharField(
+        max_length=64,
+        blank=True,
+        validators=[
+            RegexValidator(
+                regex=r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$",
+                message=(
+                    "Use 1-64 letters, numbers, dots, dashes or underscores; "
+                    "start with a letter."
+                ),
+            )
+        ],
+        help_text="Query-string parameter that receives the RM Wins respondent RID.",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="created_surveys",
     )
     company_name = models.CharField(max_length=160, default="InnovateMR", db_index=True)
     name = models.CharField(max_length=500, blank=True)
@@ -147,6 +178,11 @@ class Survey(models.Model):
         constraints = [
             models.UniqueConstraint(fields=["integration", "source_id"], name="unique_integration_survey_source"),
             models.UniqueConstraint(fields=["integration", "source_key"], name="unique_integration_survey_key"),
+            models.UniqueConstraint(
+                fields=["client", "source_key"],
+                condition=models.Q(inventory_source="manual"),
+                name="unique_manual_client_survey_key",
+            ),
         ]
 
     def save(self, *args, **kwargs):

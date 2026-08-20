@@ -28,6 +28,9 @@
           <span class="nav-icon">▤</span><span>Projects</span><span class="nav-caret">⌃</span>
         </a>
         {% if active_page == 'projects' %}<span class="nav-child"><i></i>All surveys</span>{% endif %}{% endif %}
+        {% if 'projects.manual.create' in access_codes %}<a class="nav-item {% if active_page == 'manual-survey' %}active{% endif %}" href="{% url 'manual-survey-create' %}">
+          <span class="nav-icon nav-icon-svg" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/><path d="M4 4h16v16H4z"/></svg></span><span>Add Manual Survey</span>
+        </a>{% endif %}
         {% if 'attempts.view' in access_codes %}<a class="nav-item {% if active_page == 'studies' %}active{% endif %}" href="{% url 'traffic-reports' %}">
           <span class="nav-icon">◎</span><span>Traffic Reports</span>
         </a>{% endif %}
