@@ -40,7 +40,7 @@ The public copied link always uses the platform-facing supplier code, so an upst
 
 InnovateMR owns the browser redirect after the respondent leaves this application. Configure every account-level or survey-level return URL to the same secure callback:
 
-`https://api.rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]`
+`https://rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]`
 
 The callback uses InnovateMR's hydrated `pid`, `status` and `hashdata` merge fields. The upstream PID is our 10-character attempt RID. A redirect to another domain and a `code=null` value are produced by that upstream redirect configuration, not by the local Django callback route.
 

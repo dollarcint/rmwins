@@ -113,7 +113,7 @@ On submit it stores question answers, takes the exact InnovateMR `entryLink`, re
 Configure every InnovateMR account/survey redirect with the same signed URL:
 
 ```text
-https://api.rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]
+https://rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]
 ```
 
 The callback verifies HMAC-SHA1 lowercase hex over the complete hydrated URL with an empty `hash=` value. Only verified status 1 consumes/credits a completion. Invalid hashes become quality/security terminations and cannot later be upgraded by replay. Callback hashes and the shared secret are never persisted.

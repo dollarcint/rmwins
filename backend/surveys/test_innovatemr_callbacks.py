@@ -10,7 +10,7 @@ from .models import Survey, SurveyAttempt
 
 
 CALLBACK_SECRET = "test-only-innovatemr-callback-secret"
-CALLBACK_URL = "https://api.rmwinsights.com/imr_callback"
+CALLBACK_URL = "https://rmwinsights.com/imr_callback"
 
 
 @override_settings(
