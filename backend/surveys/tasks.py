@@ -11,7 +11,7 @@ from vendors.models import ClientIntegration
 from vendors.credentials import resolve_integration_token
 
 from .integrations import InnovateMRAPIError, InnovateMRClient
-from .models import Survey, SurveyAttempt, SyncLease
+from .models import CintWebhookDelivery, Survey, SurveyAttempt, SyncLease
 from .services import reconcile_attempt_status, replace_survey_details, sync_surveys
 from .provider_services import (
     refresh_client_integration_details,
@@ -44,9 +44,14 @@ def dispatch_due_integrations_task():
     ).only(
         "id", "provider_code", "sync_interval_seconds", "last_sync_started_at",
         "last_sync_finished_at",
-        "credential_env_key", "encrypted_api_token",
+        "credential_env_key", "encrypted_api_token", "config",
     )
     for integration in integrations:
+        if (
+            integration.provider_code == "cint"
+            and (integration.config or {}).get("opportunities_webhook_enabled") is True
+        ):
+            continue
         if integration.provider_code in {"biobrain", "voqall"} and not resolve_integration_token(integration):
             continue
         lease_name = f"integration-{integration.pk}-sync"
@@ -151,21 +156,27 @@ def sync_client_integration_task(integration_id):
     soft_time_limit=240,
     time_limit=270,
 )
-def sync_cint_redirects_task(integration_id, batch_size=25):
+def sync_cint_redirects_task(integration_id, batch_size=25, force=False, after_id=0):
     """Configure new/backfill Cint survey callbacks in serialized batches."""
 
     lease_name = f"cint-redirects-{integration_id}"
     if not SyncLease.acquire(lease_name, seconds=300):
         return {"status": "skipped", "reason": "redirect batch already running"}
     continue_batching = False
+    result = {"next_after_id": max(0, int(after_id or 0))}
     try:
         integration = ClientIntegration.objects.select_related("client").get(
             pk=integration_id,
             is_active=True,
             provider_code="cint",
         )
-        result = sync_cint_redirect_contracts(integration, batch_size=batch_size)
-        continue_batching = result["remaining"] > 0 and result["failures"] == 0
+        result = sync_cint_redirect_contracts(
+            integration,
+            batch_size=batch_size,
+            force=force,
+            after_id=after_id,
+        )
+        continue_batching = result["remaining"] > 0
         result["status"] = "success" if not result["failures"] else "partial"
         return result
     finally:
@@ -173,9 +184,52 @@ def sync_cint_redirects_task(integration_id, batch_size=25):
         if continue_batching:
             sync_cint_redirects_task.apply_async(
                 args=[integration_id],
-                kwargs={"batch_size": batch_size},
+                kwargs={
+                    "batch_size": batch_size,
+                    "force": force,
+                    "after_id": result.get("next_after_id", 0),
+                },
                 countdown=1,
             )
+
+
+@shared_task(
+    name="surveys.process_cint_opportunities_delivery",
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_jitter=True,
+    max_retries=5,
+    soft_time_limit=600,
+    time_limit=630,
+)
+def process_cint_opportunities_delivery_task(delivery_id):
+    """Process a verified Cint webhook receipt outside the public request."""
+
+    from .cint_webhooks import process_delivery
+
+    delivery_ref = CintWebhookDelivery.objects.only("integration_id").get(pk=delivery_id)
+    lease_name = f"cint-webhook-{delivery_ref.integration_id}"
+    if not SyncLease.acquire(lease_name, seconds=700):
+        raise RuntimeError("A previous Cint webhook delivery is still processing.")
+    try:
+        delivery = process_delivery(delivery_id)
+    except Exception as exc:
+        CintWebhookDelivery.objects.filter(pk=delivery_id).update(
+            status=CintWebhookDelivery.Status.FAILED,
+            error=str(exc)[:10000],
+        )
+        raise
+    finally:
+        SyncLease.release(lease_name)
+    return {
+        "delivery_id": delivery.pk,
+        "status": delivery.status,
+        "created": delivery.created_count,
+        "updated": delivery.updated_count,
+        "closed": delivery.closed_count,
+        "skipped": delivery.skipped_count,
+        "errors": delivery.error_count,
+    }
 
 
 @shared_task(name="surveys.sync_innovatemr_surveys")

@@ -1,6 +1,6 @@
 """Validation and persistence rules for supplier and organization APIs."""
 
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 import ipaddress
 import re
 from urllib.parse import urlsplit
@@ -18,6 +18,7 @@ from .models import (
     AllocationReservation,
     Client,
     ClientIntegration,
+    PROFILE_REUSE_AGE_GROUPS,
     OrganizationClientAccess,
     OrganizationUnit,
     VendorClientAllocation,
@@ -26,6 +27,7 @@ from .models import (
     VendorSurveyAllocation,
 )
 from .credentials import set_integration_env_key, set_integration_token
+from .access import is_valid_supplier_profile
 
 
 class VendorDirectorySerializer(serializers.ModelSerializer):
@@ -45,19 +47,44 @@ class VendorDirectorySerializer(serializers.ModelSerializer):
     delivery_mode = serializers.CharField(source="vendor_commercial_profile.delivery_mode", read_only=True, allow_null=True)
     api_key_count = serializers.IntegerField(read_only=True)
     allocation_count = serializers.IntegerField(read_only=True)
+    active_client_allocation_count = serializers.SerializerMethodField()
+    average_client_cpi_cut_percent = serializers.SerializerMethodField()
 
     class Meta:
         model = get_user_model()
         fields = [
             "id", "username", "full_name", "email", "account_type", "role_name", "created_by",
             "commercial_profile_id", "default_cpi_cut_percent", "currency", "delivery_mode",
-            "allocation_count", "api_key_count",
+            "allocation_count", "active_client_allocation_count", "average_client_cpi_cut_percent",
+            "api_key_count",
             "is_active", "date_joined",
         ]
         read_only_fields = fields
 
     def get_full_name(self, obj) -> str:
         return obj.get_full_name() or obj.username
+
+    def get_active_client_allocation_count(self, obj) -> int:
+        allocations = getattr(obj, "active_client_allocations", None)
+        return len(allocations) if allocations is not None else obj.client_allocations.filter(is_active=True).count()
+
+    def get_average_client_cpi_cut_percent(self, obj) -> Decimal:
+        profile = getattr(obj, "employee_profile", None)
+        if profile and profile.account_type == EmployeeProfile.AccountType.INTERNAL_VENDOR:
+            return Decimal("0.00")
+        allocations = getattr(obj, "active_client_allocations", None)
+        if allocations is None:
+            allocations = list(obj.client_allocations.filter(is_active=True).select_related(
+                "vendor__vendor_commercial_profile"
+            ))
+        if allocations:
+            average = sum(
+                (allocation.effective_cpi_cut_percent for allocation in allocations),
+                Decimal("0.00"),
+            ) / Decimal(len(allocations))
+            return average.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        commercial = getattr(obj, "vendor_commercial_profile", None)
+        return getattr(commercial, "default_cpi_cut_percent", Decimal("0.00"))
 
 
 class VendorManagementVendorOptionSerializer(serializers.Serializer):
@@ -100,6 +127,8 @@ class ClientIntegrationSerializer(serializers.ModelSerializer):
     has_credential = serializers.SerializerMethodField()
     masked_credential = serializers.SerializerMethodField()
     survey_count = serializers.IntegerField(source="surveys.count", read_only=True)
+    profile_reuse_status = serializers.SerializerMethodField()
+    profile_reuse_available_country_codes = serializers.SerializerMethodField()
     config = serializers.JSONField(
         required=False,
         help_text=(
@@ -113,6 +142,14 @@ class ClientIntegrationSerializer(serializers.ModelSerializer):
         fields = [
             "id", "client", "client_name", "name", "provider_code", "base_url", "credential_env_key",
             "credential_env_keys", "config",
+            "profile_reuse_enabled", "profile_reuse_eligible_after_days",
+            "profile_reuse_monthly_percentage", "profile_reuse_country_codes",
+            "profile_reuse_age_groups", "profile_reuse_genders",
+            "profile_rereuse_enabled", "profile_rereuse_percentage",
+            "profile_rereuse_cooldown_days", "profile_reuse_status",
+            "profile_reuse_first_delay_minutes", "profile_reuse_min_interval_minutes",
+            "profile_reuse_max_uses_per_window", "profile_reuse_window_minutes",
+            "profile_reuse_available_country_codes",
             "api_token", "has_credential", "masked_credential", "supplier_code", "scheduled_sync_enabled",
             "inventory_endpoint", "paged_inventory_endpoint", "quota_endpoint_template",
             "targeting_endpoint_template", "transaction_endpoint_template", "auth_header_name",
@@ -127,10 +164,50 @@ class ClientIntegrationSerializer(serializers.ModelSerializer):
             "has_credential", "masked_credential", "last_tested_at", "last_test_status", "last_test_error",
             "last_sync_started_at", "last_sync_finished_at", "last_sync_status", "last_sync_error",
             "last_sync_summary", "created_at", "updated_at",
+            "profile_reuse_status", "profile_reuse_available_country_codes",
         ]
+
+    def get_profile_reuse_status(self, obj) -> dict:
+        from prescreener_vault.reuse import profile_reuse_month_status
+
+        return profile_reuse_month_status(obj)
+
+    def get_profile_reuse_available_country_codes(self, obj) -> list[str]:
+        return list(
+            obj.surveys.exclude(country_code="")
+            .order_by("country_code")
+            .values_list("country_code", flat=True)
+            .distinct()[:250]
+        )
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
+        enabled = attrs.get(
+            "profile_reuse_enabled", getattr(self.instance, "profile_reuse_enabled", False)
+        )
+        percentage = attrs.get(
+            "profile_reuse_monthly_percentage",
+            getattr(self.instance, "profile_reuse_monthly_percentage", Decimal("30.00")),
+        )
+        if enabled and Decimal(str(percentage or 0)) <= 0:
+            raise serializers.ValidationError({
+                "profile_reuse_monthly_percentage": "Set a percentage above 0 before enabling UID reuse."
+            })
+        # Country is never an operator-selected policy dimension. Candidate
+        # matching always enforces the survey country automatically.
+        attrs["profile_reuse_country_codes"] = []
+        age_groups = attrs.get(
+            "profile_reuse_age_groups", getattr(self.instance, "profile_reuse_age_groups", list(PROFILE_REUSE_AGE_GROUPS))
+        )
+        if not isinstance(age_groups, list) or any(value not in PROFILE_REUSE_AGE_GROUPS for value in age_groups):
+            raise serializers.ValidationError({"profile_reuse_age_groups": "Select only the supported age groups."})
+        attrs["profile_reuse_age_groups"] = [value for value in PROFILE_REUSE_AGE_GROUPS if value in age_groups]
+        genders = attrs.get(
+            "profile_reuse_genders", getattr(self.instance, "profile_reuse_genders", ["male", "female"])
+        )
+        if not isinstance(genders, list) or any(value not in {"male", "female"} for value in genders):
+            raise serializers.ValidationError({"profile_reuse_genders": "Select male, female, or both."})
+        attrs["profile_reuse_genders"] = [value for value in ("male", "female") if value in genders]
         provider = str(attrs.get("provider_code", getattr(self.instance, "provider_code", ""))).lower()
         provider_key = provider.replace("-", "").replace("_", "")
         base_url = str(attrs.get("base_url", getattr(self.instance, "base_url", ""))).rstrip("/")
@@ -543,7 +620,9 @@ class OrganizationClientAccessSerializer(serializers.ModelSerializer):
         model = OrganizationClientAccess
         fields = [
             "id", "organization_unit", "workspace_owner", "workspace_owner_name", "unit_name", "unit_type",
-            "unit_path", "client", "client_name", "is_active", "created_by", "created_at", "updated_at",
+            "unit_path", "client", "client_name", "min_cpi", "max_cpi", "inherit_cpi_range",
+            "is_active", "created_by",
+            "created_at", "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
 
@@ -564,6 +643,11 @@ class OrganizationClientAccessSerializer(serializers.ModelSerializer):
             pk=getattr(self.instance, "pk", None),
             organization_unit=unit,
             client=client,
+            min_cpi=attrs.get("min_cpi", getattr(self.instance, "min_cpi", None)),
+            max_cpi=attrs.get("max_cpi", getattr(self.instance, "max_cpi", None)),
+            inherit_cpi_range=attrs.get(
+                "inherit_cpi_range", getattr(self.instance, "inherit_cpi_range", True)
+            ),
             is_active=attrs.get("is_active", getattr(self.instance, "is_active", True)),
         )
         if self.instance:
@@ -597,11 +681,8 @@ class VendorCommercialProfileSerializer(serializers.ModelSerializer):
         vendor = attrs.get("vendor", getattr(self.instance, "vendor", None))
         cut = attrs.get("default_cpi_cut_percent", getattr(self.instance, "default_cpi_cut_percent", Decimal("0.00")))
         profile = EmployeeProfile.objects.filter(user=vendor).first()
-        if not profile or profile.account_type not in {
-            EmployeeProfile.AccountType.INTERNAL_VENDOR,
-            EmployeeProfile.AccountType.EXTERNAL_VENDOR,
-        }:
-            raise serializers.ValidationError({"vendor": "Select an internal or external supplier account."})
+        if not profile or profile.account_type != EmployeeProfile.AccountType.EXTERNAL_VENDOR:
+            raise serializers.ValidationError({"vendor": "Select an external supplier account."})
         if profile.account_type == EmployeeProfile.AccountType.INTERNAL_VENDOR and cut != Decimal("0.00"):
             raise serializers.ValidationError({"default_cpi_cut_percent": "Internal supplier cut must be zero."})
         delivery_mode = attrs.get("delivery_mode", getattr(self.instance, "delivery_mode", VendorCommercialProfile.DeliveryMode.PANEL))
@@ -616,12 +697,18 @@ class VendorAPIKeySerializer(serializers.ModelSerializer):
     masked_key = serializers.CharField(read_only=True)
     api_key = serializers.CharField(read_only=True, required=False)
     created_by = serializers.CharField(source="created_by.username", read_only=True, allow_null=True)
+    client_allocations = serializers.PrimaryKeyRelatedField(
+        many=True,
+        queryset=VendorClientAllocation.objects.select_related("vendor", "client").all(),
+    )
+    client_names = serializers.SerializerMethodField()
 
     class Meta:
         model = VendorAPIKey
         fields = [
             "id", "vendor", "vendor_name", "account_type", "name", "prefix", "last_four", "masked_key",
-            "api_key", "is_active", "expires_at", "last_used_at", "revoked_at", "created_by",
+            "api_key", "client_allocations", "client_names", "is_active", "expires_at",
+            "last_used_at", "revoked_at", "created_by",
             "created_at", "updated_at",
         ]
         read_only_fields = [
@@ -631,13 +718,16 @@ class VendorAPIKeySerializer(serializers.ModelSerializer):
     def get_vendor_name(self, obj) -> str:
         return obj.vendor.get_full_name() or obj.vendor.username
 
+    def get_client_names(self, obj) -> list[str]:
+        return [allocation.client.name for allocation in obj.client_allocations.all()]
+
     def validate(self, attrs):
         attrs = super().validate(attrs)
         vendor = attrs.get("vendor", getattr(self.instance, "vendor", None))
         if self.instance and "vendor" in attrs and attrs["vendor"] != self.instance.vendor:
             raise serializers.ValidationError({"vendor": "An issued API key cannot be transferred to another supplier."})
         profile = getattr(vendor, "employee_profile", None) if vendor else None
-        if not profile or profile.account_type != EmployeeProfile.AccountType.EXTERNAL_VENDOR:
+        if not is_valid_supplier_profile(profile) or profile.account_type != EmployeeProfile.AccountType.EXTERNAL_VENDOR:
             raise serializers.ValidationError({"vendor": "API keys can only be issued to external suppliers."})
         commercial = getattr(vendor, "vendor_commercial_profile", None)
         if not commercial or not commercial.is_active or not commercial.api_access_enabled:
@@ -645,11 +735,27 @@ class VendorAPIKeySerializer(serializers.ModelSerializer):
         expires_at = attrs.get("expires_at", getattr(self.instance, "expires_at", None))
         if expires_at and expires_at <= timezone.now():
             raise serializers.ValidationError({"expires_at": "Expiration must be in the future."})
+        allocations = attrs.get("client_allocations")
+        if allocations is None and self.instance:
+            allocations = list(self.instance.client_allocations.all())
+        allocations = list(allocations or [])
+        if not allocations:
+            raise serializers.ValidationError({
+                "client_allocations": "Select at least one active client allocation for this API key."
+            })
+        if any(
+            allocation.vendor_id != vendor.pk or not allocation.is_active or not allocation.client.is_active
+            for allocation in allocations
+        ):
+            raise serializers.ValidationError({
+                "client_allocations": "Every selected client allocation must be active and belong to this supplier."
+            })
         return attrs
 
     def create(self, validated_data):
         from .security import generate_api_key
 
+        allocations = validated_data.pop("client_allocations")
         raw_key, prefix, last_four, key_hash = generate_api_key()
         request = self.context.get("request")
         instance = VendorAPIKey.objects.create(
@@ -659,6 +765,7 @@ class VendorAPIKeySerializer(serializers.ModelSerializer):
             key_hash=key_hash,
             created_by=request.user if request else None,
         )
+        instance.client_allocations.set(allocations)
         instance.api_key = raw_key
         return instance
 
@@ -670,13 +777,15 @@ class VendorClientAllocationSerializer(serializers.ModelSerializer):
     remaining_quantity = serializers.IntegerField(read_only=True)
     effective_cpi_cut_percent = serializers.DecimalField(max_digits=5, decimal_places=2, read_only=True)
     created_by = serializers.CharField(source="created_by.username", read_only=True, allow_null=True)
+    api_key_scopes = serializers.SerializerMethodField()
 
     class Meta:
         model = VendorClientAllocation
         fields = [
             "id", "vendor", "vendor_name", "account_type", "client", "client_name", "quantity_limit",
             "reserved_quantity", "consumed_quantity", "remaining_quantity", "cpi_cut_override_percent",
-            "effective_cpi_cut_percent", "starts_at", "ends_at", "is_active", "created_by",
+            "effective_cpi_cut_percent", "min_cpi", "max_cpi", "api_key_scopes", "starts_at", "ends_at",
+            "is_active", "created_by",
             "created_at", "updated_at",
         ]
         read_only_fields = ["reserved_quantity", "consumed_quantity", "created_at", "updated_at"]
@@ -684,19 +793,31 @@ class VendorClientAllocationSerializer(serializers.ModelSerializer):
     def get_vendor_name(self, obj) -> str:
         return obj.vendor.get_full_name() or obj.vendor.username
 
+    def get_api_key_scopes(self, obj) -> list[dict]:
+        return [
+            {
+                "id": api_key.pk,
+                "name": api_key.name,
+                "masked_key": api_key.masked_key,
+                "is_active": api_key.is_active,
+            }
+            for api_key in obj.api_keys.all()
+        ]
+
     def validate(self, attrs):
         attrs = super().validate(attrs)
         vendor = attrs.get("vendor", getattr(self.instance, "vendor", None))
         quantity_limit = attrs.get("quantity_limit", getattr(self.instance, "quantity_limit", 0))
         cut = attrs.get("cpi_cut_override_percent", getattr(self.instance, "cpi_cut_override_percent", None))
         profile = EmployeeProfile.objects.filter(user=vendor).first()
-        if not profile or profile.account_type not in {
-            EmployeeProfile.AccountType.INTERNAL_VENDOR,
-            EmployeeProfile.AccountType.EXTERNAL_VENDOR,
-        }:
-            raise serializers.ValidationError({"vendor": "Select an internal or external supplier account."})
+        if not profile or profile.account_type != EmployeeProfile.AccountType.EXTERNAL_VENDOR:
+            raise serializers.ValidationError({"vendor": "Select an external supplier account."})
         if profile.account_type == EmployeeProfile.AccountType.INTERNAL_VENDOR and cut not in {None, Decimal("0.00")}:
             raise serializers.ValidationError({"cpi_cut_override_percent": "Internal supplier cut must be zero."})
+        min_cpi = attrs.get("min_cpi", getattr(self.instance, "min_cpi", None))
+        max_cpi = attrs.get("max_cpi", getattr(self.instance, "max_cpi", None))
+        if min_cpi is not None and max_cpi is not None and min_cpi > max_cpi:
+            raise serializers.ValidationError({"max_cpi": "Maximum CPI must be greater than or equal to minimum CPI."})
         instance = self.instance
         used = (instance.consumed_quantity + instance.reserved_quantity) if instance else 0
         if quantity_limit < used:

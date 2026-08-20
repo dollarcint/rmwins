@@ -3,7 +3,7 @@
 from django.contrib.auth import get_user_model
 from django.conf import settings
 from django.db.models.deletion import ProtectedError
-from django.db.models import Count, Q
+from django.db.models import Count, Prefetch, Q
 from django.shortcuts import render
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
@@ -23,7 +23,10 @@ from accounts.access import (
 )
 from accounts.models import EmployeeProfile
 
-from .access import organization_workspace_owner_ids, vendor_scope_user_id
+from .access import (
+    organization_workspace_owner_ids,
+    vendor_scope_user_id,
+)
 
 from .models import (
     AllocationReservation,
@@ -124,7 +127,7 @@ def organization_management_page(request):
         if f"organization.column.unit.{name}" in codes
     ]
     access_columns = [
-        name for name in ("unit", "client", "status", "actions")
+        name for name in ("unit", "client", "cpi", "status", "actions")
         if f"organization.column.access.{name}" in codes
     ]
     first_tab = next((name for name, available in (
@@ -343,12 +346,12 @@ class VendorManagementOptionsView(APIView):
     def get(self, request):
         vendor_id = vendor_scope_user_id(request.user)
         vendors = get_user_model().objects.filter(
-            employee_profile__account_type__in={
-                EmployeeProfile.AccountType.INTERNAL_VENDOR,
-                EmployeeProfile.AccountType.EXTERNAL_VENDOR,
-            },
+            employee_profile__account_type=EmployeeProfile.AccountType.EXTERNAL_VENDOR,
+            employee_profile__role__slug="external-vendor",
             is_active=True,
-        ).select_related("employee_profile").order_by("first_name", "last_name", "username")
+        ).select_related("employee_profile", "employee_profile__role").order_by(
+            "first_name", "last_name", "username"
+        )
         clients = Client.objects.filter(is_active=True).order_by("name")
         if vendor_id:
             vendors = vendors.filter(pk=vendor_id)
@@ -423,13 +426,19 @@ class VendorDirectoryViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         queryset = get_user_model().objects.filter(
-            employee_profile__account_type__in={
-                EmployeeProfile.AccountType.INTERNAL_VENDOR,
-                EmployeeProfile.AccountType.EXTERNAL_VENDOR,
-            }
+            employee_profile__account_type=EmployeeProfile.AccountType.EXTERNAL_VENDOR,
+            employee_profile__role__slug="external-vendor",
         ).select_related(
             "employee_profile", "employee_profile__role", "employee_profile__created_by",
             "vendor_commercial_profile",
+        ).prefetch_related(
+            Prefetch(
+                "client_allocations",
+                queryset=VendorClientAllocation.objects.filter(is_active=True).select_related(
+                    "vendor__vendor_commercial_profile", "client"
+                ),
+                to_attr="active_client_allocations",
+            )
         ).annotate(
             allocation_count=Count("client_allocations", distinct=True),
             api_key_count=Count("vendor_api_keys", filter=Q(vendor_api_keys__is_active=True), distinct=True),
@@ -585,7 +594,7 @@ class ClientIntegrationViewSet(PermissionByActionMixin, viewsets.ModelViewSet):
 class VendorCommercialProfileViewSet(PermissionByActionMixin, viewsets.ModelViewSet):
     queryset = VendorCommercialProfile.objects.select_related(
         "vendor", "vendor__employee_profile", "created_by"
-    ).all()
+    ).filter(vendor__employee_profile__account_type=EmployeeProfile.AccountType.EXTERNAL_VENDOR)
     serializer_class = VendorCommercialProfileSerializer
     permission_classes = [HasFunctionPermission]
     view_permission = "vendors.tab.policies"
@@ -611,7 +620,9 @@ class VendorCommercialProfileViewSet(PermissionByActionMixin, viewsets.ModelView
 class VendorAPIKeyViewSet(viewsets.ModelViewSet):
     queryset = VendorAPIKey.objects.select_related(
         "vendor", "vendor__employee_profile", "vendor__vendor_commercial_profile", "created_by"
-    ).all()
+    ).prefetch_related("client_allocations__client").filter(
+        vendor__employee_profile__account_type=EmployeeProfile.AccountType.EXTERNAL_VENDOR
+    )
     serializer_class = VendorAPIKeySerializer
     permission_classes = [HasFunctionPermission]
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
@@ -668,7 +679,9 @@ class VendorAPIKeyViewSet(viewsets.ModelViewSet):
 class VendorClientAllocationViewSet(PermissionByActionMixin, viewsets.ModelViewSet):
     queryset = VendorClientAllocation.objects.select_related(
         "vendor", "vendor__employee_profile", "vendor__vendor_commercial_profile", "client", "created_by"
-    ).all()
+    ).prefetch_related("api_keys").filter(
+        vendor__employee_profile__account_type=EmployeeProfile.AccountType.EXTERNAL_VENDOR
+    )
     serializer_class = VendorClientAllocationSerializer
     permission_classes = [HasFunctionPermission]
     view_permission = "vendors.tab.clients"
@@ -693,7 +706,9 @@ class VendorSurveyAllocationViewSet(PermissionByActionMixin, viewsets.ModelViewS
     queryset = VendorSurveyAllocation.objects.select_related(
         "client_allocation", "client_allocation__vendor", "client_allocation__vendor__employee_profile",
         "client_allocation__vendor__vendor_commercial_profile", "client_allocation__client", "survey", "created_by",
-    ).all()
+    ).filter(
+        client_allocation__vendor__employee_profile__account_type=EmployeeProfile.AccountType.EXTERNAL_VENDOR
+    )
     serializer_class = VendorSurveyAllocationSerializer
     permission_classes = [HasFunctionPermission]
     view_permission = "vendors.tab.projects"

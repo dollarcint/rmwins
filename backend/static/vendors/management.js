@@ -24,7 +24,7 @@
   const canViewClientAllocations = workspace.dataset.viewClientAllocations === 'true';
   const canViewProjectAllocations = workspace.dataset.viewProjectAllocations === 'true';
   const canViewApiKeys = workspace.dataset.viewApiKeys === 'true';
-  const canEditPolicy = workspace.dataset.editPolicy === 'true';
+  const canEditPolicy = workspace.dataset.canEditPolicy === 'true';
   const canAllocateClient = workspace.dataset.allocateClient === 'true';
   const canAllocateProject = workspace.dataset.allocateProject === 'true';
   const canCreateApiKey = workspace.dataset.createApiKey === 'true';
@@ -33,6 +33,7 @@
     vendors: [], profiles: [], clients: [], clientAllocations: [], surveyAllocations: [], apiKeys: [],
     selectedSurvey: null, searchTimer: null,
   };
+  const clientPicker = document.querySelector('#vendorClientPicker');
 
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -159,12 +160,18 @@
     return `<div class="vendor-money"><strong>${escapeHtml(record.effective_cpi_cut_percent ?? 0)}%</strong><small>${own === null || own === undefined ? inheritedLabel : 'override'}</small></div>`;
   }
 
+  function cpiRangeMarkup(record) {
+    const minimum = record.min_cpi == null ? 'Any' : `$${record.min_cpi}`;
+    const maximum = record.max_cpi == null ? 'Any' : `$${record.max_cpi}`;
+    return `<div class="vendor-money"><strong>${escapeHtml(minimum)} – ${escapeHtml(maximum)}</strong><small>source CPI range</small></div>`;
+  }
+
   function emptyRow(columns, message) {
     return `<tr><td colspan="${columns}"><div class="vendor-empty">${escapeHtml(message)}</div></td></tr>`;
   }
 
-  function actionButton(kind, id, allowed) {
-    return allowed ? `<button class="vendor-action" type="button" data-edit-${kind}="${id}">Edit</button>` : '';
+  function actionButton(kind, id, allowed, label = 'Edit') {
+    return allowed ? `<button class="vendor-action" type="button" data-edit-${kind}="${id}">${escapeHtml(label)}</button>` : '';
   }
 
   function renderOverview() {
@@ -179,12 +186,13 @@
     const profiles = new Map(state.profiles.map((item) => [Number(item.vendor), item]));
     const rows = state.vendors.map((vendor) => {
       const profile = profiles.get(Number(vendor.id));
-      const cut = vendor.account_type === 'internal_vendor' ? '0.00' : (profile?.default_cpi_cut_percent ?? vendor.default_cpi_cut_percent ?? '0.00');
+      const cut = vendor.average_client_cpi_cut_percent ?? '0.00';
+      const allocationCount = vendor.active_client_allocation_count ?? vendor.allocation_count ?? 0;
       const cells = [];
       if (vendorColumns.has('name')) cells.push(`<td>${vendorIdentity(vendor)}</td>`);
       if (vendorColumns.has('type')) cells.push(`<td>${typeBadge(vendor.account_type)}</td>`);
-      if (vendorColumns.has('cpi')) cells.push(`<td><div class="vendor-money"><strong>${escapeHtml(cut)}%</strong><small>${escapeHtml(profile?.currency || vendor.currency || 'USD')} policy</small></div></td>`);
-      if (vendorColumns.has('clients')) cells.push(`<td>${number(vendor.allocation_count)}</td>`);
+      if (vendorColumns.has('cpi')) cells.push(`<td><div class="vendor-money"><strong>${escapeHtml(cut)}%</strong><small>${allocationCount ? `average across ${number(allocationCount)} client${allocationCount === 1 ? '' : 's'}` : 'supplier default'}</small></div></td>`);
+      if (vendorColumns.has('clients')) cells.push(`<td>${number(allocationCount)}</td>`);
       if (vendorColumns.has('status')) cells.push(`<td>${stateBadge(vendor.is_active && (profile?.is_active ?? true))}<small class="delivery-label">${escapeHtml(deliveryLabel(profile?.delivery_mode || vendor.delivery_mode))}</small></td>`);
       if (vendorColumns.has('actions')) cells.push(`<td>${actionButton('policy', vendor.id, canEditPolicy)}</td>`);
       return `<tr>${cells.join('') || '<td><div class="vendor-empty">No supplier columns assigned.</div></td>'}</tr>`;
@@ -192,9 +200,10 @@
     $('#vendorRows').innerHTML = rows;
     $('#vendorCards').innerHTML = state.vendors.map((vendor) => {
       const profile = profiles.get(Number(vendor.id));
-      const cut = vendor.account_type === 'internal_vendor' ? '0.00' : (profile?.default_cpi_cut_percent ?? '0.00');
+      const cut = vendor.average_client_cpi_cut_percent ?? '0.00';
+      const allocationCount = vendor.active_client_allocation_count ?? vendor.allocation_count ?? 0;
       const head = `${vendorColumns.has('name') ? vendorIdentity(vendor) : ''}${vendorColumns.has('type') ? typeBadge(vendor.account_type) : ''}`;
-      const details = `${vendorColumns.has('cpi') ? `<span>Default CPI cut<strong>${escapeHtml(cut)}%</strong></span>` : ''}${vendorColumns.has('clients') ? `<span>Client grants<strong>${number(vendor.allocation_count)}</strong></span>` : ''}${vendorColumns.has('status') ? `<span>Delivery<strong>${escapeHtml(deliveryLabel(profile?.delivery_mode || vendor.delivery_mode))}</strong></span>` : ''}`;
+      const details = `${vendorColumns.has('cpi') ? `<span>Average CPI cut<strong>${escapeHtml(cut)}%</strong></span>` : ''}${vendorColumns.has('clients') ? `<span>Client grants<strong>${number(allocationCount)}</strong></span>` : ''}${vendorColumns.has('status') ? `<span>Delivery<strong>${escapeHtml(deliveryLabel(profile?.delivery_mode || vendor.delivery_mode))}</strong></span>` : ''}`;
       return `<article class="vendor-card">${head ? `<div class="vendor-card-head">${head}</div>` : ''}${details ? `<div class="vendor-card-grid">${details}</div>` : ''}${vendorColumns.has('actions') ? actionButton('policy', vendor.id, canEditPolicy) : ''}</article>`;
     }).join('');
   }
@@ -206,15 +215,15 @@
       if (clientColumns.has('vendor')) cells.push(`<td><strong>${escapeHtml(row.vendor_name)}</strong><br>${typeBadge(row.account_type)}</td>`);
       if (clientColumns.has('client')) cells.push(`<td><strong>${escapeHtml(row.client_name)}</strong><br><small>${stateBadge(row.is_active)}</small></td>`);
       if (clientColumns.has('quantity')) cells.push(`<td>${quantityMarkup(row)}</td>`);
-      if (clientColumns.has('cpi')) cells.push(`<td>${cutMarkup(row, 'supplier default')}</td>`);
+      if (clientColumns.has('cpi')) cells.push(`<td>${cutMarkup(row, 'supplier default')}${cpiRangeMarkup(row)}</td>`);
       if (clientColumns.has('window')) cells.push(`<td><div class="vendor-window"><span>${dateTime(row.starts_at)}</span><span>to ${dateTime(row.ends_at)}</span></div></td>`);
-      if (clientColumns.has('actions')) cells.push(`<td>${actionButton('client', row.id, canAllocateClient)}</td>`);
+      if (clientColumns.has('actions')) cells.push(`<td>${actionButton('client', row.id, canAllocateClient, 'View')}</td>`);
       return `<tr>${cells.join('') || '<td><div class="vendor-empty">No client-allocation columns assigned.</div></td>'}</tr>`;
     }).join('') || emptyRow(Math.max(1, clientColumns.size), 'No client allocations yet.');
     $('#clientAllocationCards').innerHTML = state.clientAllocations.map((row) => {
       const head = `${clientColumns.has('vendor') ? `<strong>${escapeHtml(row.vendor_name)}</strong>` : ''}${clientColumns.has('client') ? `<small>${escapeHtml(row.client_name)}</small>` : ''}`;
-      const details = `${clientColumns.has('quantity') ? `<span>Available<strong>${number(row.remaining_quantity)}</strong></span><span>Limit<strong>${number(row.quantity_limit)}</strong></span>` : ''}${clientColumns.has('cpi') ? `<span>CPI cut<strong>${escapeHtml(row.effective_cpi_cut_percent)}%</strong></span>` : ''}${clientColumns.has('vendor') ? `<span>Type<strong>${escapeHtml(accountLabel(row.account_type))}</strong></span>` : ''}${clientColumns.has('window') ? `<span>Window<strong>${dateTime(row.starts_at)} to ${dateTime(row.ends_at)}</strong></span>` : ''}`;
-      return `<article class="vendor-card">${head ? `<div class="vendor-card-head"><div>${head}</div>${clientColumns.has('client') ? stateBadge(row.is_active) : ''}</div>` : ''}${details ? `<div class="vendor-card-grid">${details}</div>` : ''}${clientColumns.has('quantity') ? quantityMarkup(row) : ''}${clientColumns.has('actions') ? actionButton('client', row.id, canAllocateClient) : ''}</article>`;
+      const details = `${clientColumns.has('quantity') ? `<span>Available<strong>${number(row.remaining_quantity)}</strong></span><span>Limit<strong>${number(row.quantity_limit)}</strong></span>` : ''}${clientColumns.has('cpi') ? `<span>CPI cut<strong>${escapeHtml(row.effective_cpi_cut_percent)}%</strong></span><span>Source CPI range<strong>${escapeHtml(row.min_cpi ?? 'Any')} – ${escapeHtml(row.max_cpi ?? 'Any')}</strong></span>` : ''}${clientColumns.has('vendor') ? `<span>Type<strong>${escapeHtml(accountLabel(row.account_type))}</strong></span>` : ''}${clientColumns.has('window') ? `<span>Window<strong>${dateTime(row.starts_at)} to ${dateTime(row.ends_at)}</strong></span>` : ''}`;
+      return `<article class="vendor-card">${head ? `<div class="vendor-card-head"><div>${head}</div>${clientColumns.has('client') ? stateBadge(row.is_active) : ''}</div>` : ''}${details ? `<div class="vendor-card-grid">${details}</div>` : ''}${clientColumns.has('quantity') ? quantityMarkup(row) : ''}${clientColumns.has('actions') ? actionButton('client', row.id, canAllocateClient, 'View') : ''}</article>`;
     }).join('');
   }
 
@@ -242,7 +251,7 @@
     $('#apiKeyRows').innerHTML = state.apiKeys.map((key) => {
       const cells = [];
       if (apiColumns.has('vendor')) cells.push(`<td><strong>${escapeHtml(key.vendor_name)}</strong><br>${typeBadge(key.account_type)}</td>`);
-      if (apiColumns.has('key')) cells.push(`<td><div class="vendor-money"><strong>${escapeHtml(key.name)}</strong><small>${escapeHtml(key.masked_key)}</small></div></td>`);
+      if (apiColumns.has('key')) cells.push(`<td><div class="vendor-money"><strong>${escapeHtml(key.name)}</strong><small>${escapeHtml(key.masked_key)} · ${escapeHtml((key.client_names || []).join(', ') || 'No clients')}</small></div></td>`);
       if (apiColumns.has('created')) cells.push(`<td>${dateTime(key.created_at)}</td>`);
       if (apiColumns.has('last_used')) cells.push(`<td>${key.last_used_at ? dateTime(key.last_used_at) : 'Never'}</td>`);
       if (apiColumns.has('expires')) cells.push(`<td>${key.expires_at ? dateTime(key.expires_at) : 'No expiry'}</td>`);
@@ -251,7 +260,7 @@
     }).join('') || emptyRow(Math.max(1, apiColumns.size), 'No API keys issued yet.');
     $('#apiKeyCards').innerHTML = state.apiKeys.map((key) => {
       const head = `${apiColumns.has('key') ? `<strong>${escapeHtml(key.name)}</strong>` : ''}${apiColumns.has('vendor') ? `<small>${escapeHtml(key.vendor_name)}</small>` : ''}`;
-      const details = `${apiColumns.has('key') ? `<span>Key<strong>${escapeHtml(key.masked_key)}</strong></span>` : ''}${apiColumns.has('last_used') ? `<span>Last used<strong>${key.last_used_at ? dateTime(key.last_used_at) : 'Never'}</strong></span>` : ''}${apiColumns.has('created') ? `<span>Created<strong>${dateTime(key.created_at)}</strong></span>` : ''}${apiColumns.has('expires') ? `<span>Expires<strong>${key.expires_at ? dateTime(key.expires_at) : 'Never'}</strong></span>` : ''}`;
+      const details = `${apiColumns.has('key') ? `<span>Key<strong>${escapeHtml(key.masked_key)}</strong></span><span>Clients<strong>${escapeHtml((key.client_names || []).join(', ') || 'None')}</strong></span>` : ''}${apiColumns.has('last_used') ? `<span>Last used<strong>${key.last_used_at ? dateTime(key.last_used_at) : 'Never'}</strong></span>` : ''}${apiColumns.has('created') ? `<span>Created<strong>${dateTime(key.created_at)}</strong></span>` : ''}${apiColumns.has('expires') ? `<span>Expires<strong>${key.expires_at ? dateTime(key.expires_at) : 'Never'}</strong></span>` : ''}`;
       return `<article class="vendor-card">${head ? `<div class="vendor-card-head"><div>${head}</div>${key.is_active ? stateBadge(true) : stateBadge(false)}</div>` : ''}${details ? `<div class="vendor-card-grid">${details}</div>` : ''}${apiColumns.has('actions') && key.is_active && canRevokeApiKey ? `<button class="vendor-action danger" type="button" data-revoke-api-key="${key.id}">Revoke key</button>` : ''}</article>`;
     }).join('');
   }
@@ -264,16 +273,66 @@
     return `<option value="${escapeHtml(value)}"${selected ? ' selected' : ''}>${escapeHtml(label)}</option>`;
   }
 
+  function selectedClientIds() {
+    return [...field('client', 'client').selectedOptions].map((item) => Number(item.value));
+  }
+
+  function selectedApiAllocationIds() {
+    return $$('#apiClientAllocationChoices input[type="checkbox"]:checked').map((item) => Number(item.value));
+  }
+
+  function renderApiAllocationChoices() {
+    const container = $('#apiClientAllocationChoices');
+    if (!container) return;
+    const vendorId = Number(field('api_vendor', 'api_key')?.value || 0);
+    const allocations = state.clientAllocations.filter((row) => (
+      Number(row.vendor) === vendorId && row.is_active
+    ));
+    container.innerHTML = allocations.length ? allocations.map((row) => (
+      `<label><input type="checkbox" value="${row.id}"><span><strong>${escapeHtml(row.client_name)}</strong><small>${escapeHtml(row.effective_cpi_cut_percent)}% cut · ${number(row.remaining_quantity)} completes left</small></span></label>`
+    )).join('') : '<div class="vendor-choice-empty">Select an external supplier with an active client allocation.</div>';
+  }
+
+  function updateClientPickerLabel() {
+    const selected = selectedClientIds();
+    const label = clientPicker.querySelector('.vendor-client-picker-trigger span');
+    if (!selected.length) label.textContent = 'Select one or more clients';
+    else if (selected.length === 1) {
+      label.textContent = state.clients.find((item) => Number(item.id) === selected[0])?.name || '1 client selected';
+    } else label.textContent = `${selected.length} clients selected`;
+  }
+
+  function renderClientPickerOptions(needle = '') {
+    const selected = new Set(selectedClientIds());
+    const normalized = needle.trim().toLowerCase();
+    const visible = state.clients.filter((client) => !normalized || client.name.toLowerCase().includes(normalized));
+    clientPicker.querySelector('.vendor-client-picker-options').innerHTML = visible.length ? visible.map((client) => (
+      `<label><input type="checkbox" value="${client.id}"${selected.has(Number(client.id)) ? ' checked' : ''}><span>${escapeHtml(client.name)}</span></label>`
+    )).join('') : '<div class="vendor-empty">No matching clients</div>';
+  }
+
+  function setClientSelection(ids, disabled = false) {
+    const selected = new Set((ids || []).map(Number));
+    [...field('client', 'client').options].forEach((item) => { item.selected = selected.has(Number(item.value)); });
+    clientPicker.classList.toggle('disabled', disabled);
+    clientPicker.querySelector('.vendor-client-picker-trigger').disabled = disabled;
+    renderClientPickerOptions();
+    updateClientPickerLabel();
+  }
+
   function hydrateSelects() {
     const vendorOptions = state.vendors.map((vendor) => option(vendor.id, `${vendor.full_name} — ${accountLabel(vendor.account_type)}`)).join('');
     field('policy_vendor', 'policy').innerHTML = vendorOptions;
     field('client_vendor', 'client').innerHTML = `<option value="">Select supplier</option>${vendorOptions}`;
-    field('client', 'client').innerHTML = `<option value="">Select client</option>${state.clients.map((client) => option(client.id, client.name)).join('')}`;
+    field('client', 'client').innerHTML = state.clients.map((client) => option(client.id, client.name)).join('');
+    renderClientPickerOptions();
+    updateClientPickerLabel();
     field('client_allocation', 'survey').innerHTML = `<option value="">Select supplier and client</option>${state.clientAllocations.map((row) => option(row.id, `${row.vendor_name} — ${row.client_name}`)).join('')}`;
     field('api_vendor', 'api_key').innerHTML = `<option value="">Select API-enabled external supplier</option>${state.vendors.filter((vendor) => {
       const profile = state.profiles.find((item) => Number(item.vendor) === Number(vendor.id));
       return vendor.account_type === 'external_vendor' && ['api', 'both'].includes(profile?.delivery_mode || vendor.delivery_mode);
     }).map((vendor) => option(vendor.id, vendor.full_name)).join('')}`;
+    renderApiAllocationChoices();
   }
 
   function updatePolicyRule() {
@@ -310,6 +369,13 @@
     if (field('survey')) field('survey').value = '';
     if (field('is_active')) field('is_active').checked = true;
     state.selectedSurvey = null;
+    if (mode === 'client') setClientSelection([], false);
+    if (mode === 'client') {
+      const summary = $('#clientAllocationSummary');
+      summary.hidden = true;
+      summary.innerHTML = '';
+    }
+    if (mode === 'api_key') renderApiAllocationChoices();
     errorBox.hidden = true;
     const results = $('#surveySearchResults');
     if (results) results.hidden = true;
@@ -365,16 +431,27 @@
     if (record) {
       field('record_id').value = record.id;
       field('client_vendor').value = record.vendor;
-      field('client').value = record.client;
-      field('client_vendor').disabled = true; field('client').disabled = true;
+      setClientSelection([record.client], true);
+      field('client_vendor').disabled = true;
       field('client_quantity_limit').value = record.quantity_limit;
       field('client_cpi_cut').value = record.cpi_cut_override_percent ?? '';
+      field('client_min_cpi').value = record.min_cpi ?? '';
+      field('client_max_cpi').value = record.max_cpi ?? '';
       field('client_starts_at').value = toInputDateTime(record.starts_at);
       field('client_ends_at').value = toInputDateTime(record.ends_at);
       field('is_active').checked = record.is_active;
+      const apiScopes = (record.api_key_scopes || []).filter((item) => item.is_active);
+      const summary = $('#clientAllocationSummary');
+      summary.innerHTML = `
+        <article><span>Supplier</span><strong>${escapeHtml(record.vendor_name)}</strong></article>
+        <article><span>Client</span><strong>${escapeHtml(record.client_name)}</strong></article>
+        <article><span>Effective CPI cut</span><strong>${escapeHtml(record.effective_cpi_cut_percent)}%</strong></article>
+        <article><span>Source CPI range</span><strong>${escapeHtml(record.min_cpi ?? 'Any')} – ${escapeHtml(record.max_cpi ?? 'Any')}</strong></article>
+        <article><span>API access</span><strong>${escapeHtml(apiScopes.map((item) => item.name).join(', ') || 'No API key')}</strong></article>`;
+      summary.hidden = false;
     }
-    $('[data-modal-title]', modal).textContent = record ? 'Edit client allocation' : 'Allocate a client';
-    $('[data-vendor-submit]', form).textContent = record ? 'Save allocation' : 'Create allocation';
+    $('[data-modal-title]', modal).textContent = record ? 'Client allocation details' : 'Allocate a client';
+    $('[data-vendor-submit]', form).textContent = record ? 'Update allocation' : 'Create allocation';
     updateClientRule(); showModal();
   }
 
@@ -424,7 +501,7 @@
       needsOptions ? api('/api/v1/vendors/management-options/') : Promise.resolve({ vendors: [], clients: [] }),
       canViewVendors ? fetchAll('/api/v1/vendors/directory/') : Promise.resolve(null),
       canViewVendors ? fetchAll('/api/v1/vendors/commercial-profiles/') : Promise.resolve([]),
-      canViewClientAllocations ? fetchAll('/api/v1/vendors/client-allocations/') : Promise.resolve([]),
+      (canViewClientAllocations || canCreateApiKey) ? fetchAll('/api/v1/vendors/client-allocations/') : Promise.resolve([]),
       canViewProjectAllocations ? fetchAll('/api/v1/vendors/survey-allocations/') : Promise.resolve([]),
       canViewApiKeys ? fetchAll('/api/v1/vendors/api-keys/') : Promise.resolve([]),
     ]);
@@ -457,13 +534,13 @@
     if (createApiKey && canCreateApiKey) {
       event.preventDefault(); event.stopPropagation(); openApiKey(); return;
     }
-    const policy = event.target.closest('[data-edit-policy]');
+    const policy = event.target.closest('button[data-edit-policy]');
     const client = event.target.closest('[data-edit-client]');
     const survey = event.target.closest('[data-edit-survey]');
     if (policy && canEditPolicy) { event.preventDefault(); openPolicy(policy.dataset.editPolicy); return; }
     if (client && canAllocateClient) { event.preventDefault(); openClientAllocation(client.dataset.editClient); return; }
     if (survey && canAllocateProject) { event.preventDefault(); openSurveyAllocation(survey.dataset.editSurvey); return; }
-    const revokeKey = event.target.closest('[data-revoke-api-key]');
+    const revokeKey = event.target.closest('button[data-revoke-api-key]');
     if (revokeKey && canRevokeApiKey && confirm('Revoke this API key permanently?')) {
       api(`/api/v1/vendors/api-keys/${revokeKey.dataset.revokeApiKey}/`, { method: 'DELETE' })
         .then(() => { toast('API key revoked.'); return reloadData(); })
@@ -475,6 +552,7 @@
   document.addEventListener('keydown', (event) => { if (event.key === 'Escape' && modal && !modal.hidden) closeModal(); });
   field('policy_vendor', 'policy').addEventListener('change', updatePolicyRule);
   field('client_vendor', 'client').addEventListener('change', updateClientRule);
+  field('api_vendor', 'api_key').addEventListener('change', renderApiAllocationChoices);
   field('client_allocation', 'survey').addEventListener('change', () => {
     field('survey', 'survey').value = ''; field('survey_search', 'survey').value = ''; state.selectedSurvey = null;
     updateSurveyRule();
@@ -492,6 +570,28 @@
     field('survey_search').value = `${label} · ${subtitle}`;
     state.selectedSurvey = { id: Number(button.dataset.selectSurvey) };
     $('#surveySearchResults').hidden = true;
+  });
+  clientPicker.querySelector('.vendor-client-picker-trigger').addEventListener('click', () => {
+    const open = !clientPicker.classList.contains('open');
+    clientPicker.classList.toggle('open', open);
+    clientPicker.querySelector('.vendor-client-picker-menu').hidden = !open;
+    clientPicker.querySelector('.vendor-client-picker-trigger').setAttribute('aria-expanded', String(open));
+    if (open) clientPicker.querySelector('input[type="search"]').focus();
+  });
+  clientPicker.querySelector('input[type="search"]').addEventListener('input', (event) => {
+    renderClientPickerOptions(event.target.value);
+  });
+  clientPicker.querySelector('.vendor-client-picker-options').addEventListener('change', (event) => {
+    if (!event.target.matches('input[type="checkbox"]')) return;
+    const target = [...field('client', 'client').options].find((item) => item.value === event.target.value);
+    if (target) target.selected = event.target.checked;
+    updateClientPickerLabel();
+  });
+  document.addEventListener('click', (event) => {
+    if (clientPicker.contains(event.target)) return;
+    clientPicker.classList.remove('open');
+    clientPicker.querySelector('.vendor-client-picker-menu').hidden = true;
+    clientPicker.querySelector('.vendor-client-picker-trigger').setAttribute('aria-expanded', 'false');
   });
   $('#copyIssuedKey').addEventListener('click', async () => {
     await navigator.clipboard.writeText($('#issuedKeyValue').value);
@@ -517,10 +617,16 @@
       };
     } else if (mode === 'client') {
       url = `/api/v1/vendors/client-allocations/${id ? `${id}/` : ''}`;
+      const clientIds = selectedClientIds();
+      if (!clientIds.length) {
+        errorBox.textContent = 'Select at least one client.'; errorBox.hidden = false; return;
+      }
       payload = {
-        vendor: Number(field('client_vendor').value), client: Number(field('client').value),
+        vendor: Number(field('client_vendor').value), client: clientIds[0],
         quantity_limit: Number(field('client_quantity_limit').value),
         cpi_cut_override_percent: field('client_cpi_cut').disabled ? null : nullableNumber(field('client_cpi_cut').value),
+        min_cpi: nullableNumber(field('client_min_cpi').value),
+        max_cpi: nullableNumber(field('client_max_cpi').value),
         starts_at: toApiDateTime(field('client_starts_at').value), ends_at: toApiDateTime(field('client_ends_at').value),
         is_active: field('is_active').checked,
       };
@@ -536,15 +642,30 @@
       };
     } else {
       url = '/api/v1/vendors/api-keys/';
+      const allocationIds = selectedApiAllocationIds();
+      if (!allocationIds.length) {
+        errorBox.textContent = 'Select at least one client for this API key.'; errorBox.hidden = false; return;
+      }
       payload = {
         vendor: Number(field('api_vendor').value), name: field('api_key_name').value.trim(),
+        client_allocations: allocationIds,
         expires_at: toApiDateTime(field('api_key_expires_at').value),
       };
     }
     try {
       const submit = $('[data-vendor-submit]', form);
       submit.disabled = true;
-      const result = await api(url, { method: id ? 'PATCH' : 'POST', body: JSON.stringify(payload) });
+      let result;
+      if (mode === 'client' && !id) {
+        const clientIds = selectedClientIds();
+        for (const clientId of clientIds) {
+          result = await api(url, {
+            method: 'POST', body: JSON.stringify({ ...payload, client: clientId }),
+          });
+        }
+      } else {
+        result = await api(url, { method: id ? 'PATCH' : 'POST', body: JSON.stringify(payload) });
+      }
       if (mode === 'api_key') {
         $('#issuedKeyValue').value = result.api_key;
         $('#issuedKeyPanel').hidden = false;
@@ -553,7 +674,8 @@
         toast('API key generated. Copy it now.');
         await reloadData();
       } else {
-        closeModal(); toast(id ? 'Changes saved.' : 'Configuration created.'); await reloadData();
+        const count = mode === 'client' && !id ? selectedClientIds().length : 1;
+        closeModal(); toast(id ? 'Changes saved.' : (count > 1 ? `${count} client allocations created.` : 'Configuration created.')); await reloadData();
       }
     } catch (error) { errorBox.textContent = error.message; errorBox.hidden = false; }
     finally { const submit = $('[data-vendor-submit]', form); if (submit) submit.disabled = false; }

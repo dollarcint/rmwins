@@ -5,7 +5,8 @@ from decimal import Decimal
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
-from django.test import TestCase, override_settings
+from django.core.cache import cache
+from django.test import RequestFactory, TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient, APIRequestFactory
 
@@ -20,7 +21,7 @@ from .provider_services import sync_cint_redirect_contracts, sync_client_integra
 from .providers import ProviderError
 from .providers.cint import CintProvider
 from .serializers import SurveyListSerializer, SurveyQuotaSerializer, TargetingQuestionSerializer
-from .views import _prescreener_questions
+from .views import _collect_prescreener_answers, _prescreener_questions
 
 
 class FakeResponse:
@@ -76,6 +77,7 @@ class CintProviderTests(TestCase):
     databases = {"default", DATABASE_ALIAS}
 
     def setUp(self):
+        cache.clear()
         self.client_record = Client.objects.create(
             code="cint", name="Cint Exchange", provider_code="cint"
         )
@@ -457,7 +459,20 @@ class CintProviderTests(TestCase):
     @override_settings(PUBLIC_APP_BASE_URL="https://api.exchange-ip.com")
     @patch.dict("os.environ", {"TEST_CINT_API_KEY": "cint-secret"}, clear=False)
     def test_redirect_batch_skips_surveys_already_on_current_contract(self):
-        provider = CintProvider(self.integration, session=RecordingSession({"ApiResult": 0}))
+        redirect_response = {
+            "ApiResult": 0,
+            "SupplierLink": {
+                "SupplierLinkTypeCode": "OWS",
+                "TrackingTypeCode": "NONE",
+                "DefaultLink": "https://api.exchange-ip.com/survey?status=2&rid=[%MID%]",
+                "SuccessLink": "https://api.exchange-ip.com/survey?status=1&rid=[%MID%]",
+                "FailureLink": "https://api.exchange-ip.com/survey?status=2&rid=[%MID%]",
+                "OverQuotaLink": "https://api.exchange-ip.com/survey?status=3&rid=[%MID%]",
+                "QualityTerminationLink": "https://api.exchange-ip.com/survey?status=4&rid=[%MID%]",
+                "LiveLink": "https://samplicio.us/s/default.aspx?SID=verified&PID=",
+            },
+        }
+        provider = CintProvider(self.integration, session=RecordingSession(redirect_response))
         fingerprint = provider.redirect_contract_fingerprint()
         configured = Survey.objects.create(
             client=self.client_record,
@@ -466,6 +481,7 @@ class CintProviderTests(TestCase):
             raw_data={
                 "_cint_redirect_contract": fingerprint,
                 "_cint_redirect_supplier_code": provider.supplier_code,
+                "_cint_redirect_verified_at": timezone.now().isoformat(),
             },
         )
         pending = Survey.objects.create(
@@ -650,12 +666,84 @@ class CintProviderTests(TestCase):
             ],
             raw_data={"provider": "cint", "targeting_choices": ["1"]},
         )
+        TargetingQuestion.objects.create(
+            survey=survey,
+            question_id=45,
+            key="ZIP",
+            text="What is your ZIP/postal code?",
+            question_type="Numeric - Open-end",
+            category="Cint qualification",
+            options=[
+                {"OptionId": "02108", "OptionText": "02108"},
+                {"OptionId": "10001", "OptionText": "10001"},
+            ],
+            raw_data={"provider": "cint", "targeting_choices": ["02108"]},
+        )
 
-        age, gender = _prescreener_questions(survey)
+        age, gender, postal = _prescreener_questions(survey)
         self.assertEqual((age["min_value"], age["max_value"]), (18, 20))
         self.assertEqual(age["targeting_note"], "Qualifying age: 18\u201320")
         self.assertEqual(gender["targeting_note"], "Qualifying answer: Male")
         self.assertEqual(gender["options"], [{"value": "1", "label": "Male", "selected": False}])
+        self.assertEqual(postal["input_kind"], "text")
+        self.assertEqual(postal["type_label"], "Postal code")
+        self.assertEqual(postal["placeholder"], "Enter your ZIP / postal code")
+        self.assertEqual(
+            postal["targeting_note"],
+            "Enter a ZIP/postal code accepted by this survey.",
+        )
+
+    def test_cint_dummy_qualifications_with_options_are_selectable(self):
+        survey = Survey.objects.create(
+            client=self.client_record,
+            integration=self.integration,
+            source_id=143481,
+            source_key="143481",
+            company_name="Cint Exchange",
+        )
+        TargetingQuestion.objects.create(
+            survey=survey,
+            question_id=5001,
+            key="REGION",
+            text="What is your REGION?",
+            question_type="Dummy",
+            category="Cint qualification",
+            options=[
+                {"OptionId": "midwest", "OptionText": "Midwest"},
+                {"OptionId": "south", "OptionText": "South"},
+                {"OptionId": "west", "OptionText": "West"},
+            ],
+            raw_data={
+                "provider": "cint",
+                "targeting_choices": ["midwest", "south"],
+            },
+        )
+        TargetingQuestion.objects.create(
+            survey=survey,
+            question_id=5002,
+            key="MOBILE_DEVICE",
+            text="Are you using a mobile device?",
+            question_type="Dummy",
+            category="Cint qualification",
+            options=[
+                {"OptionId": "true", "OptionText": "Yes"},
+                {"OptionId": "false", "OptionText": "No"},
+            ],
+            raw_data={"provider": "cint", "targeting_choices": ["false"]},
+        )
+
+        region, mobile = _prescreener_questions(survey)
+
+        self.assertEqual(region["input_kind"], "radio")
+        self.assertEqual(
+            [(item["value"], item["label"]) for item in region["options"]],
+            [("midwest", "Midwest"), ("south", "South")],
+        )
+        self.assertEqual(mobile["input_kind"], "radio")
+        self.assertEqual(
+            [(item["value"], item["label"]) for item in mobile["options"]],
+            [("false", "No")],
+        )
 
     @patch.dict(
         "os.environ",

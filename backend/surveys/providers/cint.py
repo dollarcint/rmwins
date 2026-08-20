@@ -12,10 +12,12 @@ from decimal import Decimal, InvalidOperation
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import requests
+from prescreener_vault.reuse import effective_profile_uid
 from django.conf import settings
 from django.db import transaction
 from django.utils import timezone
 
+from config.cache_utils import safe_cache_get_or_set, stable_cache_key
 from prescreener_vault.cint_email_pool import assigned_email_hash
 from surveys.models import Survey, SurveyQuota, TargetingQuestion
 from vendors.credentials import resolve_integration_token
@@ -131,7 +133,10 @@ class CintProvider(SurveyProvider):
         except requests.RequestException as exc:
             status = getattr(getattr(exc, "response", None), "status_code", None)
             suffix = f" (HTTP {status})" if status else ""
-            raise ProviderError(f"Cint Exchange request failed{suffix}.") from exc
+            raise ProviderError(
+                f"Cint Exchange request failed{suffix}.",
+                status_code=status,
+            ) from exc
         except ValueError as exc:
             raise ProviderError("Cint Exchange returned invalid JSON.") from exc
         if not isinstance(data, dict):
@@ -528,8 +533,20 @@ class CintProvider(SurveyProvider):
     def _question_library(self, country_language_id):
         """Return localized question metadata keyed by numeric QuestionID."""
 
-        data = self._request(
-            f"Lookup/v1/QuestionLibrary/AllQuestions/{country_language_id}"
+        cache_key = stable_cache_key(
+            "cint:question-library:v1",
+            {
+                "base_url": self.base_url,
+                "country_language_id": int(country_language_id),
+            },
+        )
+        data = safe_cache_get_or_set(
+            cache_key,
+            lambda: self._request(
+                f"Lookup/v1/QuestionLibrary/AllQuestions/{country_language_id}"
+            ),
+            timeout=86400,
+            jitter_seconds=3600,
         )
         return {
             self._integer(item.get("QuestionID"), -1): item
@@ -542,18 +559,44 @@ class CintProvider(SurveyProvider):
 
         if question_id in library:
             return library[question_id]
-        data = self._request(
-            f"Lookup/v1/QuestionLibrary/QuestionById/{country_language_id}/{question_id}",
-            allow_not_found=True,
+        cache_key = stable_cache_key(
+            "cint:question:v1",
+            {
+                "base_url": self.base_url,
+                "country_language_id": int(country_language_id),
+                "question_id": int(question_id),
+            },
+        )
+        data = safe_cache_get_or_set(
+            cache_key,
+            lambda: self._request(
+                f"Lookup/v1/QuestionLibrary/QuestionById/{country_language_id}/{question_id}",
+                allow_not_found=True,
+            ),
+            timeout=86400,
+            jitter_seconds=3600,
         )
         return data.get("Question") if isinstance(data.get("Question"), dict) else {}
 
     def _question_options(self, country_language_id, question_id):
         """Fetch localized option/PreCode rows for one question."""
 
-        data = self._request(
-            f"Lookup/v1/QuestionLibrary/AllQuestionOptions/{country_language_id}/{question_id}",
-            allow_not_found=True,
+        cache_key = stable_cache_key(
+            "cint:question-options:v1",
+            {
+                "base_url": self.base_url,
+                "country_language_id": int(country_language_id),
+                "question_id": int(question_id),
+            },
+        )
+        data = safe_cache_get_or_set(
+            cache_key,
+            lambda: self._request(
+                f"Lookup/v1/QuestionLibrary/AllQuestionOptions/{country_language_id}/{question_id}",
+                allow_not_found=True,
+            ),
+            timeout=86400,
+            jitter_seconds=3600,
         )
         return self._rows(data, "QuestionOptions") if data else []
 
@@ -632,8 +675,17 @@ class CintProvider(SurveyProvider):
             metadata[question_id] = self._question_metadata(
                 country_language_id, question_id, library
             )
-            options[question_id] = self._question_options(
-                country_language_id, question_id
+            question_type = str(
+                (metadata[question_id] or {}).get("QuestionType") or ""
+            ).lower()
+            # Age and ZIP/postal are open-ended standard qualifications. Their
+            # accepted values already arrive in the survey qualification; a
+            # country-wide option lookup (especially every ZIP) is unnecessary
+            # and can be extremely large.
+            options[question_id] = (
+                []
+                if question_id in {42, 45} or "open-end" in question_type
+                else self._question_options(country_language_id, question_id)
             )
 
         merged_qualifications = {}
@@ -936,6 +988,13 @@ class CintProvider(SurveyProvider):
             payload=payload,
         )
         raw_data = dict(survey.raw_data or {})
+        for key in (
+            "_cint_redirect_last_error",
+            "_cint_redirect_last_failed_at",
+            "_cint_redirect_terminal",
+            "_cint_redirect_terminal_at",
+        ):
+            raw_data.pop(key, None)
         raw_data["_cint_redirect_contract"] = self.redirect_contract_fingerprint()
         raw_data["_cint_redirect_synced_at"] = timezone.now().isoformat()
         raw_data["_cint_redirect_supplier_code"] = self.supplier_code
@@ -1001,7 +1060,7 @@ class CintProvider(SurveyProvider):
         hostname = (parsed.hostname or "").lower()
         if hostname != "samplicio.us" and not hostname.endswith(".samplicio.us"):
             raise ProviderConfigurationError("Cint returned an unexpected supplier-link hostname.")
-        pid = str(attempt.prescreener_uid or "").strip()
+        pid = effective_profile_uid(attempt)
         if not pid:
             raise ProviderConfigurationError("Cint requires the pre-screener UID as persistent PID.")
         email_digest = assigned_email_hash(pid, attempt.rid)

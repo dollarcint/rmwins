@@ -34,7 +34,7 @@ EXTERNAL_VENDOR_FORBIDDEN_CODES = frozenset({
     "termination_reasons.field.status", "termination_reasons.field.reason",
     "termination_reasons.field.respondent", "termination_reasons.field.survey",
     "termination_reasons.field.timing", "termination_reasons.field.audit",
-    "studies.column.cpi", "studies.card.revenue", "dashboard.card.revenue",
+    "studies.card.revenue", "dashboard.card.revenue",
     "dashboard.card.average_cpi", "dashboard.card.rpc",
     "dashboard.graph.finance_filters",
     "sync.run",
@@ -72,15 +72,19 @@ def effective_permission_codes(user) -> set[str]:
     if profile and profile.account_type == EmployeeProfile.AccountType.EXTERNAL_VENDOR:
         codes.difference_update(EXTERNAL_VENDOR_FORBIDDEN_CODES)
         codes = {code for code in codes if not code.startswith("organization.")}
-    if not is_super_admin_account(user):
-        codes = {code for code in codes if not code.startswith("dashboard.")}
     return codes
 
 
 def has_function_access(user, code: str) -> bool:
-    if code == "dashboard.view":
-        return is_super_admin_account(user)
-    return bool(user and user.is_authenticated and user.is_active and (user.is_superuser or code in effective_permission_codes(user)))
+    return bool(
+        user
+        and user.is_authenticated
+        and user.is_active
+        and (
+            user.is_superuser
+            or code in effective_permission_codes(user)
+        )
+    )
 
 
 def function_permission_required(code: str):

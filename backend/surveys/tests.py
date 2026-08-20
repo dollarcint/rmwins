@@ -491,6 +491,18 @@ class SurveyAPITests(TestCase):
         denied_rows = xlsx_rows(denied_response)
         self.assertNotIn("CPI", denied_rows[0])
 
+        UserFunctionOverride.objects.create(
+            user=self.user,
+            function=AccessFunction.objects.get(code="projects.column.client_name"),
+            effect=UserFunctionOverride.Effect.DENY,
+        )
+        client_denied_rows = xlsx_rows(self.api.get(reverse("survey-export")))
+        self.assertNotIn("Client", client_denied_rows[0])
+        client_denied_list = self.api.get(reverse("survey-list"))
+        self.assertEqual(client_denied_list.data["results"][0]["client_name"], "")
+        self.assertEqual(client_denied_list.data["results"][0]["display_company_name"], "")
+        self.assertEqual(client_denied_list.data["results"][0]["company_name"], "")
+
     def test_detail_actions_return_cached_data(self):
         quota = self.api.get(reverse("survey-quotas", kwargs={"local_id": self.survey.local_id}))
         targeting = self.api.get(reverse("survey-targeting", kwargs={"local_id": self.survey.local_id}))
@@ -597,9 +609,16 @@ class SurveyFlowTests(TestCase):
             reverse("survey-status"), {"status": "1", "rid": rid}, REMOTE_ADDR="20.20.20.20",
             HTTP_USER_AGENT="Mozilla/5.0 (Linux; Android 14; Mobile) Chrome/126.0.0.0",
         )
-        self.assertEqual(callback.status_code, 200)
-        self.assertContains(callback, "Thank you for participating!")
+        self.assertEqual(callback.status_code, 302)
         attempt = SurveyAttempt.objects.get(rid=rid)
+        self.assertEqual(
+            callback["Location"],
+            f"{reverse('survey-status')}?status=1&pid={attempt.pid}",
+        )
+        clean_result = self.client.get(callback["Location"])
+        self.assertEqual(clean_result.status_code, 200)
+        self.assertContains(clean_result, "Thank you for participating!")
+        self.assertContains(clean_result, attempt.pid)
         self.assertEqual(attempt.status, SurveyAttempt.Status.COMPLETED)
         self.assertEqual(attempt.platform_user, self.platform_user)
         self.assertEqual(attempt.user_id, "294")
@@ -797,7 +816,11 @@ class SurveyFlowTests(TestCase):
 
         response = self.client.get(reverse("survey-status"), {"status": "1", "rid": attempt.rid})
 
-        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            response["Location"],
+            f"{reverse('survey-status')}?status=1&pid={attempt.pid}",
+        )
         attempt.refresh_from_db()
         self.assertGreaterEqual(attempt.loi_seconds, 3900)
         self.assertLess(attempt.loi_seconds, 3910)
@@ -815,7 +838,7 @@ class SurveyFlowTests(TestCase):
             reverse("survey-status"), {"status": "2", "rid": rid}, REMOTE_ADDR="127.0.0.1",
             HTTP_X_REAL_IP="1.1.1.1",
         )
-        self.assertEqual(callback.status_code, 200)
+        self.assertEqual(callback.status_code, 302)
         attempt = SurveyAttempt.objects.get(rid=rid)
         self.assertEqual(attempt.initiation_ip, "8.8.8.8")
         self.assertEqual(attempt.callback_ip, "1.1.1.1")
@@ -1158,17 +1181,174 @@ class StudiesTrackingTests(TestCase):
         self.assertIn(".xlsx", response["Content-Disposition"])
         rows = xlsx_rows(response)
         self.assertEqual(rows[0], [
-            "Project id", "Cleint survey id", "PID", "RID", "Status", "Status source",
-            "Client name", "Country", "Study type", "Actual LOI", "Current Client CPI",
-            "Client entry link CPI", "Vendor CPI", "Vendor name", "User name", "Device",
-            "OS", "Browser", "User agent", "Entry IP", "Exit IP", "Inisitate at",
-            "Presecreent at", "Redirect at", "entry date time", "Exit date time",
+            "Project id", "Client name", "Cleint survey id", "Country",
+            "Current Client CPI", "Client entry link CPI", "Vendor CPI", "Vendor name",
+            "RID", "PID", "User name", "Device", "OS", "Browser", "User agent",
+            "Entry IP", "Exit IP", "Actual LOI (minutes)", "Status", "Status source",
+            "Inisitate at", "Presecreent at", "Redirect at", "entry date time",
+            "Exit date time",
         ])
         self.assertIn("Kanik Sharma", rows[1])
         self.assertIn(self.complete.rid, rows[1])
         self.assertNotIn("Pre-screener answers", rows[0])
         self.assertNotIn("Outbound supplier URL", rows[0])
         self.assertNotIn("Ee4Ff5Gg6H", str(rows))
+        self.assertEqual(
+            rows[1][rows[0].index("Actual LOI (minutes)")],
+            "1.37",
+        )
+
+    def test_traffic_export_omits_columns_denied_to_the_user(self):
+        UserFunctionOverride.objects.create(
+            user=self.kanik,
+            function=AccessFunction.objects.get(code="attempts.export"),
+            effect=UserFunctionOverride.Effect.ALLOW,
+        )
+        UserFunctionOverride.objects.create(
+            user=self.kanik,
+            function=AccessFunction.objects.get(code="studies.column.ip"),
+            effect=UserFunctionOverride.Effect.DENY,
+        )
+        UserFunctionOverride.objects.create(
+            user=self.kanik,
+            function=AccessFunction.objects.get(code="studies.column.respondent_id"),
+            effect=UserFunctionOverride.Effect.ALLOW,
+        )
+        scoped_api = APIClient()
+        scoped_api.force_authenticate(self.kanik)
+
+        rows = xlsx_rows(scoped_api.get(reverse("survey-attempt-export")))
+
+        self.assertNotIn("Entry IP", rows[0])
+        self.assertNotIn("Exit IP", rows[0])
+        self.assertIn("RID", rows[0])
+
+    def test_traffic_export_separates_admin_commercials_from_team_lead_cpi(self):
+        role = Role.objects.get(slug="team-lead")
+        role.cpi_visibility_percent = "70.00"
+        role.save(update_fields=["cpi_visibility_percent"])
+        branch = OrganizationUnit.objects.create(
+            workspace_owner=self.owner,
+            unit_type=OrganizationUnit.UnitType.BRANCH,
+            name="Delhi",
+            code="traffic-export-delhi",
+            created_by=self.owner,
+        )
+        sub_branch = OrganizationUnit.objects.create(
+            workspace_owner=self.owner,
+            parent=branch,
+            unit_type=OrganizationUnit.UnitType.SUB_BRANCH,
+            name="Operations",
+            code="traffic-export-operations",
+            created_by=self.owner,
+        )
+        shift = OrganizationUnit.objects.create(
+            workspace_owner=self.owner,
+            parent=sub_branch,
+            unit_type=OrganizationUnit.UnitType.SHIFT,
+            name="Morning",
+            code="traffic-export-morning",
+            created_by=self.owner,
+        )
+        EmployeeProfile.objects.filter(user=self.kanik).update(
+            role=role,
+            organization_unit=shift,
+        )
+        UserFunctionOverride.objects.create(
+            user=self.kanik,
+            function=AccessFunction.objects.get(code="attempts.export"),
+            effect=UserFunctionOverride.Effect.ALLOW,
+        )
+        self.kanik = get_user_model().objects.get(pk=self.kanik.pk)
+
+        scoped_api = APIClient()
+        scoped_api.force_authenticate(self.kanik)
+        scoped_rows = xlsx_rows(scoped_api.get(reverse("survey-attempt-export")))
+        self.assertNotIn("Vendor CPI", scoped_rows[0])
+        self.assertNotIn("Vendor name", scoped_rows[0])
+        self.assertEqual(
+            scoped_rows[1][scoped_rows[0].index("Current Client CPI")],
+            "1.75",
+        )
+        self.assertEqual(
+            scoped_rows[1][scoped_rows[0].index("Client entry link CPI")],
+            "1.75",
+        )
+
+        admin_rows = xlsx_rows(self.api.get(reverse("survey-attempt-export"), {
+            "search": self.complete.rid,
+        }))
+        self.assertEqual(
+            admin_rows[1][admin_rows[0].index("Current Client CPI")],
+            "2.50",
+        )
+        self.assertEqual(
+            admin_rows[1][admin_rows[0].index("Client entry link CPI")],
+            "2.50",
+        )
+        self.assertEqual(admin_rows[1][admin_rows[0].index("Vendor CPI")], "1.75")
+        self.assertEqual(admin_rows[1][admin_rows[0].index("Vendor name")], "Operations")
+
+    def test_external_supplier_export_hides_admin_commercial_columns(self):
+        external = get_user_model().objects.create_user(
+            username="external-supplier",
+            first_name="External",
+            last_name="Supply",
+        )
+        EmployeeProfile.objects.filter(user=external).update(
+            account_type=EmployeeProfile.AccountType.EXTERNAL_VENDOR,
+            role=Role.objects.get(slug="external-vendor"),
+            created_by=self.owner,
+        )
+        UserFunctionOverride.objects.create(
+            user=external,
+            function=AccessFunction.objects.get(code="attempts.export"),
+            effect=UserFunctionOverride.Effect.ALLOW,
+        )
+        UserFunctionOverride.objects.create(
+            user=external,
+            function=AccessFunction.objects.get(code="studies.column.cpi"),
+            effect=UserFunctionOverride.Effect.ALLOW,
+        )
+        external_attempt = SurveyAttempt.objects.create(
+            rid="Xx1Ee2Vv3D",
+            survey=self.survey,
+            platform_user=external,
+            vendor=external,
+            user_id=str(external.pk),
+            status=SurveyAttempt.Status.COMPLETED,
+            source_cpi_snapshot="2.50",
+            cpi_cut_percent_snapshot="30.00",
+            payable_cpi_snapshot="1.75",
+            cpi_currency_snapshot="USD",
+        )
+
+        external_api = APIClient()
+        external_api.force_authenticate(external)
+        external_rows = xlsx_rows(external_api.get(reverse("survey-attempt-export")))
+        self.assertNotIn("Vendor CPI", external_rows[0])
+        self.assertNotIn("Vendor name", external_rows[0])
+        self.assertEqual(
+            external_rows[1][external_rows[0].index("Current Client CPI")],
+            "1.75",
+        )
+        self.assertEqual(
+            external_rows[1][external_rows[0].index("Client entry link CPI")],
+            "1.75",
+        )
+
+        admin_rows = xlsx_rows(self.api.get(reverse("survey-attempt-export"), {
+            "search": external_attempt.rid,
+        }))
+        self.assertEqual(
+            admin_rows[1][admin_rows[0].index("Current Client CPI")],
+            "2.50",
+        )
+        self.assertEqual(admin_rows[1][admin_rows[0].index("Vendor CPI")], "1.75")
+        self.assertEqual(
+            admin_rows[1][admin_rows[0].index("Vendor name")],
+            "External Supply",
+        )
 
     def test_view_permission_is_scoped_and_does_not_grant_csv_export(self):
         viewer = get_user_model().objects.create_user(username="viewer", first_name="Scoped")
@@ -1531,6 +1711,64 @@ class TerminationReasonPageTests(TestCase):
         self.assertContains(response, "Quota1Ab2C")
         self.assertContains(response, "Quali1Ab2C")
         self.assertContains(response, "Details", count=3)
+
+    def test_traffic_style_filters_support_multiple_statuses_country_and_search(self):
+        self.survey.country_code = "US"
+        self.survey.country = "United States"
+        self.survey.buyer_id = "buyer-a"
+        self.survey.save(update_fields=["country_code", "country", "buyer_id"])
+        quota = SurveyAttempt.objects.create(
+            rid="Quota2Ab3D",
+            survey=self.survey,
+            platform_user=self.respondent,
+            status=SurveyAttempt.Status.OVER_QUOTA,
+            callback_at=timezone.now(),
+        )
+        SurveyAttempt.objects.create(
+            rid="Quali2Ab3D",
+            survey=self.survey,
+            platform_user=self.respondent,
+            status=SurveyAttempt.Status.QUALITY_TERMINATED,
+            callback_at=timezone.now(),
+        )
+        self.client.force_login(self.owner)
+
+        response = self.client.get(reverse("termination-reasons"), {
+            "search": self.survey.local_id,
+            "status": [SurveyAttempt.Status.TERMINATED, SurveyAttempt.Status.OVER_QUOTA],
+            "country": ["US"],
+            "buyer_id": ["buyer-a"],
+        })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.context["summary"]["total"], 2)
+        self.assertContains(response, self.attempt.rid)
+        self.assertContains(response, quota.rid)
+        self.assertNotContains(response, "Quali2Ab3D")
+        self.assertContains(response, "Sub-client / Buyer ID")
+        self.assertContains(response, "From date &amp; time")
+
+    def test_filtered_excel_contains_platform_and_provider_statuses(self):
+        self.attempt.upstream_transaction_data = {
+            "status": "Pre Survey Termination",
+            "termReason": "Off hours",
+        }
+        self.attempt.save(update_fields=["upstream_transaction_data"])
+        self.client.force_login(self.owner)
+
+        response = self.client.get(
+            reverse("termination-reasons-export"),
+            {"status": SurveyAttempt.Status.TERMINATED, "search": self.attempt.rid},
+        )
+        rows = xlsx_rows(response)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", response["Content-Type"])
+        self.assertIn("Platform status", rows[0])
+        self.assertIn("Provider status", rows[0])
+        self.assertIn("Terminated", rows[1])
+        self.assertIn("Pre Survey Termination", rows[1])
+        self.assertIn("Off hours", rows[1])
 
     def test_rfg_detail_uses_stored_provider_callback_reason(self):
         client = Client.objects.create(code="reason-rfg", name="Research For Good", provider_code="rfg")

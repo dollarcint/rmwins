@@ -10,6 +10,7 @@ from django.conf import settings
 from django.db import IntegrityError, transaction
 
 from .models import Survey, SurveyAttempt
+from .identifiers import generate_platform_pid
 
 
 RID_ALPHABET = string.ascii_letters + string.digits
@@ -190,19 +191,35 @@ def backfill_attempt_entry_audit(attempt: SurveyAttempt, request) -> SurveyAttem
     return attempt
 
 
-def create_attempt(survey: Survey, platform_user, ip_address: str | None, client_data: dict | None = None) -> SurveyAttempt:
-    """Create one immutable respondent journey with fresh RID/UID and CPI audit.
+def create_attempt(
+    survey: Survey,
+    platform_user,
+    ip_address: str | None,
+    client_data: dict | None = None,
+    pid: str | None = None,
+) -> SurveyAttempt:
+    """Create one immutable respondent journey with fresh RID/PID/UID and CPI audit.
 
     The transaction makes identifier allocation and the historical attempt
     snapshots one unit. Database uniqueness is the final collision guard.
     """
 
     client_data = client_data or {}
-    for _ in range(10):
+    requested_pid = str(pid or "").strip()
+    if requested_pid and (
+        not requested_pid.isalnum() or not 6 <= len(requested_pid) <= 9
+    ):
+        raise ValueError("Invalid platform PID.")
+    for attempt_number in range(10):
         try:
             with transaction.atomic():
                 return SurveyAttempt.objects.create(
                     rid=generate_rid(),
+                    pid=(
+                        requested_pid
+                        if requested_pid and attempt_number == 0
+                        else generate_platform_pid()
+                    ),
                     prescreener_uid=generate_prescreener_uid(),
                     survey=survey,
                     platform_user=platform_user,
@@ -223,7 +240,7 @@ def create_attempt(survey: Survey, platform_user, ip_address: str | None, client
                 )
         except IntegrityError:
             continue
-    raise RuntimeError("Could not allocate a unique RID")
+    raise RuntimeError("Could not allocate unique RID, PID and UID identifiers")
 
 
 def build_outbound_url(
@@ -281,6 +298,24 @@ def build_outbound_url(
             profile_pairs.append(pair)
             profile_keys.add(question_key.casefold())
 
+    reserved_keys = {"pid", "trackid", "survnum", "supcode"}
+    profile_pairs: list[tuple[str, str]] = []
+    profile_keys: set[str] = set()
+    seen_pairs: set[tuple[str, str]] = set()
+    for answer in answers.values():
+        question_key = str(answer.get("question_key") or "").strip()
+        if not question_key or question_key.casefold() in reserved_keys:
+            continue
+        for value in answer.get("upstream_values") or []:
+            if value is None or str(value).strip() == "":
+                continue
+            pair = (question_key, str(value).strip())
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            profile_pairs.append(pair)
+            profile_keys.add(question_key.casefold())
+
     for key, value in query:
         lowered = key.casefold()
         if is_voqall and lowered == "vq_token":
@@ -310,8 +345,8 @@ def build_outbound_url(
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(outbound), parts.fragment))
 
 
-def status_rid_from_request(request) -> str:
-    """Read a callback tracking identifier, preferring the platform RID alias.
+def status_identifiers_from_request(request) -> list[str]:
+    """Return every distinct provider callback identifier in priority order.
 
     Some providers echo our canonical RID as ``tid``/``trackId`` while their
     field named ``rid`` contains our persistent prescreener UID.  Callers must
@@ -319,10 +354,20 @@ def status_rid_from_request(request) -> str:
     matched attempt's canonical ``SurveyAttempt.rid``.
     """
 
+    values = []
     for name in (
-        "vq_token", "VQ_TOKEN", "tid", "TID", "trackId", "rid", "RID", "pid", "PID", "qsid", "QSID", "lid", "LID"
+        "vq_token", "VQ_TOKEN", "aff_sub", "AFF_SUB", "tid", "TID",
+        "trackId", "trackid", "rid", "RID", "pid", "PID", "qsid", "QSID",
+        "lid", "LID",
     ):
-        value = request.GET.get(name)
-        if value:
-            return value.strip()
-    return ""
+        value = str(request.GET.get(name) or "").strip()
+        if value and value not in values:
+            values.append(value)
+    return values
+
+
+def status_rid_from_request(request) -> str:
+    """Backward-compatible first callback identifier accessor."""
+
+    values = status_identifiers_from_request(request)
+    return values[0] if values else ""

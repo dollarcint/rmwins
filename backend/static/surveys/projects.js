@@ -5,6 +5,7 @@
   if (!$('surveyRows')) return;
   const projectColumns = new Set(JSON.parse($('projectColumnAccess')?.textContent || '[]'));
   const canOpenProjectStudies = JSON.parse($('projectStudyLinkAccess')?.textContent || 'false');
+  const canViewProjectClientName = JSON.parse($('projectClientNameAccess')?.textContent || 'false');
   const visibleColumnCount = Math.max(1, projectColumns.size);
   document.querySelector('.survey-table').style.minWidth = `${Math.max(620, visibleColumnCount * 112)}px`;
 
@@ -19,6 +20,7 @@
     detailErrors: { targeting: null, quotas: null },
     timer: null,
     controller: null,
+    loading: false,
   };
 
   const els = {
@@ -37,6 +39,28 @@
   };
 
   const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[char]));
+  function projectIdControl(survey, title = "View this project's traffic reports") {
+    const projectId = escapeHtml(survey.local_id);
+    if (!canOpenProjectStudies) return `<strong class="id-link project-id-value">${projectId}</strong>`;
+    const studyUrl = `/traffic-reports/?internal_id=${encodeURIComponent(survey.local_id)}`;
+    return `<span class="id-link project-study-link" role="link" tabindex="0" data-study-url="${escapeHtml(studyUrl)}" title="${escapeHtml(title)}">${projectId}</span>`;
+  }
+  function generatePlatformPid() {
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    const length = 6 + Math.floor(Math.random() * 4);
+    const randomValues = new Uint32Array(length);
+    let candidate = '';
+    do {
+      window.crypto.getRandomValues(randomValues);
+      candidate = [...randomValues].map((value) => alphabet[value % alphabet.length]).join('');
+    } while (!/[A-Z]/.test(candidate) || !/[a-z]/.test(candidate) || !/[0-9]/.test(candidate));
+    return candidate;
+  }
+  function entryLinkWithPid(rawLink) {
+    const url = new URL(rawLink, window.location.origin);
+    url.searchParams.set('pid', generatePlatformPid());
+    return url.toString();
+  }
   const formatDate = (value) => {
     if (!value) return '—';
     const formatted = new Intl.DateTimeFormat('en-IN', {
@@ -263,19 +287,28 @@
   }
 
   async function loadSurveys({ silent = false } = {}) {
+    // Never stack background refreshes when the database/API is already busy.
+    // Interactive filter changes still cancel stale work immediately.
+    if (silent && state.loading) return;
     state.controller?.abort();
-    state.controller = new AbortController();
+    const controller = new AbortController();
+    state.controller = controller;
+    state.loading = true;
     if (!silent) {
       els.rows.innerHTML = `<tr><td colspan="${visibleColumnCount}"><div class="table-loader"><i></i><span>Fetching survey inventory…</span></div></td></tr>`;
       els.cards.innerHTML = '<div class="mobile-loading">Fetching surveys…</div>';
     }
     try {
-      const response = await fetch(`/api/v1/surveys/?${queryString()}`, { signal: state.controller.signal });
+      const response = await fetch(`/api/v1/surveys/?${queryString()}`, { signal: controller.signal });
       if (!response.ok) throw new Error(`Request failed (${response.status})`);
       const data = await response.json();
       state.results = data.results || [];
       state.pages = Math.max(1, Math.ceil(data.count / state.pageSize));
-      if (state.page > state.pages) { state.page = state.pages; return loadSurveys({ silent }); }
+      if (state.page > state.pages) {
+        state.page = state.pages;
+        state.loading = false;
+        return loadSurveys({ silent });
+      }
       render(data.count);
     } catch (error) {
       if (error.name === 'AbortError') return;
@@ -283,6 +316,8 @@
       els.rows.innerHTML = `<tr><td colspan="${visibleColumnCount}"><div class="error-state"><strong>Could not load surveys</strong><span>${escapeHtml(error.message)}</span><button id="retryLoad">Try again</button></div></td></tr>`;
       els.cards.innerHTML = '';
       $('retryLoad')?.addEventListener('click', loadSurveys);
+    } finally {
+      if (state.controller === controller) state.loading = false;
     }
   }
 
@@ -308,15 +343,14 @@
     const percent = Math.min(100, Number(survey.progress_percent || 0));
     const cells = [];
     const clientName = survey.client_name || survey.display_company_name || survey.company_name || 'Survey client';
-    const studyUrl = `/traffic-reports/?internal_id=${encodeURIComponent(survey.local_id)}`;
-    if (projectColumns.has('project_id')) cells.push(`<td><div class="project-id-stack">${canOpenProjectStudies ? `<a class="id-link project-study-link" href="${studyUrl}" title="View this project's traffic reports">${escapeHtml(survey.local_id)}</a>` : `<strong class="id-link">${escapeHtml(survey.local_id)}</strong>`}<small>${escapeHtml(clientName)}</small></div></td>`);
+    if (projectColumns.has('project_id')) cells.push(`<td><div class="project-id-stack">${projectIdControl(survey)}${canViewProjectClientName ? `<small>${escapeHtml(clientName)}</small>` : ''}</div></td>`);
     if (projectColumns.has('survey')) cells.push(`<td><div class="survey-name"><strong>${escapeHtml(survey.source_id ?? '—')}</strong><span>${survey.buyer_id ? escapeHtml(survey.buyer_id) : 'Buyer ID unavailable'}</span></div></td>`);
     if (projectColumns.has('market')) cells.push(`<td><span class="market-pill">${escapeHtml(survey.country_code || '—')} <i>${escapeHtml(survey.language_code || '')}</i></span><small class="country-name">${escapeHtml(survey.country || '')}</small></td>`);
     if (projectColumns.has('completes')) cells.push(`<td><div class="complete-value"><strong>${survey.completes.toLocaleString()} / ${survey.sample_size.toLocaleString()}</strong><span><i style="width:${percent}%"></i></span></div></td>`);
     if (projectColumns.has('cpi')) cells.push(`<td><strong class="cpi">${money(survey.cpi)}</strong></td>`);
     if (projectColumns.has('loi_ir')) cells.push(`<td><div class="metric-pair"><span><b>${survey.loi ?? '—'}</b> min</span><span><b>${survey.incidence_rate ?? '—'}</b>%</span></div><small class="survey-type-tag">${escapeHtml(survey.survey_type || survey.group_type || 'Type unavailable')}</small></td>`);
-    if (projectColumns.has('entry_link')) cells.push(`<td><button class="copy-link" data-copy-link="${escapeHtml(survey.start_link)}">Copy link</button></td>`);
-    if (projectColumns.has('modified')) cells.push(`<td><div class="source-timestamp">${sourceTimestamp(survey.source_modified_display, survey.source_modified_at)}</div><small class="created-date">Created ${escapeHtml(formatDate(survey.source_created_at))}</small><small class="status ${survey.status}"><i></i>${escapeHtml(survey.status)}</small></td>`);
+    if (projectColumns.has('entry_link')) cells.push(`<td>${survey.start_link ? `<button class="copy-link" data-copy-link="${escapeHtml(survey.start_link)}">Copy link</button>` : '<button class="copy-link" type="button" disabled title="The supplier callback link is still being verified">Preparing link...</button>'}</td>`);
+    if (projectColumns.has('modified')) cells.push(`<td><div class="source-timestamp">${sourceTimestamp(survey.source_modified_display, survey.source_modified_at || survey.updated_at)}</div><small class="created-date">Created ${escapeHtml(survey.source_created_display || formatDate(survey.source_created_at || survey.created_at))}</small><small class="status ${survey.status}"><i></i>${escapeHtml(survey.status)}</small></td>`);
     if (projectColumns.has('actions')) cells.push(`<td><button class="eye-button" data-action="${escapeHtml(survey.local_id)}" aria-label="View details for ${escapeHtml(survey.name)}">◉</button></td>`);
     return `<tr>${cells.length ? cells.join('') : '<td><div class="column-denied">No project columns are assigned to your account.</div></td>'}</tr>`;
   }
@@ -324,14 +358,13 @@
   function cardTemplate(survey) {
     if (!projectColumns.size) return '<article class="survey-card"><div class="column-denied">No project columns are assigned to your account.</div></article>';
     const clientName = survey.client_name || survey.display_company_name || survey.company_name || 'Survey client';
-    const studyUrl = `/traffic-reports/?internal_id=${encodeURIComponent(survey.local_id)}`;
-    const top = `${projectColumns.has('project_id') ? `${canOpenProjectStudies ? `<a class="id-link project-study-link" href="${studyUrl}">${escapeHtml(survey.local_id)}</a>` : `<strong class="id-link">${escapeHtml(survey.local_id)}</strong>`}<small class="project-card-client">${escapeHtml(clientName)}</small>` : ''}${projectColumns.has('modified') ? `<span class="status ${survey.status}"><i></i>${escapeHtml(survey.status)}</span>` : ''}`;
+    const top = `${projectColumns.has('project_id') ? `${projectIdControl(survey)}${canViewProjectClientName ? `<small class="project-card-client">${escapeHtml(clientName)}</small>` : ''}` : ''}${projectColumns.has('modified') ? `<span class="status ${survey.status}"><i></i>${escapeHtml(survey.status)}</span>` : ''}`;
     const metrics = [];
     if (projectColumns.has('market')) metrics.push(`<span><small>Market</small><b>${escapeHtml(survey.country_code || '—')} ${escapeHtml(survey.language_code || '')}</b></span>`);
     if (projectColumns.has('completes')) metrics.push(`<span><small>Completes</small><b>${survey.completes} / ${survey.sample_size}</b></span>`);
     if (projectColumns.has('cpi')) metrics.push(`<span><small>CPI</small><b>${money(survey.cpi)}</b></span>`);
     if (projectColumns.has('loi_ir')) metrics.push(`<span><small>LOI / IR · Type</small><b>${survey.loi ?? '—'}m · ${survey.incidence_rate ?? '—'}% · ${escapeHtml(survey.survey_type || survey.group_type || '—')}</b></span>`);
-    const bottom = `${projectColumns.has('modified') ? `<div class="source-timestamp"><small>Updated</small>${sourceTimestamp(survey.source_modified_display, survey.source_modified_at)}</div>` : ''}${projectColumns.has('entry_link') ? `<button class="copy-link" data-copy-link="${escapeHtml(survey.start_link)}">Copy link</button>` : ''}`;
+    const bottom = `${projectColumns.has('modified') ? `<div class="source-timestamp"><small>Updated</small>${sourceTimestamp(survey.source_modified_display, survey.source_modified_at || survey.updated_at)}</div>` : ''}${projectColumns.has('entry_link') ? (survey.start_link ? `<button class="copy-link" data-copy-link="${escapeHtml(survey.start_link)}">Copy link</button>` : '<button class="copy-link" type="button" disabled title="The supplier callback link is still being verified">Preparing link...</button>') : ''}`;
     return `<article class="survey-card"><div class="card-top"><div>${top}</div>${projectColumns.has('actions') ? `<button class="eye-button" data-action="${escapeHtml(survey.local_id)}" aria-label="View survey details">◉</button>` : ''}</div>${projectColumns.has('survey') ? `<h3>${escapeHtml(survey.source_id ?? '—')}</h3><p>${survey.buyer_id ? escapeHtml(survey.buyer_id) : 'Buyer ID unavailable'}</p>` : ''}${metrics.length ? `<div class="card-grid">${metrics.join('')}</div>` : ''}${bottom ? `<div class="card-bottom">${bottom}</div>` : ''}</article>`;
   }
 
@@ -373,14 +406,31 @@
   document.addEventListener('click', async (event) => {
     if (!event.target.closest('.multi-select')) closeMultiSelects();
     if (!event.target.closest('[data-cpi-filter]')) closeCpiFilter();
+    const studyTarget = event.target.closest('[data-study-url]');
+    if (studyTarget) {
+      const selection = window.getSelection();
+      const selectingProjectId = selection && !selection.isCollapsed && selection.containsNode(studyTarget, true);
+      if (!selectingProjectId) window.location.assign(studyTarget.dataset.studyUrl);
+      return;
+    }
     const copy = event.target.closest('[data-copy]');
     if (copy) { await navigator.clipboard.writeText(copy.dataset.copy); toast('Project ID copied'); }
     const copyLink = event.target.closest('[data-copy-link]');
-    if (copyLink && copyLink.dataset.copyLink) { await navigator.clipboard.writeText(copyLink.dataset.copyLink); toast('Entry link copied'); }
+    if (copyLink && copyLink.dataset.copyLink) {
+      await navigator.clipboard.writeText(entryLinkWithPid(copyLink.dataset.copyLink));
+      toast('Entry link copied with PID');
+    }
     const action = event.target.closest('[data-action]');
     if (action) {
       const survey = state.results.find((item) => item.local_id === action.dataset.action);
       if (survey) openDrawer(survey);
+    }
+  });
+  document.addEventListener('keydown', (event) => {
+    const studyTarget = event.target.closest('[data-study-url]');
+    if (studyTarget && (event.key === 'Enter' || event.key === ' ')) {
+      event.preventDefault();
+      window.location.assign(studyTarget.dataset.studyUrl);
     }
   });
 
@@ -400,7 +450,8 @@
     state.detailErrors = { targeting: null, quotas: null };
     els.drawer.hidden = els.backdrop.hidden = false;
     document.body.classList.add('drawer-open');
-    els.drawerSurvey.innerHTML = `<strong>${escapeHtml(survey.display_company_name || survey.company_name || 'InnovateMR')}</strong><span>${escapeHtml(survey.country_label || 'Market unavailable')}</span>`;
+    const clientName = survey.client_name || survey.display_company_name || survey.company_name || 'Survey client';
+    els.drawerSurvey.innerHTML = `<div class="drawer-survey-primary">${canViewProjectClientName ? `<strong>${escapeHtml(clientName)}</strong>` : ''}<span>${escapeHtml(survey.country_label || 'Market unavailable')}</span></div><div class="drawer-project-code"><small>Project ID</small><b>${escapeHtml(survey.local_id)}</b></div>`;
     setActiveTab('targeting');
     requestAnimationFrame(() => { els.drawer.classList.add('open'); els.backdrop.classList.add('open'); });
     loadDrawerDetails(survey);
@@ -449,7 +500,7 @@
 
   function renderQuotas(items) {
     if (!items.length) return '<div class="detail-empty"><div class="detail-empty-visual" aria-hidden="true"><span></span><span></span><span></span><i>✓</i></div><strong>No quota data</strong><p>This survey currently has no quota definitions.</p></div>';
-    return `<div class="quota-help"><strong>How to read this</strong><span>Remaining capacity is shown from the provider response. Target and completed totals appear only when the provider supplies them.</span></div><div class="detail-list">${items.map((quota, index) => `<article class="quota-item"><div class="detail-index">${String(index + 1).padStart(2, '0')}</div><div class="detail-main"><div class="detail-title"><div><strong>${escapeHtml(quota.name || quota.title || `Quota ${quota.quota_id || index + 1}`)}</strong><small class="quota-scope">${escapeHtml(quota.scope_label || 'Quota scope')} · limited by ${escapeHtml(quota.limit_type || 'Completes')}</small></div><span class="quota-status quota-status-${escapeHtml(String(quota.status || 'unknown').toLowerCase())}">${escapeHtml(quota.status || 'Unknown')}</span></div><div class="quota-stats"><span><small>Target</small><b>${quota.target_known ? escapeHtml(quota.sample_size) : '<em>Not provided</em>'}</b></span><span><small>Completed</small><b>${quota.completed_known ? escapeHtml(quota.completes) : '<em>Not provided</em>'}</b></span><span><small>Remaining</small><b>${escapeHtml(quota.remaining)}</b></span></div>${quotaTargeting(quota.targeting_details)}</div></article>`).join('')}</div>`;
+    return `<div class="quota-help"><strong>How to read this</strong><span>Remaining capacity is shown from the provider response. Target and completed totals appear only when the provider supplies them.</span></div><div class="detail-list">${items.map((quota, index) => `<article class="quota-item"><div class="detail-index">${String(index + 1).padStart(2, '0')}</div><div class="detail-main"><div class="detail-title"><div><strong>${escapeHtml(quota.display_name || quota.name || quota.title || 'Survey quota')}</strong><small class="quota-scope">${escapeHtml(quota.scope_label || 'Quota scope')} · limited by ${escapeHtml(quota.limit_type || 'Completes')}</small></div><span class="quota-status quota-status-${escapeHtml(String(quota.status || 'unknown').toLowerCase())}">${escapeHtml(quota.status || 'Unknown')}</span></div><div class="quota-stats"><span><small>Target</small><b>${quota.target_known ? escapeHtml(quota.sample_size) : '<em>Not provided</em>'}</b></span><span><small>Completed</small><b>${quota.completed_known ? escapeHtml(quota.completes) : '<em>Not provided</em>'}</b></span><span><small>Remaining</small><b>${escapeHtml(quota.remaining)}</b></span></div>${quotaTargeting(quota.targeting_details)}</div></article>`).join('')}</div>`;
   }
 
   function quotaTargeting(details) {
@@ -486,7 +537,7 @@
   loadSurveys();
   window.setInterval(() => {
     if (!document.hidden) loadSurveys({ silent: true });
-  }, 30000);
+  }, 60000);
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden) loadSurveys({ silent: true });
   });

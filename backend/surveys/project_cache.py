@@ -4,6 +4,7 @@ from django.conf import settings
 from django.db.models import Max, Min
 
 from config.cache_utils import (
+    safe_cache_add,
     safe_cache_get,
     safe_cache_get_or_set,
     safe_cache_increment,
@@ -13,16 +14,35 @@ from config.cache_utils import (
 
 CACHE_ALIAS = "projects"
 _VERSION_KEY = "projects:version"
+_INVALIDATION_THROTTLE_KEY = "projects:invalidate-throttle"
 
 
 def _version() -> int:
     return int(safe_cache_get(_VERSION_KEY, 1, alias=CACHE_ALIAS) or 1)
 
 
-def invalidate_project_cache() -> None:
-    """Invalidate metadata/counts without scanning or flushing Redis DB 3."""
+def invalidate_project_cache(*, throttle_seconds: int = 0) -> bool:
+    """Invalidate metadata/counts without scanning or flushing Redis DB 3.
+
+    High-frequency feeds can request a small throttle window. The first
+    process increments the shared version while later callbacks in that window
+    reuse it, preventing every five-second Cint delivery from invalidating all
+    user-scoped project metadata. Cache outages fail open and still invalidate.
+    """
+
+    throttle_seconds = max(0, int(throttle_seconds or 0))
+    if throttle_seconds:
+        acquired = safe_cache_add(
+            _INVALIDATION_THROTTLE_KEY,
+            1,
+            timeout=throttle_seconds,
+            alias=CACHE_ALIAS,
+        )
+        if acquired is False:
+            return False
 
     safe_cache_increment(_VERSION_KEY, alias=CACHE_ALIAS)
+    return True
 
 
 def project_filter_metadata(
@@ -31,6 +51,7 @@ def project_filter_metadata(
     user_id: int,
     client_scoped: bool,
     include_cpi: bool,
+    cpi_field: str = "cpi",
 ) -> dict:
     key = stable_cache_key(
         f"projects:v{_version()}:filters",
@@ -38,6 +59,7 @@ def project_filter_metadata(
             "user_id": user_id,
             "client_scoped": client_scoped,
             "include_cpi": include_cpi,
+            "cpi_field": cpi_field,
         },
     )
 
@@ -68,7 +90,10 @@ def project_filter_metadata(
             .order_by("survey_type")
         )
         cpi_bounds = (
-            queryset.aggregate(minimum=Min("cpi"), maximum=Max("cpi"))
+            queryset.aggregate(
+                minimum=Min(cpi_field),
+                maximum=Max(cpi_field),
+            )
             if include_cpi
             else {"minimum": None, "maximum": None}
         )

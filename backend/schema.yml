@@ -3,9 +3,9 @@ info:
   title: Survey Workspace API
   version: 1.0.0
   description: Internal multi-provider survey API. Active client-provider sections
-    let authorized administrators execute allow-listed provider operations
-    while every credential remains server-side. Authentication requires the current
-    Django admin session and the separate documentation password.
+    let authorized administrators execute allow-listed provider operations while every
+    credential remains server-side. Authentication requires the current Django admin
+    session and the separate documentation password.
 paths:
   /api/v1/access/functions/:
     get:
@@ -529,6 +529,71 @@ paths:
       responses:
         '204':
           description: No response body
+  /api/v1/canonical-questions/:
+    get:
+      operationId: api_v1_canonical_questions_list
+      description: Provider-neutral question and answer keys. External supplier integrations
+        should use these keys instead of hard-coding InnovateMR, RFG or Cint IDs.
+      summary: List stable internal qualification keys
+      parameters:
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - name: page_size
+        required: false
+        in: query
+        description: Number of results to return per page.
+        schema:
+          type: integer
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - Canonical qualification mappings
+      security:
+      - VendorApiKeyAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedCanonicalQuestionList'
+          description: ''
+  /api/v1/canonical-questions/{code}/:
+    get:
+      operationId: api_v1_canonical_questions_retrieve
+      summary: Get one stable qualification definition
+      parameters:
+      - in: path
+        name: code
+        schema:
+          type: string
+        required: true
+      tags:
+      - Canonical qualification mappings
+      security:
+      - VendorApiKeyAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CanonicalQuestion'
+          description: ''
   /api/v1/dashboard/:
     get:
       operationId: api_v1_dashboard_retrieve
@@ -596,6 +661,92 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DashboardResponse'
+          description: ''
+  /api/v1/provider-question-mappings/:
+    get:
+      operationId: api_v1_provider_question_mappings_list
+      description: Shows how each provider's country/language-specific question IDs
+        and answer precodes map to stable platform keys. Filter with provider_code,
+        country_code, language_code or canonical_key.
+      summary: List provider-to-platform question mappings
+      parameters:
+      - in: query
+        name: canonical_key
+        schema:
+          type: string
+      - in: query
+        name: country_code
+        schema:
+          type: string
+      - in: query
+        name: country_language_id
+        schema:
+          type: string
+      - in: query
+        name: language_code
+        schema:
+          type: string
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
+        schema:
+          type: string
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
+        schema:
+          type: integer
+      - name: page_size
+        required: false
+        in: query
+        description: Number of results to return per page.
+        schema:
+          type: integer
+      - in: query
+        name: provider_code
+        schema:
+          type: string
+      - name: search
+        required: false
+        in: query
+        description: A search term.
+        schema:
+          type: string
+      tags:
+      - Canonical qualification mappings
+      security:
+      - VendorApiKeyAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaginatedProviderQuestionMappingList'
+          description: ''
+  /api/v1/provider-question-mappings/{id}/:
+    get:
+      operationId: api_v1_provider_question_mappings_retrieve
+      parameters:
+      - in: path
+        name: id
+        schema:
+          type: integer
+        description: A unique integer value identifying this provider question mapping.
+        required: true
+      tags:
+      - api
+      security:
+      - VendorApiKeyAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderQuestionMapping'
           description: ''
   /api/v1/survey-attempts/:
     get:
@@ -906,16 +1057,19 @@ paths:
   /api/v1/surveys/:
     get:
       operationId: api_v1_surveys_list
-      description: Returns locally stored surveys using page-number pagination. Search
-        matches project ID, upstream survey ID, survey name, country and category.
-        Date filters accept ISO-8601 timestamps.
+      description: Returns locally stored surveys using the requesting user's access
+        scope.
       summary: List synchronized surveys
       parameters:
       - in: query
         name: buyer_id
         schema:
-          type: string
-        description: Comma-separated buyer/sub-client IDs.
+          type: array
+          items:
+            type: string
+        description: Comma-separated provider buyer/sub-client IDs
+        explode: false
+        style: form
       - in: query
         name: client
         schema:
@@ -985,27 +1139,30 @@ paths:
         schema:
           type: string
           format: date-time
-      - in: query
-        name: ordering
+      - name: ordering
+        required: false
+        in: query
+        description: Which field to use when ordering the results.
         schema:
           type: string
-        description: One of source_modified_at, source_created_at, cpi, sample_size,
-          completes, created_at; prefix '-' for descending.
-      - in: query
-        name: page
+      - name: page
+        required: false
+        in: query
+        description: A page number within the paginated result set.
         schema:
           type: integer
-        description: 1-based result page.
-      - in: query
-        name: page_size
+      - name: page_size
+        required: false
+        in: query
+        description: Number of results to return per page.
         schema:
           type: integer
-        description: Rows per page (1–100, default 20).
-      - in: query
-        name: search
+      - name: search
+        required: false
+        in: query
+        description: A search term.
         schema:
           type: string
-        description: Free-text search across survey identifiers and descriptive fields.
       - in: query
         name: status
         schema:
@@ -1018,8 +1175,12 @@ paths:
       - in: query
         name: survey_type
         schema:
-          type: string
-        description: Comma-separated normalized audience types, for example B2B,B2C.
+          type: array
+          items:
+            type: string
+        description: Comma-separated normalized types, e.g. B2B,B2C
+        explode: false
+        style: form
       tags:
       - Surveys
       security:
@@ -1035,8 +1196,7 @@ paths:
   /api/v1/surveys/{local_id}/:
     get:
       operationId: api_v1_surveys_retrieve
-      description: Looks up a survey by the platform's immutable 14-digit local_id
-        and embeds current quotas and targeting questions.
+      description: Returns one project with normalized quota and targeting details.
       summary: Get one survey
       parameters:
       - in: path
@@ -1383,12 +1543,12 @@ paths:
         name: max_cpi
         schema:
           type: number
-        description: Maximum CPI, inclusive.
+        description: Maximum viewer-visible CPI after configured cuts, inclusive.
       - in: query
         name: min_cpi
         schema:
           type: number
-        description: Minimum CPI, inclusive.
+        description: Minimum viewer-visible CPI after configured cuts, inclusive.
       - in: query
         name: modified_from
         schema:
@@ -1405,7 +1565,7 @@ paths:
         name: ordering
         schema:
           type: string
-        description: Current Projects ordering, including cpi or -cpi.
+        description: Current Projects ordering, including viewer-visible cpi or -cpi.
       - in: query
         name: search
         schema:
@@ -3575,6 +3735,700 @@ paths:
               schema:
                 $ref: '#/components/schemas/UpstreamError'
           description: Alias matches multiple active integrations.
+  /api/v1/vendors/upstream-explorer/{client_code}/cint/allocated-inventory/:
+    get:
+      operationId: cint_allocated_inventory
+      description: |-
+        **Purpose:** Live surveys allocated or linked to this Cint supplier.
+
+        **You send:** required: nothing required; optional: none. Credentials are never entered here.
+
+        **Upstream request:** `GET /Supply/v1/Surveys/SupplierAllocations/All/{supplier_code}` using server-side authentication.
+
+        **You receive:** SupplierAllocationSurveys visible to the configured supplier account.
+
+        **Official documentation:** https://developer.lucidhq.com
+      summary: Allocated surveys
+      parameters:
+      - in: path
+        name: client_code
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9][A-Za-z0-9_-]*$
+        required: true
+      - in: query
+        name: limit
+        schema:
+          type: integer
+        description: Maximum list rows shown in this response (1-200).
+      tags:
+      - Cint Exchange APIs
+      security:
+      - VendorApiKeyAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamExecutionResponse'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamError'
+          description: Missing/invalid input or safe upstream error.
+        '403':
+          description: Admin or super-admin session required.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamError'
+          description: Client alias is ambiguous.
+  /api/v1/vendors/upstream-explorer/{client_code}/cint/allocated-survey/:
+    get:
+      operationId: cint_allocated_survey
+      description: |-
+        **Purpose:** One allocated survey including supplier allocation and link metadata when available.
+
+        **You send:** required: survey_id; optional: none. Credentials are never entered here.
+
+        **Upstream request:** `GET /Supply/v1/Surveys/SupplierAllocations/BySurveyNumber/{survey_id}/{supplier_code}` using server-side authentication.
+
+        **You receive:** One SupplierAllocationSurvey for the requested Cint SurveyNumber.
+
+        **Official documentation:** https://developer.lucidhq.com
+      summary: Allocated survey by ID
+      parameters:
+      - in: path
+        name: client_code
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9][A-Za-z0-9_-]*$
+        required: true
+      - in: query
+        name: limit
+        schema:
+          type: integer
+        description: Maximum list rows shown in this response (1-200).
+      - in: query
+        name: survey_id
+        schema:
+          type: string
+        description: 'Provider survey/project ID. InnovateMR example: 16003381; RFG
+          example: RFG2300540746-001.'
+        required: true
+      tags:
+      - Cint Exchange APIs
+      security:
+      - VendorApiKeyAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamExecutionResponse'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamError'
+          description: Missing/invalid input or safe upstream error.
+        '403':
+          description: Admin or super-admin session required.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamError'
+          description: Client alias is ambiguous.
+  /api/v1/vendors/upstream-explorer/{client_code}/cint/country-language-inventory/:
+    get:
+      operationId: cint_country_language_inventory
+      description: |-
+        **Purpose:** Live Marketplace opportunities for one Cint CountryLanguageID; this is the production inventory endpoint used by Quest.
+
+        **You send:** required: country_language_id; optional: none. Credentials are never entered here.
+
+        **Upstream request:** `GET /Supply/v1/Surveys/AllOfferwall/ByCountryLanguage/{country_language_id}/{supplier_code}` using server-side authentication.
+
+        **You receive:** Country-language-scoped Cint surveys with SurveyNumber, RPI, LOI, IR, market and capacity fields.
+
+        **Official documentation:** https://developer.lucidhq.com
+      summary: Marketplace surveys by country-language
+      parameters:
+      - in: path
+        name: client_code
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9][A-Za-z0-9_-]*$
+        required: true
+      - in: query
+        name: country_language_id
+        schema:
+          type: string
+        description: Cint CountryLanguageID from the global definitions endpoint,
+          for example 9.
+        required: true
+      - in: query
+        name: limit
+        schema:
+          type: integer
+        description: Maximum list rows shown in this response (1-200).
+      tags:
+      - Cint Exchange APIs
+      security:
+      - VendorApiKeyAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamExecutionResponse'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamError'
+          description: Missing/invalid input or safe upstream error.
+        '403':
+          description: Admin or super-admin session required.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamError'
+          description: Client alias is ambiguous.
+  /api/v1/vendors/upstream-explorer/{client_code}/cint/create-supplier-link/:
+    post:
+      operationId: cint_create_supplier_link
+      description: |-
+        **Purpose:** Create a Cint Offerwall/Standalone link using this platform's four outcome redirects.
+
+        **You send:** required: survey_id; optional: none. Credentials are never entered here.
+
+        **Upstream request:** `POST /Supply/v1/SupplierLinks/Create/{survey_id}/{supplier_code}` using server-side authentication.
+
+        **You receive:** The new callback-enabled SupplierLink containing LiveLink and TestLink.
+
+        **Official documentation:** https://developer.lucidhq.com
+
+        **Safety:** This changes live provider data. Send `confirm_upstream_mutation: true`; without it the call is rejected before contacting InnovateMR.
+      summary: Create OWS supplier entry link
+      parameters:
+      - in: path
+        name: client_code
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9][A-Za-z0-9_-]*$
+        required: true
+      tags:
+      - Cint Exchange APIs
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpstreamMutationRequestRequest'
+            examples:
+              ConfirmedLiveChange:
+                value:
+                  confirm_upstream_mutation: true
+                  survey_id: '143479'
+                summary: Confirmed live change
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/UpstreamMutationRequestRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/UpstreamMutationRequestRequest'
+        required: true
+      security:
+      - VendorApiKeyAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamExecutionResponse'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamError'
+          description: Missing/invalid input or safe upstream error.
+        '403':
+          description: Admin or super-admin session required.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamError'
+          description: Client alias is ambiguous.
+  /api/v1/vendors/upstream-explorer/{client_code}/cint/definitions/:
+    get:
+      operationId: cint_definitions
+      description: |-
+        **Purpose:** Country-language, industry, sample, study, supplier-link and survey-status mappings.
+
+        **You send:** required: nothing required; optional: none. Credentials are never entered here.
+
+        **Upstream request:** `GET /Lookup/v1/BasicLookups/BundledLookups/CountryLanguages,Industries,SampleTypes,StudyTypes,SupplierLinkTypes,SurveyStatuses` using server-side authentication.
+
+        **You receive:** Cint lookup dictionaries used to turn IDs into readable market and survey metadata.
+
+        **Official documentation:** https://developer.lucidhq.com
+      summary: Global definitions
+      parameters:
+      - in: path
+        name: client_code
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9][A-Za-z0-9_-]*$
+        required: true
+      - in: query
+        name: limit
+        schema:
+          type: integer
+        description: Maximum list rows shown in this response (1-200).
+      tags:
+      - Cint Exchange APIs
+      security:
+      - VendorApiKeyAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamExecutionResponse'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamError'
+          description: Missing/invalid input or safe upstream error.
+        '403':
+          description: Admin or super-admin session required.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamError'
+          description: Client alias is ambiguous.
+  /api/v1/vendors/upstream-explorer/{client_code}/cint/inventory-ids/:
+    get:
+      operationId: cint_inventory_ids
+      description: |-
+        **Purpose:** IDs of live surveys allocated to this Cint Supplier Code.
+
+        **You send:** required: nothing required; optional: none. Credentials are never entered here.
+
+        **Upstream request:** `GET /Supply/v1/Surveys/Inventory/{supplier_code}` using server-side authentication.
+
+        **You receive:** SupplyAllocationSurveyIDs currently allocated to this supplier.
+
+        **Official documentation:** https://developer.lucidhq.com
+      summary: Allocated survey IDs
+      parameters:
+      - in: path
+        name: client_code
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9][A-Za-z0-9_-]*$
+        required: true
+      - in: query
+        name: limit
+        schema:
+          type: integer
+        description: Maximum list rows shown in this response (1-200).
+      tags:
+      - Cint Exchange APIs
+      security:
+      - VendorApiKeyAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamExecutionResponse'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamError'
+          description: Missing/invalid input or safe upstream error.
+        '403':
+          description: Admin or super-admin session required.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamError'
+          description: Client alias is ambiguous.
+  /api/v1/vendors/upstream-explorer/{client_code}/cint/open-inventory/:
+    get:
+      operationId: cint_open_inventory
+      description: |-
+        **Purpose:** Live Marketplace opportunities without an existing allocation or entry link.
+
+        **You send:** required: nothing required; optional: none. Credentials are never entered here.
+
+        **Upstream request:** `GET /Supply/v1/Surveys/AllOfferwall/{supplier_code}` using server-side authentication.
+
+        **You receive:** Open Cint survey rows with SurveyNumber, buyer, market, LOI, IR, RPI and remaining capacity.
+
+        **Official documentation:** https://developer.lucidhq.com
+      summary: Open Marketplace surveys
+      parameters:
+      - in: path
+        name: client_code
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9][A-Za-z0-9_-]*$
+        required: true
+      - in: query
+        name: limit
+        schema:
+          type: integer
+        description: Maximum list rows shown in this response (1-200).
+      tags:
+      - Cint Exchange APIs
+      security:
+      - VendorApiKeyAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamExecutionResponse'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamError'
+          description: Missing/invalid input or safe upstream error.
+        '403':
+          description: Admin or super-admin session required.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamError'
+          description: Client alias is ambiguous.
+  /api/v1/vendors/upstream-explorer/{client_code}/cint/question-options/:
+    get:
+      operationId: cint_question_options
+      description: |-
+        **Purpose:** Localized answer labels and precodes for one Cint question.
+
+        **You send:** required: country_language_id, question_id; optional: none. Credentials are never entered here.
+
+        **Upstream request:** `GET /Lookup/v1/QuestionLibrary/AllQuestionOptions/{country_language_id}/{question_id}` using server-side authentication.
+
+        **You receive:** Localized OptionText and Precode values for the requested Cint question.
+
+        **Official documentation:** https://developer.lucidhq.com
+      summary: Question options
+      parameters:
+      - in: path
+        name: client_code
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9][A-Za-z0-9_-]*$
+        required: true
+      - in: query
+        name: country_language_id
+        schema:
+          type: string
+        description: Cint CountryLanguageID from the global definitions endpoint,
+          for example 9.
+        required: true
+      - in: query
+        name: limit
+        schema:
+          type: integer
+        description: Maximum list rows shown in this response (1-200).
+      - in: query
+        name: question_id
+        schema:
+          type: string
+        description: Cint standard qualification QuestionID, for example 43 for gender.
+        required: true
+      tags:
+      - Cint Exchange APIs
+      security:
+      - VendorApiKeyAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamExecutionResponse'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamError'
+          description: Missing/invalid input or safe upstream error.
+        '403':
+          description: Admin or super-admin session required.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamError'
+          description: Client alias is ambiguous.
+  /api/v1/vendors/upstream-explorer/{client_code}/cint/questions/:
+    get:
+      operationId: cint_questions
+      description: |-
+        **Purpose:** All standard qualification questions for one CountryLanguageID.
+
+        **You send:** required: country_language_id; optional: none. Credentials are never entered here.
+
+        **Upstream request:** `GET /Lookup/v1/QuestionLibrary/AllQuestions/{country_language_id}` using server-side authentication.
+
+        **You receive:** Localized Cint question IDs, names, text and question types.
+
+        **Official documentation:** https://developer.lucidhq.com
+      summary: Question library
+      parameters:
+      - in: path
+        name: client_code
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9][A-Za-z0-9_-]*$
+        required: true
+      - in: query
+        name: country_language_id
+        schema:
+          type: string
+        description: Cint CountryLanguageID from the global definitions endpoint,
+          for example 9.
+        required: true
+      - in: query
+        name: limit
+        schema:
+          type: integer
+        description: Maximum list rows shown in this response (1-200).
+      tags:
+      - Cint Exchange APIs
+      security:
+      - VendorApiKeyAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamExecutionResponse'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamError'
+          description: Missing/invalid input or safe upstream error.
+        '403':
+          description: Admin or super-admin session required.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamError'
+          description: Client alias is ambiguous.
+  /api/v1/vendors/upstream-explorer/{client_code}/cint/quota/:
+    get:
+      operationId: cint_quota
+      description: |-
+        **Purpose:** Real-time total and demographic quota capacity available to this supplier.
+
+        **You send:** required: survey_id; optional: none. Credentials are never entered here. For RFG this calls targeting with `rfg_id` and returns only its `quotas` array.
+
+        **Upstream request:** `GET /Supply/v1/SurveyQuotas/BySurveyNumber/{survey_id}/{supplier_code}` using server-side authentication.
+
+        **You receive:** SurveyQuotas with RPI, conversion, real-time NumberOfRespondents and targeting questions.
+
+        **Official documentation:** https://developer.lucidhq.com
+      summary: Supplier survey quotas
+      parameters:
+      - in: path
+        name: client_code
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9][A-Za-z0-9_-]*$
+        required: true
+      - in: query
+        name: limit
+        schema:
+          type: integer
+        description: Maximum list rows shown in this response (1-200).
+      - in: query
+        name: survey_id
+        schema:
+          type: string
+        description: 'Provider survey/project ID. InnovateMR example: 16003381; RFG
+          example: RFG2300540746-001.'
+        required: true
+      tags:
+      - Cint Exchange APIs
+      security:
+      - VendorApiKeyAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamExecutionResponse'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamError'
+          description: Missing/invalid input or safe upstream error.
+        '403':
+          description: Admin or super-admin session required.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamError'
+          description: Client alias is ambiguous.
+  /api/v1/vendors/upstream-explorer/{client_code}/cint/supplier-link/:
+    get:
+      operationId: cint_supplier_link
+      description: |-
+        **Purpose:** Retrieve this supplier's live/test entry link and callback configuration for one survey.
+
+        **You send:** required: survey_id; optional: none. Credentials are never entered here.
+
+        **Upstream request:** `GET /Supply/v1/SupplierLinks/BySurveyNumber/{survey_id}/{supplier_code}` using server-side authentication.
+
+        **You receive:** The existing Cint SupplierLink with LiveLink, TestLink, tracking type and callback URLs.
+
+        **Official documentation:** https://developer.lucidhq.com
+      summary: Show supplier entry link
+      parameters:
+      - in: path
+        name: client_code
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9][A-Za-z0-9_-]*$
+        required: true
+      - in: query
+        name: limit
+        schema:
+          type: integer
+        description: Maximum list rows shown in this response (1-200).
+      - in: query
+        name: survey_id
+        schema:
+          type: string
+        description: 'Provider survey/project ID. InnovateMR example: 16003381; RFG
+          example: RFG2300540746-001.'
+        required: true
+      tags:
+      - Cint Exchange APIs
+      security:
+      - VendorApiKeyAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamExecutionResponse'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamError'
+          description: Missing/invalid input or safe upstream error.
+        '403':
+          description: Admin or super-admin session required.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamError'
+          description: Client alias is ambiguous.
+  /api/v1/vendors/upstream-explorer/{client_code}/cint/targeting/:
+    get:
+      operationId: cint_targeting
+      description: |-
+        **Purpose:** Questions and accepted Cint precodes defining the survey qualification.
+
+        **You send:** required: survey_id; optional: none. Credentials are never entered here. The local `survey_id` is sent upstream as RFG `rfg_id` for an RFG client.
+
+        **Upstream request:** `GET /Supply/v1/SurveyQualifications/BySurveyNumberForOfferwall/{survey_id}` using server-side authentication.
+
+        **You receive:** SurveyQualification questions, logical operators and accepted PreCodes.
+
+        **Official documentation:** https://developer.lucidhq.com
+      summary: Survey qualifications
+      parameters:
+      - in: path
+        name: client_code
+        schema:
+          type: string
+          pattern: ^[A-Za-z0-9][A-Za-z0-9_-]*$
+        required: true
+      - in: query
+        name: limit
+        schema:
+          type: integer
+        description: Maximum list rows shown in this response (1-200).
+      - in: query
+        name: survey_id
+        schema:
+          type: string
+        description: 'Provider survey/project ID. InnovateMR example: 16003381; RFG
+          example: RFG2300540746-001.'
+        required: true
+      tags:
+      - Cint Exchange APIs
+      security:
+      - VendorApiKeyAuth: []
+      - cookieAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamExecutionResponse'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamError'
+          description: Missing/invalid input or safe upstream error.
+        '403':
+          description: Admin or super-admin session required.
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpstreamError'
+          description: Client alias is ambiguous.
   /api/v1/vendors/upstream-explorer/{client_code}/execute/{operation}/:
     get:
       operationId: api_v1_vendors_upstream_explorer_execute_retrieve
@@ -6680,7 +7534,8 @@ paths:
         name: rid
         schema:
           type: string
-        description: Platform respondent ID
+        description: Persistent prescreener UID echoed from RFG RID; used to resolve
+          the canonical platform RID
         required: true
       - in: query
         name: ruledOutBy
@@ -6692,6 +7547,11 @@ paths:
         schema:
           type: string
         description: RFG session identifier
+      - in: query
+        name: tid
+        schema:
+          type: string
+        description: Platform 10-character attempt RID echoed from RFG TID
       tags:
       - RFG Callbacks
       security:
@@ -6852,6 +7712,50 @@ components:
         * `consumed` - Consumed
         * `released` - Released
         * `expired` - Expired
+    CanonicalOption:
+      type: object
+      properties:
+        code:
+          type: string
+          maxLength: 100
+          pattern: ^[-a-zA-Z0-9_]+$
+        label:
+          type: string
+          maxLength: 250
+        normalized_value:
+          type: string
+          maxLength: 250
+      required:
+      - code
+      - label
+    CanonicalQuestion:
+      type: object
+      properties:
+        code:
+          type: string
+          maxLength: 80
+          pattern: ^[-a-zA-Z0-9_]+$
+        label:
+          type: string
+          maxLength: 180
+        value_type:
+          $ref: '#/components/schemas/ValueTypeEnum'
+        description:
+          type: string
+        options:
+          type: array
+          items:
+            $ref: '#/components/schemas/CanonicalOption'
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+      required:
+      - code
+      - label
+      - options
+      - updated_at
     Client:
       type: object
       properties:
@@ -6936,6 +7840,75 @@ components:
           description: 'Provider-specific settings. RFG supports enforce_local_targeting:
             true for Strict local termination or false for Relaxed provider-side eligibility
             decisions.'
+        profile_reuse_enabled:
+          type: boolean
+          description: Allow this client to receive an eligible previously registered
+            profile UID.
+        profile_reuse_eligible_after_days:
+          type: integer
+          maximum: 730
+          minimum: 1
+          description: Minimum age of a registered UID before it enters the reuse
+            queue.
+        profile_reuse_monthly_percentage:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,3}(?:\.\d{0,2})?$
+          description: Percentage of the previous calendar month's attempts available
+            as this month's reuse budget.
+        profile_reuse_country_codes:
+          description: Allowed ISO country codes. Empty means every country served
+            by this integration.
+        profile_reuse_age_groups: {}
+        profile_reuse_genders: {}
+        profile_rereuse_enabled:
+          type: boolean
+          description: Allow profiles that already completed one reuse round to enter
+            a separate queue.
+        profile_rereuse_percentage:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,3}(?:\.\d{0,2})?$
+          description: Share of the monthly reuse target reserved for already-reused
+            profiles.
+        profile_rereuse_cooldown_days:
+          type: integer
+          maximum: 730
+          minimum: 1
+          description: Minimum cooldown after a profile reuse before it can be used
+            again.
+        profile_reuse_status:
+          type: object
+          additionalProperties: {}
+          readOnly: true
+        profile_reuse_first_delay_minutes:
+          type: integer
+          maximum: 1051200
+          minimum: 1
+          description: Minimum age of a newly registered profile before its first
+            reuse, stored in minutes so the policy can be expressed in minutes, hours,
+            or days.
+        profile_reuse_min_interval_minutes:
+          type: integer
+          maximum: 1051200
+          minimum: 1
+          description: Minimum time between two reuses of the same UID.
+        profile_reuse_max_uses_per_window:
+          type: integer
+          maximum: 1000
+          minimum: 1
+          description: Maximum reuses allowed for one UID inside the configured rolling
+            window.
+        profile_reuse_window_minutes:
+          type: integer
+          maximum: 1051200
+          minimum: 1
+          description: Rolling window used by the per-UID reuse limit.
+        profile_reuse_available_country_codes:
+          type: array
+          items:
+            type: string
+          readOnly: true
         has_credential:
           type: boolean
           readOnly: true
@@ -6985,16 +7958,16 @@ components:
           maxLength: 120
         transaction_result_key:
           type: string
-          maxLength: 120
         field_mapping:
           description: Optional canonical-field to upstream-field mapping for custom
             providers.
         sync_interval_seconds:
           type: integer
           maximum: 9223372036854775807
-          minimum: 60
+          minimum: 30
           format: int64
-          description: Minimum interval between inventory syncs for this integration.
+          description: Minimum interval between inventory syncs (30 seconds; some
+            providers require 60).
         detail_refresh_batch:
           type: integer
           maximum: 25
@@ -7064,6 +8037,8 @@ components:
       - last_tested_at
       - masked_credential
       - name
+      - profile_reuse_available_country_codes
+      - profile_reuse_status
       - survey_count
       - updated_at
     ClientIntegrationRequest:
@@ -7097,6 +8072,66 @@ components:
           description: 'Provider-specific settings. RFG supports enforce_local_targeting:
             true for Strict local termination or false for Relaxed provider-side eligibility
             decisions.'
+        profile_reuse_enabled:
+          type: boolean
+          description: Allow this client to receive an eligible previously registered
+            profile UID.
+        profile_reuse_eligible_after_days:
+          type: integer
+          maximum: 730
+          minimum: 1
+          description: Minimum age of a registered UID before it enters the reuse
+            queue.
+        profile_reuse_monthly_percentage:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,3}(?:\.\d{0,2})?$
+          description: Percentage of the previous calendar month's attempts available
+            as this month's reuse budget.
+        profile_reuse_country_codes:
+          description: Allowed ISO country codes. Empty means every country served
+            by this integration.
+        profile_reuse_age_groups: {}
+        profile_reuse_genders: {}
+        profile_rereuse_enabled:
+          type: boolean
+          description: Allow profiles that already completed one reuse round to enter
+            a separate queue.
+        profile_rereuse_percentage:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,3}(?:\.\d{0,2})?$
+          description: Share of the monthly reuse target reserved for already-reused
+            profiles.
+        profile_rereuse_cooldown_days:
+          type: integer
+          maximum: 730
+          minimum: 1
+          description: Minimum cooldown after a profile reuse before it can be used
+            again.
+        profile_reuse_first_delay_minutes:
+          type: integer
+          maximum: 1051200
+          minimum: 1
+          description: Minimum age of a newly registered profile before its first
+            reuse, stored in minutes so the policy can be expressed in minutes, hours,
+            or days.
+        profile_reuse_min_interval_minutes:
+          type: integer
+          maximum: 1051200
+          minimum: 1
+          description: Minimum time between two reuses of the same UID.
+        profile_reuse_max_uses_per_window:
+          type: integer
+          maximum: 1000
+          minimum: 1
+          description: Maximum reuses allowed for one UID inside the configured rolling
+            window.
+        profile_reuse_window_minutes:
+          type: integer
+          maximum: 1051200
+          minimum: 1
+          description: Rolling window used by the per-UID reuse limit.
         api_token:
           type: string
           writeOnly: true
@@ -7148,17 +8183,16 @@ components:
           maxLength: 120
         transaction_result_key:
           type: string
-          minLength: 1
-          maxLength: 120
         field_mapping:
           description: Optional canonical-field to upstream-field mapping for custom
             providers.
         sync_interval_seconds:
           type: integer
           maximum: 9223372036854775807
-          minimum: 60
+          minimum: 30
           format: int64
-          description: Minimum interval between inventory syncs for this integration.
+          description: Minimum interval between inventory syncs (30 seconds; some
+            providers require 60).
         detail_refresh_batch:
           type: integer
           maximum: 25
@@ -7572,6 +8606,22 @@ components:
         client_name:
           type: string
           readOnly: true
+        min_cpi:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,10}(?:\.\d{0,2})?$
+          nullable: true
+          description: Optional source-CPI floor inherited by child units.
+        max_cpi:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,10}(?:\.\d{0,2})?$
+          nullable: true
+          description: Optional source-CPI ceiling inherited by child units.
+        inherit_cpi_range:
+          type: boolean
+          description: When enabled, a child rule keeps the closest parent rule's
+            CPI range.
         is_active:
           type: boolean
         created_by:
@@ -7606,6 +8656,22 @@ components:
           type: integer
         client:
           type: integer
+        min_cpi:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,10}(?:\.\d{0,2})?$
+          nullable: true
+          description: Optional source-CPI floor inherited by child units.
+        max_cpi:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,10}(?:\.\d{0,2})?$
+          nullable: true
+          description: Optional source-CPI ceiling inherited by child units.
+        inherit_cpi_range:
+          type: boolean
+          description: When enabled, a child rule keeps the closest parent rule's
+            CPI range.
         is_active:
           type: boolean
       required:
@@ -7806,6 +8872,29 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/AllocationReservation'
+    PaginatedCanonicalQuestionList:
+      type: object
+      required:
+      - count
+      - results
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/CanonicalQuestion'
     PaginatedClientIntegrationList:
       type: object
       required:
@@ -7921,6 +9010,29 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/ProviderCatalog'
+    PaginatedProviderQuestionMappingList:
+      type: object
+      required:
+      - count
+      - results
+      properties:
+        count:
+          type: integer
+          example: 123
+        next:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=4
+        previous:
+          type: string
+          nullable: true
+          format: uri
+          example: http://api.example.org/accounts/?page=2
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProviderQuestionMapping'
     PaginatedRoleList:
       type: object
       required:
@@ -8247,6 +9359,66 @@ components:
           description: 'Provider-specific settings. RFG supports enforce_local_targeting:
             true for Strict local termination or false for Relaxed provider-side eligibility
             decisions.'
+        profile_reuse_enabled:
+          type: boolean
+          description: Allow this client to receive an eligible previously registered
+            profile UID.
+        profile_reuse_eligible_after_days:
+          type: integer
+          maximum: 730
+          minimum: 1
+          description: Minimum age of a registered UID before it enters the reuse
+            queue.
+        profile_reuse_monthly_percentage:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,3}(?:\.\d{0,2})?$
+          description: Percentage of the previous calendar month's attempts available
+            as this month's reuse budget.
+        profile_reuse_country_codes:
+          description: Allowed ISO country codes. Empty means every country served
+            by this integration.
+        profile_reuse_age_groups: {}
+        profile_reuse_genders: {}
+        profile_rereuse_enabled:
+          type: boolean
+          description: Allow profiles that already completed one reuse round to enter
+            a separate queue.
+        profile_rereuse_percentage:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,3}(?:\.\d{0,2})?$
+          description: Share of the monthly reuse target reserved for already-reused
+            profiles.
+        profile_rereuse_cooldown_days:
+          type: integer
+          maximum: 730
+          minimum: 1
+          description: Minimum cooldown after a profile reuse before it can be used
+            again.
+        profile_reuse_first_delay_minutes:
+          type: integer
+          maximum: 1051200
+          minimum: 1
+          description: Minimum age of a newly registered profile before its first
+            reuse, stored in minutes so the policy can be expressed in minutes, hours,
+            or days.
+        profile_reuse_min_interval_minutes:
+          type: integer
+          maximum: 1051200
+          minimum: 1
+          description: Minimum time between two reuses of the same UID.
+        profile_reuse_max_uses_per_window:
+          type: integer
+          maximum: 1000
+          minimum: 1
+          description: Maximum reuses allowed for one UID inside the configured rolling
+            window.
+        profile_reuse_window_minutes:
+          type: integer
+          maximum: 1051200
+          minimum: 1
+          description: Rolling window used by the per-UID reuse limit.
         api_token:
           type: string
           writeOnly: true
@@ -8298,17 +9470,16 @@ components:
           maxLength: 120
         transaction_result_key:
           type: string
-          minLength: 1
-          maxLength: 120
         field_mapping:
           description: Optional canonical-field to upstream-field mapping for custom
             providers.
         sync_interval_seconds:
           type: integer
           maximum: 9223372036854775807
-          minimum: 60
+          minimum: 30
           format: int64
-          description: Minimum interval between inventory syncs for this integration.
+          description: Minimum interval between inventory syncs (30 seconds; some
+            providers require 60).
         detail_refresh_batch:
           type: integer
           maximum: 25
@@ -8347,6 +9518,22 @@ components:
           type: integer
         client:
           type: integer
+        min_cpi:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,10}(?:\.\d{0,2})?$
+          nullable: true
+          description: Optional source-CPI floor inherited by child units.
+        max_cpi:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,10}(?:\.\d{0,2})?$
+          nullable: true
+          description: Optional source-CPI ceiling inherited by child units.
+        inherit_cpi_range:
+          type: boolean
+          description: When enabled, a child rule keeps the closest parent rule's
+            CPI range.
         is_active:
           type: boolean
     PatchedOrganizationUnitRequest:
@@ -8484,6 +9671,10 @@ components:
           type: string
           minLength: 1
           maxLength: 120
+        client_allocations:
+          type: array
+          items:
+            type: integer
         expires_at:
           type: string
           format: date-time
@@ -8507,6 +9698,18 @@ components:
           nullable: true
           description: Optional client-specific cut. Blank uses the supplier commercial
             default.
+        min_cpi:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,10}(?:\.\d{0,2})?$
+          nullable: true
+          description: Optional source-CPI floor for this supplier/client grant.
+        max_cpi:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,10}(?:\.\d{0,2})?$
+          nullable: true
+          description: Optional source-CPI ceiling for this supplier/client grant.
         starts_at:
           type: string
           format: date-time
@@ -8582,7 +9785,7 @@ components:
           format: uri
         minimum_sync_interval_seconds:
           type: integer
-          minimum: 60
+          minimum: 30
         credential_fields:
           type: array
           items:
@@ -8603,6 +9806,71 @@ components:
       required:
       - key
       - label
+    ProviderOptionMapping:
+      type: object
+      properties:
+        external_value:
+          type: string
+          maxLength: 250
+        external_label:
+          type: string
+          maxLength: 500
+        canonical_option:
+          type: string
+          readOnly: true
+        canonical_value:
+          type: string
+          maxLength: 250
+      required:
+      - canonical_option
+      - external_value
+    ProviderQuestionMapping:
+      type: object
+      properties:
+        provider_code:
+          type: string
+          maxLength: 50
+          pattern: ^[-a-zA-Z0-9_]+$
+        country_code:
+          type: string
+          maxLength: 8
+        language_code:
+          type: string
+          maxLength: 8
+        country_language_id:
+          type: string
+          maxLength: 40
+        external_question_id:
+          type: string
+          maxLength: 160
+        external_question_key:
+          type: string
+          maxLength: 180
+        canonical_key:
+          type: string
+          readOnly: true
+        canonical_label:
+          type: string
+          readOnly: true
+        options:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProviderOptionMapping'
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+      required:
+      - canonical_key
+      - canonical_label
+      - country_code
+      - country_language_id
+      - external_question_id
+      - language_code
+      - options
+      - provider_code
+      - updated_at
     RFGCallbackPreviewRequest:
       type: object
       properties:
@@ -8741,12 +10009,20 @@ components:
         rid:
           type: string
           maxLength: 10
+        pid:
+          type: string
+          readOnly: true
+          description: Platform tracking ID. Generated as 6-9 mixed alphanumeric characters;
+            kept separate from the provider-specific PID parameter.
         prescreener_uid:
           type: string
           readOnly: true
-          nullable: true
-          description: Stable XXXX-XXXX-XXXX-XXXX identity for the isolated prescreener
-            vault.
+        registered_profile_uid:
+          type: string
+          readOnly: true
+        profile_was_reused:
+          type: boolean
+          readOnly: true
         survey_local_id:
           type: string
           readOnly: true
@@ -8839,6 +10115,7 @@ components:
           format: decimal
           pattern: ^-?\d{0,10}(?:\.\d{0,2})?$
           nullable: true
+          readOnly: true
         cpi_currency_snapshot:
           type: string
           maxLength: 3
@@ -8960,7 +10237,11 @@ components:
       - entry_ip
       - exit_ip
       - language_code
+      - payable_cpi_snapshot
+      - pid
       - prescreener_uid
+      - profile_was_reused
+      - registered_profile_uid
       - rid
       - source_cpi_snapshot
       - status_label
@@ -9130,9 +10411,8 @@ components:
           format: int64
         completes:
           type: integer
-          maximum: 9223372036854775807
-          minimum: 0
-          format: int64
+          description: Return combined platform completes for every user on this survey.
+          readOnly: true
         remaining:
           type: integer
           maximum: 9223372036854775807
@@ -9273,6 +10553,7 @@ components:
           readOnly: true
       required:
       - client_name
+      - completes
       - country_label
       - cpi
       - cpi_cut_percent
@@ -9332,9 +10613,8 @@ components:
           format: int64
         completes:
           type: integer
-          maximum: 9223372036854775807
-          minimum: 0
-          format: int64
+          description: Return combined platform completes for every user on this survey.
+          readOnly: true
         remaining:
           type: integer
           maximum: 9223372036854775807
@@ -9454,6 +10734,7 @@ components:
           readOnly: true
       required:
       - client_name
+      - completes
       - country_label
       - cpi
       - cpi_cut_percent
@@ -9486,6 +10767,11 @@ components:
         name:
           type: string
           maxLength: 500
+        display_name:
+          type: string
+          readOnly: true
+          description: Readable quota title without exposing provider-internal quota
+            IDs.
         sample_size:
           type: integer
           maximum: 9223372036854775807
@@ -9540,6 +10826,7 @@ components:
           readOnly: true
       required:
       - completed_known
+      - display_name
       - id
       - limit_type
       - scope_label
@@ -9692,8 +10979,8 @@ components:
         targeting_note:
           type: string
           readOnly: true
-          description: Readable RFG qualifying-answer or age rule for internal project
-            details.
+          description: Readable provider qualifying-answer or age rule for internal
+            project details.
         updated_at:
           type: string
           format: date-time
@@ -10162,6 +11449,22 @@ components:
       - previous
       - results
       - summary
+    ValueTypeEnum:
+      enum:
+      - integer
+      - decimal
+      - text
+      - date
+      - single
+      - multiple
+      type: string
+      description: |-
+        * `integer` - Integer
+        * `decimal` - Decimal
+        * `text` - Text
+        * `date` - Date
+        * `single` - Single choice
+        * `multiple` - Multiple choice
     VendorAPIKey:
       type: object
       properties:
@@ -10190,6 +11493,15 @@ components:
           readOnly: true
         api_key:
           type: string
+          readOnly: true
+        client_allocations:
+          type: array
+          items:
+            type: integer
+        client_names:
+          type: array
+          items:
+            type: string
           readOnly: true
         is_active:
           type: boolean
@@ -10223,6 +11535,8 @@ components:
       required:
       - account_type
       - api_key
+      - client_allocations
+      - client_names
       - created_at
       - created_by
       - id
@@ -10245,11 +11559,16 @@ components:
           type: string
           minLength: 1
           maxLength: 120
+        client_allocations:
+          type: array
+          items:
+            type: integer
         expires_at:
           type: string
           format: date-time
           nullable: true
       required:
+      - client_allocations
       - name
       - vendor
     VendorClientAllocation:
@@ -10297,6 +11616,24 @@ components:
           format: decimal
           pattern: ^-?\d{0,3}(?:\.\d{0,2})?$
           readOnly: true
+        min_cpi:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,10}(?:\.\d{0,2})?$
+          nullable: true
+          description: Optional source-CPI floor for this supplier/client grant.
+        max_cpi:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,10}(?:\.\d{0,2})?$
+          nullable: true
+          description: Optional source-CPI ceiling for this supplier/client grant.
+        api_key_scopes:
+          type: array
+          items:
+            type: object
+            additionalProperties: {}
+          readOnly: true
         starts_at:
           type: string
           format: date-time
@@ -10321,6 +11658,7 @@ components:
           readOnly: true
       required:
       - account_type
+      - api_key_scopes
       - client
       - client_name
       - consumed_quantity
@@ -10352,6 +11690,18 @@ components:
           nullable: true
           description: Optional client-specific cut. Blank uses the supplier commercial
             default.
+        min_cpi:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,10}(?:\.\d{0,2})?$
+          nullable: true
+          description: Optional source-CPI floor for this supplier/client grant.
+        max_cpi:
+          type: string
+          format: decimal
+          pattern: ^-?\d{0,10}(?:\.\d{0,2})?$
+          nullable: true
+          description: Optional source-CPI ceiling for this supplier/client grant.
         starts_at:
           type: string
           format: date-time
@@ -10494,6 +11844,13 @@ components:
         allocation_count:
           type: integer
           readOnly: true
+        active_client_allocation_count:
+          type: integer
+          readOnly: true
+        average_client_cpi_cut_percent:
+          type: number
+          format: double
+          readOnly: true
         api_key_count:
           type: integer
           readOnly: true
@@ -10509,8 +11866,10 @@ components:
           readOnly: true
       required:
       - account_type
+      - active_client_allocation_count
       - allocation_count
       - api_key_count
+      - average_client_cpi_cut_percent
       - commercial_profile_id
       - created_by
       - currency
@@ -10745,3 +12104,6 @@ tags:
 - name: RFG Callbacks
   description: Research For Good callback contract and safe result-code interpretation
     tools.
+- name: Cint Exchange APIs
+  description: Cint Model 2 Method B inventory, allocation, qualification, quota and
+    question-library reads using server-side credentials.

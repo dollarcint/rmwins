@@ -512,6 +512,16 @@ html,body,.app-shell{max-width:100%;overflow-x:clip}.main-area{width:calc(100% -
 
 .reason-table-outcome{display:flex;min-width:180px;max-width:300px;flex-direction:column;align-items:flex-start;gap:6px}.reason-table-outcome small{display:-webkit-box;max-width:100%;overflow:hidden;color:#77849a;font-size:9px;line-height:1.35;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow-wrap:anywhere}.reason-card-cause{margin:10px 0 0!important;padding:9px 10px;border-radius:9px;background:#f7f9fc;color:#65748b!important;font-size:10px!important;line-height:1.45}
 
+/* Term Reports shares the scalable Traffic Reports filter system. */
+.reason-list-filters{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));align-items:end}
+.reason-list-filters .search-field{grid-column:span 2}
+.reason-list-filters .datetime-field{grid-column:span 2}
+.reason-list-filters .multi-menu{z-index:42}
+.reason-list-filters .reason-filter-button,.reason-list-filters .reason-clear-link{min-height:43px}
+.reason-platform-status{display:block!important;color:#687993!important;font-size:9px!important;font-weight:800;letter-spacing:.15px;-webkit-line-clamp:1!important}
+.reason-mobile-card>.reason-platform-status{margin-top:7px}
+@media(max-width:720px){.reason-list-filters .search-field{grid-column:1/-1}.reason-list-filters .datetime-field{grid-column:auto}}
+
 @media(max-width:1550px) and (min-width:901px){
   .page-studies .study-overview-compact{gap:7px}
   .page-studies .study-overview-compact>.revenue,.page-studies .study-overview-compact>.study-summary-card{padding-inline:9px}
@@ -522,3 +532,16 @@ html,body,.app-shell{max-width:100%;overflow-x:clip}.main-area{width:calc(100% -
 @media(max-width:1180px) and (min-width:901px){.page-studies .study-overview-compact{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media(max-width:900px){.page-studies .study-overview-compact{grid-template-columns:repeat(2,minmax(0,1fr))}.vault-answer-drawer{width:min(640px,100vw)}}
 @media(max-width:620px){.page-studies .study-overview-compact{grid-template-columns:1fr 1fr}.vault-drawer-summary{grid-template-columns:1fr}.vault-answer-drawer{width:100vw}.vault-answer-drawer-body{padding:13px}.vault-answer-drawer>header{padding-inline:16px}.vault-answer-trigger{width:100%;margin-top:11px}}
+
+/* Shared selected-filter summary and comfortable search sizing. */
+.active-filter-strip{grid-column:1/-1;order:-1;display:flex;align-items:flex-start;gap:12px;min-width:0;padding:0 0 12px;border-bottom:1px solid #edf1f5}
+.active-filter-strip[hidden]{display:none!important}.active-filter-title{flex:0 0 auto;padding-top:7px;color:#8995a8;font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:.65px}.active-filter-chips{display:flex;flex:1;flex-wrap:wrap;gap:7px;min-width:0}.active-filter-chip{max-width:min(260px,100%);min-height:30px;display:inline-grid;grid-template-columns:auto minmax(0,auto) auto;align-items:center;gap:6px;padding:5px 8px 5px 10px;border:1px solid #cfeaf0;border-radius:999px;background:#f0fbfd;color:#466077;cursor:pointer;box-shadow:0 3px 10px rgba(17,129,153,.05);transition:border-color .18s,background .18s,transform .18s}.active-filter-chip b{color:#087f99;font-size:9px}.active-filter-chip span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;font-weight:600}.active-filter-chip i{width:18px;height:18px;display:grid;place-items:center;border-radius:50%;background:#d9f3f7;color:#087f99;font:700 14px/1 sans-serif}.active-filter-chip:hover{border-color:#8fdbe8;background:#e8f9fd;transform:translateY(-1px)}
+.filter-panel .search-field{grid-column:span 2!important;min-width:0}.filter-panel .search-field .field-control,.filter-panel .search-field input{width:100%;min-width:0}.filter-panel .multi-menu{width:max(100%,280px);max-width:min(360px,calc(100vw - 32px))}.filter-panel .multi-menu-search{height:42px}.filter-panel .multi-menu .multi-menu-search input{font-size:12px}
+@media(max-width:700px){.filter-panel .search-field{grid-column:1/-1!important}.active-filter-strip{align-items:stretch;flex-direction:column;gap:7px}.active-filter-title{padding-top:0}.active-filter-chip{max-width:100%}}
+
+/* Project identifiers remain navigable while allowing normal text selection/copy. */
+.project-study-link{display:inline-block;width:max-content;max-width:100%;text-decoration:none!important;user-select:text;-webkit-user-select:text;cursor:pointer;outline:none;transform:none!important}
+.project-study-link:hover{color:var(--cyan-dark)!important;text-decoration:none!important}.project-study-link:focus-visible{border-radius:4px;box-shadow:0 0 0 3px var(--cyan-soft)}
+.drawer-survey{flex-direction:row;align-items:center;justify-content:space-between;gap:18px}.drawer-survey-primary{display:flex;min-width:0;flex-direction:column}.drawer-survey-primary strong,.drawer-survey-primary span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.drawer-project-code{flex:0 0 auto;min-width:150px;padding:9px 12px;border:1px solid rgba(255,255,255,.16);border-radius:10px;background:rgba(255,255,255,.08);display:flex;flex-direction:column;align-items:flex-start}.drawer-project-code small{margin:0;color:rgba(255,255,255,.64);font-size:8px;font-weight:800;text-transform:uppercase;letter-spacing:.7px}.drawer-project-code b{margin-top:4px;color:#fff;font-size:12px;letter-spacing:.15px;user-select:text;-webkit-user-select:text}
+@media(max-width:520px){.drawer-survey{align-items:stretch;flex-direction:column;gap:12px}.drawer-project-code{min-width:0;width:100%}}

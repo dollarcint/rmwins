@@ -12,12 +12,14 @@ import logging
 import re
 from datetime import date, timedelta
 from decimal import Decimal
+from types import SimpleNamespace
 from urllib.parse import quote, urlencode
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import DatabaseError, transaction
-from django.db.models import Count, Max, Q, Sum
+from django.db.models import Count, IntegerField, Max, OuterRef, Q, Subquery, Sum, Value
+from django.db.models.functions import Coalesce
 from django.http import HttpResponse, HttpResponseRedirect, JsonResponse, StreamingHttpResponse
 from django.core.paginator import Paginator
 from django.shortcuts import render
@@ -43,10 +45,12 @@ from accounts.access import (
 )
 from vendors.services import (
     AllocationUnavailable,
+    annotate_survey_pricing_for_user,
     finalize_attempt_capacity,
     reserve_attempt_capacity,
     resolve_vendor_survey_context,
     organization_client_ids_for_user,
+    scope_surveys_for_api_key,
     scope_surveys_for_user,
     visible_amount_for_user,
     visible_cpi_for_user,
@@ -64,6 +68,14 @@ from .excel import ExcelSheet, build_excel_response
 from .integrations import InnovateMRAPIError, InnovateMRClient
 from .models import CanonicalQuestion, ProviderQuestionMapping, Survey, SurveyAttempt, SyncRun
 from .outcomes import provider_outcome
+from .report_pricing import (
+    apply_percentage,
+    can_view_report_commercials,
+    role_visibility_percent,
+    supplier_cpi_for_admin,
+    supplier_label_for_admin,
+    viewer_attempt_cpi,
+)
 from .serializers import (
     SurveyDetailSerializer,
     DashboardResponseSerializer,
@@ -83,17 +95,26 @@ from .pagination import SurveyPagination
 from .project_cache import project_filter_metadata
 from prescreener_vault.services import (
     PrescreenerVaultError,
+    answers_with_entry_postal_code,
     capture_prescreener_submission,
     operational_answer_value,
+    wrong_target_country_answers,
 )
 from prescreener_vault.cint_email_pool import CintEmailPoolExhausted
 from prescreener_vault.models import PrescreenerSubmission
+from prescreener_vault.reuse import maybe_assign_reusable_profile
 from prescreener_vault.cache import (
     apply_submission_filters,
     vault_filter_options,
     vault_filtered_summary,
 )
 from .providers import ProviderError, get_provider, has_provider
+from .geolocation import (
+    geolocation_client_data,
+    is_wrong_target_country,
+    resolve_entry_geolocation,
+    survey_target_country_code,
+)
 from .rfg_outcomes import RFG_STATUS_MAP, describe_rfg_outcome
 from .rfg_text import clean_rfg_display_text
 from .services import reconcile_attempt_status, replace_survey_quotas, replace_survey_targeting, sync_surveys
@@ -104,6 +125,7 @@ from .survey_flow import (
     ensure_attempt_prescreener_uid,
     get_request_client_data,
     get_request_ip,
+    status_identifiers_from_request,
     status_rid_from_request,
 )
 from .tasks import sync_innovatemr_surveys_task
@@ -138,7 +160,8 @@ PROJECT_FILTER_PERMISSIONS = {
 STUDY_COLUMN_PERMISSIONS = {
     "project_id": "studies.column.project_id", "survey_id": "studies.column.survey_id",
     "country": "studies.column.country", "cpi": "studies.column.cpi",
-    "respondent_id": "studies.column.respondent_id", "user": "studies.column.user",
+    "respondent_id": "studies.column.respondent_id", "pid": "studies.column.pid",
+    "user": "studies.column.user",
     "device": "studies.column.device", "ip": "studies.column.ip", "loi": "studies.column.loi",
     "status": "studies.column.status", "start": "studies.column.start", "end": "studies.column.end",
 }
@@ -227,8 +250,15 @@ TERM_REASON_COLUMN_PERMISSIONS = {
 
 TERM_REASON_FILTER_PERMISSIONS = {
     "rid": "termination_reasons.filter.rid",
+    "branch": "termination_reasons.filter.branch",
+    "sub_branch": "termination_reasons.filter.sub_branch",
+    "shift": "termination_reasons.filter.shift",
+    "user": "termination_reasons.filter.user",
     "status": "termination_reasons.filter.status",
+    "country": "termination_reasons.filter.country",
     "client": "termination_reasons.filter.client",
+    "buyer": "termination_reasons.filter.buyer",
+    "date": "termination_reasons.filter.date",
     "clear": "termination_reasons.filters.clear",
 }
 
@@ -309,7 +339,10 @@ def projects_page(request):
     inventory_surveys = Survey.objects.filter(
         Q(integration__isnull=True) | Q(integration__is_active=True)
     )
-    visible_surveys = scope_surveys_for_user(inventory_surveys, request.user)
+    visible_surveys = annotate_survey_pricing_for_user(
+        scope_surveys_for_user(inventory_surveys, request.user),
+        request.user,
+    )
     is_client_scoped_panel = bool(
         vendor_scope_user_id(request.user) or organization_client_ids_for_user(request.user) is not None
     )
@@ -321,6 +354,7 @@ def projects_page(request):
         user_id=request.user.pk,
         client_scoped=is_client_scoped_panel,
         include_cpi=can_sort_cpi,
+        cpi_field="visible_cpi",
     )
     cpi_min, cpi_max = 0, 100
     if can_sort_cpi:
@@ -338,6 +372,7 @@ def projects_page(request):
         "company_filter_param": "client_name" if is_client_scoped_panel else "company",
         "company_filter_default": "All clients",
         "project_columns": project_columns, "project_column_count": max(1, len(project_columns)),
+        "can_view_project_client_name": "projects.column.client_name" in codes,
         "project_filters": project_filters,
         "can_sync": "sync.run" in codes,
         "can_export_projects": "projects.export" in codes,
@@ -496,7 +531,7 @@ def prescreener_data_export(request):
     def submission_rows():
         for submission in queryset.iterator(chunk_size=500):
             yield [
-                submission.uid, submission.rid, submission.country, submission.country_code,
+                submission.uid, submission.country, submission.country_code,
                 submission.language, submission.language_code, submission.respondent_age,
                 submission.respondent_age_group, submission.respondent_gender,
                 submission.respondent_ethnicity, submission.respondent_postal_code,
@@ -508,7 +543,7 @@ def prescreener_data_export(request):
         for submission in queryset.iterator(chunk_size=250):
             for answer in submission.question_answers.all():
                 yield [
-                    submission.uid, submission.rid, answer.position, answer.question_id,
+                    submission.uid, answer.position, answer.question_id,
                     answer.question_key, answer.question_text, answer.question_type,
                     answer.question_category, answer.canonical_attribute,
                     ", ".join(str(value) for value in answer.answer_values),
@@ -522,15 +557,15 @@ def prescreener_data_export(request):
         [
             ExcelSheet(
                 "Submissions",
-                ["UID", "RID", "Country", "Country code", "Language", "Language code", "Age", "Age group", "Gender", "Ethnicity", "ZIP / postal code", "Visits", "Registered at (IST)", "Captured at (IST)"],
+                ["UID", "Country", "Country code", "Language", "Language code", "Age", "Age group", "Gender", "Ethnicity", "ZIP / postal code", "Visits", "Registered at (IST)", "Captured at (IST)"],
                 submission_rows(),
-                [22, 14, 20, 13, 17, 14, 9, 13, 14, 24, 18, 13, 22, 22],
+                [22, 20, 13, 17, 14, 9, 13, 14, 24, 18, 13, 22, 22],
             ),
             ExcelSheet(
                 "Answers",
-                ["UID", "RID", "Position", "Question ID", "Question key", "Question", "Question type", "Category", "Reusable attribute", "Answer values", "Answer labels", "Upstream values"],
+                ["UID", "Position", "Question ID", "Question key", "Question", "Question type", "Category", "Reusable attribute", "Answer values", "Answer labels", "Upstream values"],
                 answer_rows(),
-                [22, 14, 10, 16, 22, 48, 18, 18, 20, 28, 34, 25],
+                [22, 10, 16, 22, 48, 18, 18, 20, 28, 34, 25],
             ),
         ],
     )
@@ -566,43 +601,152 @@ def _refresh_provider_outcome(attempt, integration):
     attempt.save(update_fields=["upstream_transaction_data", "upstream_checked_at", "updated_at"])
 
 
+def _term_report_values(request, name):
+    """Return stable, de-duplicated values from repeated or CSV query params."""
+
+    values = []
+    for raw_value in request.GET.getlist(name):
+        for value in str(raw_value or "").split(","):
+            value = value.strip()
+            if value and value not in values:
+                values.append(value)
+    return values
+
+
+def _term_report_filter_state(request, filters_access):
+    selected = {
+        "search": request.GET.get("search", "").strip(),
+        "branch": _term_report_values(request, "branch"),
+        "sub_branch": _term_report_values(request, "sub_branch"),
+        "shift": _term_report_values(request, "shift"),
+        "user": _term_report_values(request, "user"),
+        "status": _term_report_values(request, "status"),
+        "country": _term_report_values(request, "country"),
+        "client": _term_report_values(request, "client"),
+        "buyer_id": _term_report_values(request, "buyer_id"),
+        "date_field": request.GET.get("date_field", "callback").strip() or "callback",
+        "date_from": request.GET.get("date_from", "").strip(),
+        "date_to": request.GET.get("date_to", "").strip(),
+    }
+    supplied_by_permission = {
+        "rid": selected["search"],
+        "branch": selected["branch"],
+        "sub_branch": selected["sub_branch"],
+        "shift": selected["shift"],
+        "user": selected["user"],
+        "status": selected["status"],
+        "country": selected["country"],
+        "client": selected["client"],
+        "buyer": selected["buyer_id"],
+        "date": selected["date_from"] or selected["date_to"],
+    }
+    for filter_name, value in supplied_by_permission.items():
+        if value and not filters_access.get(filter_name, False):
+            raise PermissionDenied(
+                f"Your account cannot use the {filter_name.replace('_', ' ')} filter."
+            )
+    if selected["date_field"] not in {"initiated", "callback"}:
+        selected["date_field"] = "callback"
+    return selected
+
+
+def _term_report_base_queryset():
+    return SurveyAttempt.objects.select_related(
+        "survey__integration__client",
+        "survey__client",
+        "platform_user__employee_profile__organization_unit__parent__parent",
+    ).filter(status__in=UNSUCCESSFUL_ATTEMPT_STATUSES)
+
+
+def _term_report_datetime(value, label):
+    if not value:
+        return None
+    parsed = parse_datetime(value)
+    if parsed is None:
+        raise PermissionDenied(f"{label} must use a valid date and time.")
+    if timezone.is_naive(parsed):
+        parsed = timezone.make_aware(parsed, timezone.get_current_timezone())
+    return parsed
+
+
+def _filtered_term_report_queryset(request, filters_access):
+    selected = _term_report_filter_state(request, filters_access)
+    queryset = _term_report_base_queryset()
+    search = selected["search"]
+    if search:
+        queryset = queryset.filter(
+            Q(rid__icontains=search)
+            | Q(pid__icontains=search)
+            | Q(prescreener_uid__icontains=search)
+            | Q(provider_profile_uid__icontains=search)
+            | Q(survey__local_id__icontains=search)
+            | Q(survey__source_key__icontains=search)
+            | Q(survey__buyer_id__icontains=search)
+            | Q(survey__client__name__icontains=search)
+            | Q(platform_user__username__icontains=search)
+            | Q(platform_user__first_name__icontains=search)
+            | Q(platform_user__last_name__icontains=search)
+            | Q(platform_user__email__icontains=search)
+            | Q(initiation_ip__icontains=search)
+            | Q(callback_ip__icontains=search)
+        )
+
+    filter_data = {
+        name: ",".join(selected[name])
+        for name in ("branch", "sub_branch", "shift", "user", "status", "country", "client", "buyer_id")
+        if selected[name]
+    }
+    queryset = SurveyAttemptFilter(filter_data, queryset=queryset).qs
+    lower = _term_report_datetime(selected["date_from"], "From date and time")
+    upper = _term_report_datetime(selected["date_to"], "To date and time")
+    if lower and upper and lower > upper:
+        raise PermissionDenied("From date and time cannot be after To date and time.")
+    date_column = "initiated_at" if selected["date_field"] == "initiated" else "callback_at"
+    if lower:
+        queryset = queryset.filter(**{f"{date_column}__gte": lower})
+    if upper:
+        queryset = queryset.filter(**{f"{date_column}__lte": upper})
+    return queryset, selected
+
+
+def _term_report_options(base_queryset, user):
+    hierarchy = user_hit_filter_options(user)
+    return {
+        **hierarchy,
+        "countries": list(
+            base_queryset.exclude(survey__country_code="")
+            .values("survey__country_code", "survey__country")
+            .distinct().order_by("survey__country_code")
+        ),
+        "clients": list(
+            base_queryset.filter(survey__client__isnull=False)
+            .values("survey__client_id", "survey__client__name")
+            .distinct().order_by("survey__client__name")
+        ),
+        "buyers": list(
+            base_queryset.exclude(survey__buyer_id="")
+            .values("survey__client_id", "survey__buyer_id")
+            .distinct().order_by("survey__buyer_id")
+        ),
+    }
+
+
 @function_permission_required("termination_reasons.view")
 def termination_reasons_page(request):
     codes = effective_permission_codes(request.user)
     filters_access = _component_access(codes, TERM_REASON_FILTER_PERMISSIONS)
     columns = _permitted_columns(codes, TERM_REASON_COLUMN_PERMISSIONS)
-    search = request.GET.get("search", "").strip()
-    status_filter = request.GET.get("status", "").strip()
-    client_filter = request.GET.get("client", "").strip()
+    queryset, selected = _filtered_term_report_queryset(request, filters_access)
     detail_rid = (request.GET.get("detail") or request.GET.get("rid") or "").strip()
     detail_attempt = None
     detail_outcome = None
     lookup_error = ""
 
-    if search and not filters_access["rid"]:
-        raise PermissionDenied("Your account cannot use the RID filter.")
-    if status_filter and not filters_access["status"]:
-        raise PermissionDenied("Your account cannot use the status filter.")
-    if client_filter and not filters_access["client"]:
-        raise PermissionDenied("Your account cannot use the client filter.")
     if detail_rid and "termination_reasons.action.details" not in codes:
         raise PermissionDenied("Your account cannot open outcome details.")
 
-    base_queryset = SurveyAttempt.objects.select_related(
-        "survey__integration__client", "survey__client", "platform_user"
-    ).filter(status__in=UNSUCCESSFUL_ATTEMPT_STATUSES)
-    client_options = list(
-        base_queryset.filter(survey__client__isnull=False)
-        .values("survey__client_id", "survey__client__name")
-        .distinct().order_by("survey__client__name")
-    )
-    queryset = base_queryset
-    if search:
-        queryset = queryset.filter(rid__icontains=search)
-    if status_filter in UNSUCCESSFUL_ATTEMPT_STATUSES:
-        queryset = queryset.filter(status=status_filter)
-    if client_filter.isdigit():
-        queryset = queryset.filter(survey__client_id=int(client_filter))
+    base_queryset = _term_report_base_queryset()
+    filter_options = _term_report_options(base_queryset, request.user)
 
     summary = queryset.aggregate(
         total=Count("id"),
@@ -668,11 +812,16 @@ def termination_reasons_page(request):
 
     return render(request, "surveys/termination_reasons.html", {
         "active_page": "termination-reasons",
-        "search_query": search,
-        "status_filter": status_filter,
-        "client_filter": client_filter,
-        "client_options": client_options,
-        "term_reason_clients": client_options,
+        "selected": selected,
+        "search_query": selected["search"],
+        "client_options": filter_options["clients"],
+        "term_reason_clients": filter_options["clients"],
+        "term_branches": filter_options["branches"],
+        "term_sub_branches": filter_options["sub_branches"],
+        "term_shifts": filter_options["shifts"],
+        "term_users": filter_options["users"],
+        "term_countries": filter_options["countries"],
+        "term_buyers": filter_options["buyers"],
         "attempt_statuses": list(UNSUCCESSFUL_STATUS_LABELS.items()),
         "summary": summary,
         "page_obj": page_obj,
@@ -688,8 +837,72 @@ def termination_reasons_page(request):
         "page_query": page_query,
         "lookup_error": lookup_error,
         "can_refresh_reasons": "termination_reasons.action.refresh" in codes,
+        "can_export_reasons": "termination_reasons.export" in codes,
         "reason_fields": _component_access(codes, TERM_REASON_FIELD_PERMISSIONS),
     })
+
+
+@function_permission_required("termination_reasons.export")
+def termination_reasons_export(request):
+    """Export the exact filtered Term Reports result set with both status layers."""
+
+    codes = effective_permission_codes(request.user)
+    filters_access = _component_access(codes, TERM_REASON_FILTER_PERMISSIONS)
+    queryset, _selected = _filtered_term_report_queryset(request, filters_access)
+    queryset = queryset.order_by("-callback_at", "-initiated_at")
+
+    headers = [
+        "RID", "PID", "UID", "Project ID", "Client survey ID", "Client", "Provider",
+        "Buyer ID", "Country", "Respondent", "Email", "Entry IP", "Exit IP",
+        "Platform status", "Provider status", "Term reason", "Term category",
+        "Status source", "Started at", "Ended at", "LOI (minutes)",
+    ]
+    widths = [
+        15, 13, 22, 19, 20, 22, 18, 17, 13, 22, 30, 17, 17, 20, 27, 44, 22,
+        20, 24, 24, 15,
+    ]
+
+    def rows():
+        for attempt in queryset.iterator(chunk_size=500):
+            outcome = provider_outcome(attempt)
+            survey = attempt.survey
+            client = survey.client or (survey.integration.client if survey.integration_id else None)
+            provider = survey.integration.provider_code if survey.integration_id else "innovatemr"
+            respondent = ""
+            email = ""
+            if attempt.platform_user_id:
+                respondent = attempt.platform_user.get_full_name() or attempt.platform_user.username
+                email = attempt.platform_user.email
+            ended_at = attempt.callback_at or attempt.last_callback_at or attempt.initiated_at
+            yield [
+                attempt.rid,
+                attempt.pid,
+                attempt.provider_profile_uid or attempt.prescreener_uid or "",
+                survey.local_id,
+                survey.source_key,
+                client.name if client else survey.company_name,
+                provider,
+                survey.buyer_id,
+                survey.country_code or survey.country,
+                respondent,
+                email,
+                attempt.initiation_ip or "",
+                attempt.callback_ip or "",
+                UNSUCCESSFUL_STATUS_LABELS.get(attempt.status, attempt.get_status_display()),
+                outcome.get("status") or "Not supplied",
+                outcome.get("reason") or "",
+                outcome.get("category") or "",
+                attempt.status_source,
+                _excel_datetime(attempt.initiated_at),
+                _excel_datetime(ended_at),
+                round(attempt.loi_seconds / 60, 2) if attempt.loi_seconds is not None else "",
+            ]
+
+    local_now = timezone.localtime()
+    return build_excel_response(
+        f"term-reports-{local_now:%Y%m%d-%H%M%S}-IST.xlsx",
+        [ExcelSheet("Term Reports", headers, rows(), widths)],
+    )
 
 
 def workspace_home(request):
@@ -791,6 +1004,39 @@ def _prescreener_questions(survey, submitted_data=None, *, qualifying_options_on
         if survey.integration_id else "innovatemr"
     )
     question_rows = list(survey.targeting_questions.all())
+    if provider_code == "cint" and not question_rows:
+        # Some open Cint opportunities genuinely have no qualifications. We
+        # still need a minimal reusable profile, so collect age and gender as
+        # platform-only answers. Empty question IDs/upstream values guarantee
+        # these controls are never appended to the signed Cint entry URL.
+        question_rows = [
+            SimpleNamespace(
+                pk="platform_profile_age",
+                question_id="",
+                key="AGE",
+                text="What is your age?",
+                question_type="Numeric",
+                category="Required profile",
+                options=[],
+                raw_data={
+                    "platform_only": True,
+                    "targeting_age_ranges": [{"min": 13, "max": 120}],
+                },
+            ),
+            SimpleNamespace(
+                pk="platform_profile_gender",
+                question_id="",
+                key="GENDER",
+                text="What is your gender?",
+                question_type="Single Punch",
+                category="Required profile",
+                options=[
+                    {"OptionId": "male", "OptionText": "Male"},
+                    {"OptionId": "female", "OptionText": "Female"},
+                ],
+                raw_data={"platform_only": True},
+            ),
+        ]
     profile_aliases = {}
     aliased_question_ids = set()
     if provider_code == "rfg":
@@ -937,11 +1183,21 @@ def _prescreener_questions(survey, submitted_data=None, *, qualifying_options_on
         elif is_age_question:
             input_kind = "number"
             display_text = "What is your age?"
+        elif is_postal_question:
+            # Postal codes are identifiers, not numbers: leading zeroes and
+            # country-specific letters must survive exactly as entered.
+            input_kind = "text"
         elif "date" in lowered_type:
             input_kind = "date_mask"
         elif "multi" in lowered_type:
             input_kind = "checkbox"
         elif "single" in lowered_type and options:
+            input_kind = "radio"
+        elif options:
+            # Providers sometimes label derived/boolean qualifications as
+            # ``Dummy`` (for example Region or Mobile Device) even though
+            # they supply a closed option list. A fixed list must never fall
+            # back to a free-text field: one respondent value is selected.
             input_kind = "radio"
         elif question.key.upper() == "AGE" or "numeric" in lowered_type:
             input_kind = "number"
@@ -1098,12 +1354,19 @@ def _collect_prescreener_answers(request, survey):
                 )
                 continue
 
+        platform_only = bool((question.raw_data or {}).get("platform_only"))
+        if platform_only:
+            upstream_values = []
+
         answers[str(question.pk)] = {
             "question_id": question.question_id,
             "question_key": question.key,
             "question_text": prepared["display_text"],
+            "question_type": question.question_type,
+            "question_category": question.category,
             "values": values,
             "upstream_values": upstream_values,
+            "platform_only": platform_only,
         }
         for alias in prepared.get("aliases", []):
             alias_upstream_values = _rfg_alias_upstream_values(
@@ -1179,6 +1442,63 @@ def _finish_local_rfg_attempt(attempt, answers, request, *, result, reason):
     return locked
 
 
+def _finish_wrong_target_country_attempt(attempt, request, location):
+    """Record a local S4 before any prescreener question or provider redirect."""
+
+    now = timezone.now()
+    expected = survey_target_country_code(attempt.survey)
+    actual = str((location or {}).get("country_code") or "").upper()
+    vault_answers = wrong_target_country_answers(attempt, location)
+    if settings.PRESCREENER_VAULT_ENABLED:
+        try:
+            capture_prescreener_submission(attempt, vault_answers, submitted_at=now)
+        except PrescreenerVaultError:
+            # Country enforcement must still protect the provider contract. The
+            # failed vault write remains visible in logs for operational retry.
+            logger.exception(
+                "Wrong-target-country vault capture failed for rid=%s", attempt.rid
+            )
+
+    with transaction.atomic():
+        locked = SurveyAttempt.objects.select_for_update().get(pk=attempt.pk)
+        if locked.status != SurveyAttempt.Status.INITIATED:
+            return locked
+        client_data = {
+            **get_request_client_data(request),
+            **geolocation_client_data(location),
+        }
+        locked.answers = operational_answer_value(vault_answers)
+        locked.submitted_at = now
+        locked.callback_at = now
+        locked.last_callback_at = now
+        locked.callback_ip = get_request_ip(request) or locked.initiation_ip
+        locked.exit_user_agent = client_data.get("user_agent", "")
+        locked.exit_browser = client_data.get("browser", "")
+        locked.exit_device = client_data.get("device", "")
+        locked.exit_os = client_data.get("os", "")
+        locked.exit_client_data = client_data
+        locked.status = SurveyAttempt.Status.QUALITY_TERMINATED
+        locked.status_source = "local_country_guard"
+        locked.loi_seconds = locked.calculate_loi_seconds(now)
+        locked.upstream_transaction_data = {
+            **(locked.upstream_transaction_data or {}),
+            "local_country_guard": {
+                "status": "Wrong target country",
+                "reason": "Wrong target country",
+                "expected_country": expected,
+                "detected_country": actual,
+                "geo_source": str((location or {}).get("source") or ""),
+            },
+        }
+        locked.save(update_fields=[
+            "answers", "submitted_at", "callback_at", "last_callback_at", "callback_ip",
+            "exit_user_agent", "exit_browser", "exit_device", "exit_os", "exit_client_data",
+            "status", "status_source", "loi_seconds", "upstream_transaction_data", "updated_at",
+        ])
+        finalize_attempt_capacity(locked)
+    return locked
+
+
 def _mark_attempt_redirected(attempt, answers, outbound_url):
     """Atomically claim one initiated attempt for its provider redirect.
 
@@ -1215,7 +1535,10 @@ def survey_start(request):
     """
 
     if request.method == "GET" and not request.GET.get("rid"):
+        has_pid_parameter = "pid" in request.GET
         required_params = {"surveyId", "supplierCode", "userId", "code"}
+        if has_pid_parameter:
+            required_params.add("pid")
         if not _has_exact_query(request, required_params):
             return _invalid_survey_link(request)
 
@@ -1223,12 +1546,17 @@ def survey_start(request):
         supplier_code = request.GET.get("supplierCode", "").strip()
         internal_code = request.GET.get("code", "").strip()
         user_id = request.GET.get("userId", "").strip()
+        platform_pid = request.GET.get("pid", "").strip()
         if (
             not survey_id
             or len(survey_id) > 160
             or not user_id.isdigit()
             or not internal_code.isdigit()
             or len(internal_code) != 14
+            or (
+                has_pid_parameter
+                and (not platform_pid.isalnum() or not 6 <= len(platform_pid) <= 9)
+            )
         ):
             return _invalid_survey_link(request)
 
@@ -1258,6 +1586,31 @@ def survey_start(request):
         if supplier_code != expected_supplier_code:
             return _invalid_survey_link(request)
 
+        detail_provider = None
+        if provider_code == "cint":
+            try:
+                detail_provider = get_provider(survey.integration)
+                redirect_ready = detail_provider.redirect_contract_is_current(survey)
+            except Exception:
+                logger.exception(
+                    "Could not validate Cint supplier-link state survey=%s", survey.pk
+                )
+                redirect_ready = False
+            if not redirect_ready:
+                try:
+                    from .tasks import sync_cint_redirects_task
+
+                    sync_cint_redirects_task.delay(survey.integration_id, batch_size=25)
+                except Exception:
+                    logger.exception(
+                        "Could not queue Cint supplier-link repair survey=%s", survey.pk
+                    )
+                return _invalid_survey_link(
+                    request,
+                    "This survey link is still being secured. Please try again shortly.",
+                    status_code=503,
+                )
+
         stale = survey.targeting_synced_at is None or (
             survey.source_modified_at and survey.targeting_synced_at < survey.source_modified_at
         )
@@ -1275,7 +1628,7 @@ def survey_start(request):
         if stale:
             try:
                 if survey.integration_id and has_provider(survey.integration.provider_code):
-                    get_provider(survey.integration).refresh_details(survey)
+                    (detail_provider or get_provider(survey.integration)).refresh_details(survey)
                 else:
                     replace_survey_targeting(InnovateMRClient(integration=survey.integration), survey)
             except Exception:
@@ -1298,6 +1651,11 @@ def survey_start(request):
                 "The provider entry link is temporarily unavailable. Please try again shortly.",
                 status_code=503,
             )
+        entry_location = resolve_entry_geolocation(request)
+        entry_client_data = {
+            **get_request_client_data(request),
+            **geolocation_client_data(entry_location),
+        }
         try:
             with transaction.atomic():
                 allocation_context = resolve_vendor_survey_context(
@@ -1310,7 +1668,8 @@ def survey_start(request):
                     survey,
                     platform_user,
                     get_request_ip(request),
-                    client_data=get_request_client_data(request),
+                    client_data=entry_client_data,
+                    pid=platform_pid or None,
                 )
                 if allocation_context:
                     reserve_attempt_capacity(
@@ -1337,6 +1696,29 @@ def survey_start(request):
         return _invalid_survey_link(request, status_code=404)
     attempt = backfill_attempt_entry_audit(attempt, request)
 
+    entry_location = {
+        "ip": attempt.initiation_ip or "",
+        "country_code": (attempt.entry_client_data or {}).get("geo_country_code", ""),
+        "country": (attempt.entry_client_data or {}).get("geo_country", ""),
+        "postal_code": (attempt.entry_client_data or {}).get("geo_postal_code", ""),
+        "source": (attempt.entry_client_data or {}).get("geo_source", ""),
+    }
+    if not entry_location["country_code"] and request.method == "GET":
+        entry_location = resolve_entry_geolocation(request)
+        geo_updates = geolocation_client_data(entry_location)
+        if geo_updates:
+            merged_client_data = {**(attempt.entry_client_data or {}), **geo_updates}
+            SurveyAttempt.objects.filter(pk=attempt.pk).update(entry_client_data=merged_client_data)
+            attempt.entry_client_data = merged_client_data
+    if (
+        attempt.status == SurveyAttempt.Status.INITIATED
+        and is_wrong_target_country(attempt.survey, entry_location)
+    ):
+        attempt = _finish_wrong_target_country_attempt(attempt, request, entry_location)
+        return HttpResponseRedirect(
+            f"{reverse('survey-status')}?{urlencode({'status': '4', 'rid': attempt.rid})}"
+        )
+
     if request.method == "POST":
         # A browser retry after a successful submission must not call the
         # provider or allocate another cross-database respondent identity.
@@ -1348,8 +1730,6 @@ def survey_start(request):
         if not errors:
             try:
                 prescreener_uid = ensure_attempt_prescreener_uid(attempt)
-                if settings.PRESCREENER_VAULT_ENABLED:
-                    capture_prescreener_submission(attempt, answers)
                 provider = (
                     get_provider(attempt.survey.integration)
                     if attempt.survey.integration_id
@@ -1359,10 +1739,28 @@ def survey_start(request):
                 if provider and attempt.survey.integration.provider_code == "rfg":
                     eligible, reason = provider.validate_prescreener(attempt.survey, answers)
                     if not eligible:
+                        if settings.PRESCREENER_VAULT_ENABLED:
+                            capture_prescreener_submission(
+                                attempt,
+                                answers_with_entry_postal_code(attempt, answers),
+                            )
                         _finish_local_rfg_attempt(
                             attempt, answers, request, result="7", reason=reason
                         )
                         return HttpResponseRedirect(_rfg_result_url(attempt.rid, "7"))
+
+                # Select reuse before writing a new vault row. A reused
+                # respondent keeps the original vault RID + UID pair and only
+                # that row's Visits counter increases. The SurveyAttempt RID is
+                # still unique so callbacks cannot collide between journeys.
+                reuse_event = maybe_assign_reusable_profile(attempt, answers)
+                if settings.PRESCREENER_VAULT_ENABLED and reuse_event is None:
+                    capture_prescreener_submission(
+                        attempt,
+                        answers_with_entry_postal_code(attempt, answers),
+                    )
+
+                if provider and attempt.survey.integration.provider_code == "rfg":
                     if provider.duplicate_check(
                         attempt.survey,
                         attempt,
@@ -1456,18 +1854,43 @@ RFG_CALLBACK_IPS = {
 
 
 def _rfg_attempt_from_request(request):
-    """Resolve an RFG callback using the platform RID sent as RFG ``rid``."""
+    """Resolve RFG TID first, then the UID echoed in RFG's ``rid`` field.
+
+    Provider parameter names never replace platform identity. A successful UID
+    lookup returns its SurveyAttempt row, whose immutable 10-character ``rid``
+    remains the canonical journey key in callbacks, reports and status logic.
+    """
 
     base = SurveyAttempt.objects.select_related("survey__integration").filter(
         survey__integration__provider_code="rfg"
     )
-    for name in ("rid", "RID"):
+    matched_attempt = None
+    for name in ("tid", "TID", "trackId"):
         value = str(request.GET.get(name) or "").strip()
         if value:
             attempt = base.filter(rid=value).first()
             if attempt:
-                return attempt
-    return None
+                if matched_attempt and matched_attempt.pk != attempt.pk:
+                    return None
+                matched_attempt = attempt
+    for name in ("rid", "RID", "pid", "PID", "qsid", "QSID"):
+        value = str(request.GET.get(name) or "").strip()
+        if value:
+            if matched_attempt and value in {
+                matched_attempt.rid,
+                matched_attempt.pid,
+                matched_attempt.prescreener_uid,
+                matched_attempt.provider_profile_uid,
+            }:
+                continue
+            attempt = base.filter(
+                Q(rid=value) | Q(prescreener_uid=value) | Q(provider_profile_uid=value)
+            ).order_by("-initiated_at").first()
+            if attempt:
+                if matched_attempt and matched_attempt.pk != attempt.pk:
+                    return None
+                matched_attempt = attempt
+    return matched_attempt
 
 
 @require_http_methods(["GET"])
@@ -1532,7 +1955,8 @@ class RFGCallbackAPIView(APIView):
             "RFG callback preview endpoint to safely understand result/live codes without writing data."
         ),
         parameters=[
-            OpenApiParameter("rid", OpenApiTypes.STR, required=True, description="Platform 10-character attempt RID echoed from RFG RID"),
+            OpenApiParameter("tid", OpenApiTypes.STR, required=False, description="Platform 10-character attempt RID echoed from RFG TID"),
+            OpenApiParameter("rid", OpenApiTypes.STR, required=True, description="Persistent prescreener UID echoed from RFG RID; used to resolve the canonical platform RID"),
             OpenApiParameter("result", OpenApiTypes.STR, required=True, description="RFG result code"),
             OpenApiParameter("ruledOutBy", OpenApiTypes.STR, required=False, description="RFG termination reason"),
             OpenApiParameter("sesskey", OpenApiTypes.STR, required=False, description="RFG session identifier"),
@@ -1753,24 +2177,42 @@ def survey_status(request):
     enligne_identifier = (
         request.GET.get("aff_sub") or request.GET.get("AFF_SUB") or ""
     ).strip()
-    callback_identifier = (
-        _enligne_rid_from_identifier(enligne_identifier)
-        if enligne_identifier
-        else status_rid_from_request(request)
-    )
+    callback_identifiers = status_identifiers_from_request(request)
+    if enligne_identifier:
+        enligne_rid = _enligne_rid_from_identifier(enligne_identifier)
+        callback_identifiers = [
+            value for value in [enligne_rid, *callback_identifiers] if value
+        ]
+    callback_identifier = callback_identifiers[0] if callback_identifiers else ""
     page = STATUS_PAGES.get(status_code)
     if page is None or not callback_identifier:
         return render(request, "surveys/flow_error.html", {
             "title": "Invalid survey status",
-            "message": "A valid status (1–4) and RID are required.",
+            "message": "A valid status (1–4) and tracking ID are required.",
         }, status=400)
 
-    # Public callbacks resolve only the canonical 10-character attempt RID.
-    attempts = SurveyAttempt.objects.filter(rid=callback_identifier)
+    attempts = SurveyAttempt.objects.select_related("survey__integration")
     if enligne_identifier:
-        attempts = attempts.filter(survey__integration__provider_code="enligne")
-    attempt = attempts.first()
+        attempt = attempts.filter(
+            rid=callback_identifier,
+            survey__integration__provider_code="enligne",
+        ).first()
+    else:
+        attempt = attempts.filter(rid__in=callback_identifiers).first()
+        if attempt is None:
+            attempt = attempts.filter(pid__in=callback_identifiers).first()
+        if attempt is None:
+            attempt = attempts.filter(prescreener_uid__in=callback_identifiers).first()
+        if attempt is None:
+            attempt = attempts.filter(
+                provider_profile_uid__in=callback_identifiers
+            ).order_by("-initiated_at").first()
     canonical_rid = attempt.rid if attempt else callback_identifier
+    provider_code = (
+        attempt.survey.integration.provider_code
+        if attempt and attempt.survey.integration_id
+        else ""
+    )
     ip_address = get_request_ip(request)
     if attempt and enligne_identifier:
         attempt, _ = _record_enligne_s2s_result(
@@ -1781,8 +2223,61 @@ def survey_status(request):
         )
         status_label = attempt.get_status_display()
     elif attempt:
-        attempt = _record_browser_result(attempt, status_code, request)
+        canonical_query = set(request.GET.keys()) == {"status", "pid"} and (
+            request.GET.get("pid", "").strip() == attempt.pid
+        )
+        with transaction.atomic():
+            attempt = SurveyAttempt.objects.select_related(
+                "survey__integration"
+            ).select_for_update().get(pk=attempt.pk)
+            now = timezone.now()
+            exit_client_data = get_request_client_data(request)
+            first_callback = attempt.callback_at is None
+            if first_callback:
+                attempt.callback_at = now
+                attempt.callback_ip = ip_address
+                attempt.loi_seconds = attempt.calculate_loi_seconds(now)
+                attempt.status = status_code
+                attempt.exit_user_agent = exit_client_data.get("user_agent", "")
+                attempt.exit_browser = exit_client_data.get("browser", "")
+                attempt.exit_device = exit_client_data.get("device", "")
+                attempt.exit_os = exit_client_data.get("os", "")
+                attempt.exit_client_data = exit_client_data
+                attempt.status_source = "browser_callback"
+            update_fields = [
+                "callback_at", "callback_ip", "loi_seconds", "status",
+                "exit_user_agent", "exit_browser", "exit_device", "exit_os",
+                "exit_client_data", "status_source",
+            ]
+            if first_callback or not canonical_query:
+                attempt.last_callback_at = now
+                attempt.callback_count += 1
+                update_fields.extend(["last_callback_at", "callback_count"])
+            if not canonical_query:
+                callback_data = dict(request.GET.items())
+                if "hash" in callback_data:
+                    callback_data["hash"] = "[redacted]"
+                audit_key = (
+                    "rfg_browser_return" if provider_code == "rfg"
+                    else "cint_browser_return" if provider_code == "cint"
+                    else "browser_return"
+                )
+                audit = {
+                    **(attempt.upstream_transaction_data or {}),
+                    audit_key: callback_data,
+                }
+                if provider_code == "rfg":
+                    audit["rfg_outcome"] = describe_rfg_outcome(
+                        callback_data, attempt=attempt
+                    )
+                attempt.upstream_transaction_data = audit
+                update_fields.append("upstream_transaction_data")
+            attempt.save(update_fields=list(dict.fromkeys(update_fields + ["updated_at"])))
+            finalize_attempt_capacity(attempt)
         status_label = attempt.get_status_display()
+        if not canonical_query:
+            clean_query = urlencode({"status": status_code, "pid": attempt.pid})
+            return HttpResponseRedirect(f"{reverse('survey-status')}?{clean_query}")
     else:
         status_label = "Unknown attempt"
 
@@ -1790,6 +2285,8 @@ def survey_status(request):
         **page,
         "status_label": status_label,
         "rid": canonical_rid,
+        "pid": attempt.pid if attempt else callback_identifier,
+        "display_rid": provider_code == "rfg",
         "ip_address": ip_address,
         "loi_seconds": attempt.loi_seconds if attempt else None,
         "attempt_found": bool(attempt),
@@ -1896,6 +2393,23 @@ class SurveyViewSet(viewsets.ReadOnlyModelViewSet):
             Q(integration__isnull=True) | Q(integration__is_active=True)
         )
         queryset = scope_surveys_for_user(inventory, self.request.user)
+        queryset = scope_surveys_for_api_key(queryset, self.request.auth)
+        queryset = annotate_survey_pricing_for_user(queryset, self.request.user)
+        completed_attempts = (
+            SurveyAttempt.objects.filter(
+                survey_id=OuterRef("pk"),
+                status=SurveyAttempt.Status.COMPLETED,
+            )
+            .values("survey_id")
+            .annotate(total=Count("pk"))
+            .values("total")[:1]
+        )
+        queryset = queryset.annotate(
+            platform_completes=Coalesce(
+                Subquery(completed_attempts, output_field=IntegerField()),
+                Value(0),
+            )
+        )
         if self.action == "retrieve":
             queryset = queryset.prefetch_related("quotas", "targeting_questions")
         return queryset
@@ -1919,7 +2433,15 @@ class SurveyViewSet(viewsets.ReadOnlyModelViewSet):
         cpi_filtering = any(self.request.query_params.get(name) not in {None, ""} for name in ("min_cpi", "max_cpi"))
         if (cpi_ordering or cpi_filtering) and not has_function_access(self.request.user, "projects.filter.cpi"):
             raise PermissionDenied("Your account cannot filter or sort projects by CPI.")
-        return super().filter_queryset(queryset)
+        queryset = super().filter_queryset(queryset)
+        if cpi_ordering:
+            direction = "-" if self.request.query_params.get("ordering", "").startswith("-") else ""
+            queryset = queryset.order_by(
+                f"{direction}visible_cpi",
+                "-source_modified_at",
+                "-created_at",
+            )
+        return queryset
 
     def get_serializer_class(self):
         return SurveyDetailSerializer if self.action == "retrieve" else SurveyListSerializer
@@ -1942,9 +2464,9 @@ class SurveyViewSet(viewsets.ReadOnlyModelViewSet):
             OpenApiParameter("created_to", OpenApiTypes.DATETIME, description="Source-created timestamp upper bound."),
             OpenApiParameter("modified_from", OpenApiTypes.DATETIME, description="Source-modified timestamp lower bound."),
             OpenApiParameter("modified_to", OpenApiTypes.DATETIME, description="Source-modified timestamp upper bound."),
-            OpenApiParameter("min_cpi", OpenApiTypes.NUMBER, description="Minimum CPI, inclusive."),
-            OpenApiParameter("max_cpi", OpenApiTypes.NUMBER, description="Maximum CPI, inclusive."),
-            OpenApiParameter("ordering", OpenApiTypes.STR, description="Current Projects ordering, including cpi or -cpi."),
+            OpenApiParameter("min_cpi", OpenApiTypes.NUMBER, description="Minimum viewer-visible CPI after configured cuts, inclusive."),
+            OpenApiParameter("max_cpi", OpenApiTypes.NUMBER, description="Maximum viewer-visible CPI after configured cuts, inclusive."),
+            OpenApiParameter("ordering", OpenApiTypes.STR, description="Current Projects ordering, including viewer-visible cpi or -cpi."),
         ],
         responses={(200, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"): OpenApiTypes.BINARY},
     )
@@ -1993,7 +2515,7 @@ class SurveyViewSet(viewsets.ReadOnlyModelViewSet):
         try:
             self._refresh_if_stale(survey, "quotas")
         except (InnovateMRAPIError, ProviderError) as exc:
-            if survey.quota_synced_at is None:
+            if survey.quota_synced_at is None and not survey.quotas.exists():
                 raise UpstreamUnavailable(str(exc)) from exc
         return Response(SurveyQuotaSerializer(survey.quotas.all(), many=True).data)
 
@@ -2009,7 +2531,7 @@ class SurveyViewSet(viewsets.ReadOnlyModelViewSet):
         try:
             self._refresh_if_stale(survey, "targeting")
         except (InnovateMRAPIError, ProviderError) as exc:
-            if survey.targeting_synced_at is None:
+            if survey.targeting_synced_at is None and not survey.targeting_questions.exists():
                 raise UpstreamUnavailable(str(exc)) from exc
         return Response(TargetingQuestionSerializer(survey.targeting_questions.all(), many=True).data)
 
@@ -2107,6 +2629,11 @@ class SurveyAttemptViewSet(viewsets.ReadOnlyModelViewSet):
             mobile=Count("id", filter=completed_filter & (Q(entry_device__icontains="mobile") | Q(entry_device__icontains="phone"))),
             tablet=Count("id", filter=completed_filter & (Q(entry_device__icontains="tablet") | Q(entry_device__iexact="tab"))),
             total_revenue=Sum("source_cpi_snapshot", filter=completed_filter, default=Decimal("0.00")),
+            supplier_revenue=Sum(
+                Coalesce("payable_cpi_snapshot", "source_cpi_snapshot"),
+                filter=completed_filter,
+                default=Decimal("0.00"),
+            ),
             revenue_currency=Max("cpi_currency_snapshot", filter=completed_filter),
         )
         completed = summary["completed"]
@@ -2163,6 +2690,8 @@ class SurveyAttemptViewSet(viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         queryset = SurveyAttempt.objects.select_related(
             "survey", "survey__client", "survey__integration", "platform_user", "platform_user__employee_profile", "platform_user__employee_profile__role",
+            "platform_user__employee_profile__organization_unit", "platform_user__employee_profile__organization_unit__parent",
+            "platform_user__employee_profile__organization_unit__parent__parent",
             "vendor", "vendor__employee_profile", "client", "client_allocation", "survey_allocation",
         ).all()
         if self.request.user.is_superuser:
@@ -2221,6 +2750,8 @@ class SurveyAttemptViewSet(viewsets.ReadOnlyModelViewSet):
         queryset = self.filter_queryset(self.get_queryset())
         local_now = timezone.localtime()
         headers, rows, widths = _attempt_excel_rows(queryset, request.user)
+        if not headers:
+            raise PermissionDenied("No Traffic Report columns are assigned to your account.")
         return build_excel_response(
             f"traffic-reports-{local_now:%Y%m%d-%H%M%S}-IST.xlsx",
             [ExcelSheet("Traffic Reports", headers, rows, widths)],
@@ -2414,9 +2945,17 @@ def _excel_datetime(value):
 
 
 def _survey_excel_rows(queryset, request, columns):
+    can_view_client_name = has_function_access(request.user, "projects.column.client_name")
+    survey_headers = ["Survey ID", "Survey name"]
+    survey_widths = [16, 32]
+    if can_view_client_name:
+        survey_headers.append("Client")
+        survey_widths.append(21)
+    survey_headers.append("Buyer ID")
+    survey_widths.append(15)
     headers_by_column = {
         "project_id": ["Project ID"],
-        "survey": ["Survey ID", "Survey name", "Client", "Buyer ID"],
+        "survey": survey_headers,
         "market": ["Country code", "Country", "Language code", "Language"],
         "completes": ["Sample size", "Completes", "Remaining", "Progress (%)"],
         "cpi": ["CPI"],
@@ -2425,7 +2964,7 @@ def _survey_excel_rows(queryset, request, columns):
         "modified": ["Status", "Source created at", "Source modified at", "Record created at", "Record updated at"],
     }
     widths_by_column = {
-        "project_id": [19], "survey": [16, 32, 21, 15], "market": [13, 20, 14, 18],
+        "project_id": [19], "survey": survey_widths, "market": [13, 20, 14, 18],
         "completes": [13, 12, 12, 14], "cpi": [11], "loi_ir": [15, 18, 14],
         "entry_link": [48], "modified": [14, 22, 22, 22, 22],
     }
@@ -2439,11 +2978,11 @@ def _survey_excel_rows(queryset, request, columns):
             data = SurveyListSerializer(survey, context=serializer_context).data
             values_by_column = {
                 "project_id": [data.get("local_id")],
-                "survey": [
-                    data.get("source_id"), data.get("name"),
-                    data.get("client_name") or data.get("display_company_name") or data.get("company_name"),
-                    data.get("buyer_id"),
-                ],
+                "survey": (
+                    [data.get("source_id"), data.get("name")]
+                    + ([data.get("client_name") or data.get("display_company_name") or data.get("company_name")] if can_view_client_name else [])
+                    + [data.get("buyer_id")]
+                ),
                 "market": [data.get("country_code"), data.get("country"), data.get("language_code"), data.get("language")],
                 "completes": [data.get("sample_size"), data.get("completes"), data.get("remaining"), data.get("progress_percent")],
                 "cpi": [data.get("cpi")],
@@ -2460,63 +2999,82 @@ def _survey_excel_rows(queryset, request, columns):
 
 
 def _attempt_excel_rows(queryset, requesting_user=None):
-    # These labels intentionally mirror the operational workbook requested by the client.
-    headers = [
-        "Project id", "Cleint survey id", "PID", "RID", "Status", "Status source",
-        "Client name", "Country", "Study type", "Actual LOI", "Current Client CPI",
-        "Client entry link CPI", "Vendor CPI", "Vendor name", "User name", "Device",
-        "OS", "Browser", "User agent", "Entry IP", "Exit IP", "Inisitate at",
-        "Presecreent at", "Redirect at", "entry date time", "Exit date time",
-    ]
-    widths = [
-        19, 18, 12, 14, 19, 18, 21, 18, 13, 12, 18, 20, 14, 20, 22, 13,
-        16, 18, 42, 16, 16, 22, 22, 22, 22, 22,
-    ]
-    hide_source_cpi = is_external_vendor_scope(requesting_user)
-    def visible_cpi(value):
-        if hide_source_cpi or value is None:
-            return None
-        return visible_cpi_for_user(requesting_user, value)
+    """Build Traffic Report rows without leaking upstream commercial data.
+
+    Platform admins receive the source CPI, computed supplier CPI and supplier
+    identity. Scoped/cut users receive only their adjusted CPI in the two client
+    CPI columns; supplier commercial columns do not exist in their workbook.
+    """
+
+    commercial_admin = can_view_report_commercials(requesting_user)
+    permitted = set(_permitted_columns(
+        effective_permission_codes(requesting_user), STUDY_COLUMN_PERMISSIONS
+    ))
+    specs = {
+        "project_id": (["Project id", "Client name"], [19, 21]),
+        "survey_id": (["Cleint survey id"], [18]),
+        "pid": (["PID"], [12]),
+        "respondent_id": (["RID"], [14]),
+        "status": (["Status", "Status source"], [19, 18]),
+        "country": (["Country"], [18]),
+        "cpi": (
+            ["Current Client CPI", "Client entry link CPI"]
+            + (["Vendor CPI", "Vendor name"] if commercial_admin else []),
+            [18, 20] + ([14, 20] if commercial_admin else []),
+        ),
+        "user": (["User name"], [22]),
+        "device": (["Device", "OS", "Browser", "User agent"], [13, 16, 18, 42]),
+        "ip": (["Entry IP", "Exit IP"], [16, 16]),
+        "loi": (["Actual LOI (minutes)"], [19]),
+        "start": (
+            ["Inisitate at", "Presecreent at", "Redirect at", "entry date time"],
+            [22, 22, 22, 22],
+        ),
+        "end": (["Exit date time"], [22]),
+    }
+    ordered_columns = [column for column in STUDY_COLUMN_PERMISSIONS if column in permitted]
+    headers = [header for column in ordered_columns for header in specs[column][0]]
+    widths = [width for column in ordered_columns for width in specs[column][1]]
 
     def rows():
         for attempt in queryset.iterator(chunk_size=1000):
             survey = attempt.survey
             user = attempt.platform_user
-            supplier = attempt.vendor
             client = attempt.client or survey.client
             status_label = (
                 "Initiated"
                 if attempt.status in {SurveyAttempt.Status.INITIATED, SurveyAttempt.Status.REDIRECTED}
                 else attempt.get_status_display()
             )
-            yield [
-                survey.local_id,
-                survey.source_identifier,
-                attempt.user_id or (user.pk if user else ""),
-                attempt.rid,
-                status_label,
-                attempt.status_source,
-                client.name if client else survey.company_name,
-                survey.country or survey.country_code,
-                survey.survey_type or survey.group_type,
-                attempt.loi_seconds,
-                visible_cpi(survey.cpi),
-                visible_cpi(attempt.source_cpi_snapshot),
-                visible_cpi_for_user(requesting_user, attempt.payable_cpi_snapshot),
-                (supplier.get_full_name() or supplier.username) if supplier else "",
-                (user.get_full_name() or user.username) if user else "Deleted user",
-                attempt.entry_device,
-                attempt.entry_os,
-                attempt.entry_browser,
-                attempt.entry_user_agent,
-                attempt.initiation_ip,
-                attempt.callback_ip,
-                _excel_datetime(attempt.initiated_at),
-                _excel_datetime(attempt.submitted_at),
-                _excel_datetime(attempt.redirected_at),
-                _excel_datetime(attempt.created_at),
-                _excel_datetime(attempt.callback_at or attempt.last_callback_at),
-            ]
+            values_by_column = {
+                "project_id": [survey.local_id, client.name if client else survey.company_name],
+                "survey_id": [survey.source_identifier],
+                "pid": [attempt.pid],
+                "respondent_id": [attempt.rid],
+                "status": [status_label, attempt.status_source],
+                "country": [survey.country or survey.country_code],
+                "cpi": [
+                    viewer_attempt_cpi(attempt, requesting_user, current=True),
+                    viewer_attempt_cpi(attempt, requesting_user),
+                    *(
+                        [supplier_cpi_for_admin(attempt), supplier_label_for_admin(attempt)]
+                        if commercial_admin else []
+                    ),
+                ],
+                "user": [(user.get_full_name() or user.username) if user else "Deleted user"],
+                "device": [
+                    attempt.entry_device, attempt.entry_os, attempt.entry_browser,
+                    attempt.entry_user_agent,
+                ],
+                "ip": [attempt.initiation_ip, attempt.callback_ip],
+                "loi": [round((attempt.loi_seconds or 0) / 60, 2)],
+                "start": [
+                    _excel_datetime(attempt.initiated_at), _excel_datetime(attempt.submitted_at),
+                    _excel_datetime(attempt.redirected_at), _excel_datetime(attempt.created_at),
+                ],
+                "end": [_excel_datetime(attempt.callback_at or attempt.last_callback_at)],
+            }
+            yield [value for column in ordered_columns for value in values_by_column[column]]
 
     return headers, rows(), widths
 

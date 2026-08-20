@@ -18,6 +18,7 @@ from .views import (
     prescreener_data_page,
     prescreener_data_export,
     termination_reasons_page,
+    termination_reasons_export,
     user_hits_page,
     biobrain_survey_return,
     enligne_survey_postback,
@@ -27,6 +28,7 @@ from .views import (
     survey_status,
     workspace_home,
 )
+from .webhook_views import cint_opportunities_webhook
 
 router = DefaultRouter()
 router.register("surveys", SurveyViewSet, basename="survey")
@@ -36,6 +38,7 @@ router.register("sync-runs", SyncRunViewSet, basename="sync-run")
 router.register("survey-attempts", SurveyAttemptViewSet, basename="survey-attempt")
 
 urlpatterns = [
+    path("api/cint/webhook/surveys", cint_opportunities_webhook, name="cint-opportunities-webhook"),
     path("survey/start", survey_start, name="survey-start"),
     path("survey/return/s<int:status_code>/", biobrain_survey_return, name="biobrain-survey-return"),
     path("survey/enligne/postback", enligne_survey_postback, name="enligne-survey-postback"),
@@ -50,6 +53,7 @@ urlpatterns = [
     path("prescreened-data/", prescreener_data_page, name="prescreened-data"),
     path("prescreened-data/export/", prescreener_data_export, name="prescreened-data-export"),
     path("termination-reasons/", termination_reasons_page, name="termination-reasons"),
+    path("termination-reasons/export/", termination_reasons_export, name="termination-reasons-export"),
     path("user-hits/", user_hits_page, name="user-hits"),
     path("api/v1/dashboard/", DashboardAPIView.as_view(), name="dashboard-api"),
     path("api/v1/user-hits/", UserHitsAPIView.as_view(), name="user-hits-api"),

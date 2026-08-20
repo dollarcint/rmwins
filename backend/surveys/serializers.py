@@ -7,12 +7,8 @@ from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from accounts.access import has_function_access
-from vendors.access import is_external_vendor_scope, vendor_scope_user_id
-from vendors.services import (
-    organization_client_ids_for_user,
-    survey_pricing_for_user,
-    visible_cpi_for_user,
-)
+from vendors.access import vendor_scope_user_id
+from vendors.services import organization_client_ids_for_user, survey_pricing_for_user
 
 from .models import (
     CanonicalOption,
@@ -26,10 +22,12 @@ from .models import (
     TargetingQuestion,
 )
 from .outcomes import provider_outcome
+from .report_pricing import viewer_attempt_cpi
 from .rfg_text import clean_rfg_display_text, clean_rfg_options
 
 
 class SurveyQuotaSerializer(serializers.ModelSerializer):
+    display_name = serializers.SerializerMethodField(help_text="Readable quota title without exposing provider-internal quota IDs.")
     status = serializers.SerializerMethodField(help_text="Current quota state; RFG zero-remaining quotas are reported as Full.")
     target_known = serializers.SerializerMethodField(help_text="True only when the provider supplied a target total.")
     completed_known = serializers.SerializerMethodField(help_text="True only when the provider supplied a completed total.")
@@ -40,7 +38,7 @@ class SurveyQuotaSerializer(serializers.ModelSerializer):
     class Meta:
         model = SurveyQuota
         fields = [
-            "id", "quota_id", "title", "name", "sample_size", "remaining", "completes",
+            "id", "quota_id", "title", "name", "display_name", "sample_size", "remaining", "completes",
             "clicks", "status", "targeting", "target_known", "completed_known", "limit_type",
             "scope_label", "targeting_details", "updated_at",
         ]
@@ -48,6 +46,34 @@ class SurveyQuotaSerializer(serializers.ModelSerializer):
     @staticmethod
     def _is_rfg(obj) -> bool:
         return bool(obj.survey.integration_id and obj.survey.integration.provider_code == "rfg")
+
+    @staticmethod
+    def _is_toluna(obj) -> bool:
+        return bool(obj.survey.integration_id and obj.survey.integration.provider_code == "toluna")
+
+    @staticmethod
+    def _toluna_question_rows(obj) -> list:
+        raw = obj.raw_data or {}
+        layers = raw.get("Layers")
+        if not isinstance(layers, list):
+            layers = (obj.targeting or {}).get("layers")
+        rows = []
+        for layer in layers if isinstance(layers, list) else []:
+            if not isinstance(layer, dict):
+                continue
+            for subquota in layer.get("SubQuotas") or []:
+                if not isinstance(subquota, dict):
+                    continue
+                rows.extend(
+                    item for item in (subquota.get("QuestionsAndAnswers") or [])
+                    if isinstance(item, dict)
+                )
+        return rows
+
+    def get_display_name(self, obj) -> str:
+        if self._is_toluna(obj):
+            return self.get_scope_label(obj)
+        return obj.name or obj.title or "Survey quota"
 
     def get_status(self, obj) -> str:
         raw = obj.raw_data or {}
@@ -88,6 +114,8 @@ class SurveyQuotaSerializer(serializers.ModelSerializer):
         return datapoints if isinstance(datapoints, list) else []
 
     def get_scope_label(self, obj) -> str:
+        if self._is_toluna(obj):
+            return "Targeted respondent quota" if self._toluna_question_rows(obj) else "Overall survey quota"
         raw = obj.raw_data or {}
         quota_type = str(raw.get("SurveyQuotaType") or "").strip().lower()
         if quota_type:
@@ -112,6 +140,35 @@ class SurveyQuotaSerializer(serializers.ModelSerializer):
         if isinstance(normalized, list):
             return normalized
         questions = list(obj.survey.targeting_questions.all())
+        if self._is_toluna(obj):
+            question_map = {str(item.question_id): item for item in questions}
+            grouped = {}
+            for row in self._toluna_question_rows(obj):
+                question_id = str(row.get("QuestionID") or "").strip()
+                if not question_id:
+                    continue
+                question = question_map.get(question_id)
+                detail = grouped.setdefault(question_id, {
+                    "name": question.text if question else f"Qualification {question_id}",
+                    "values": [],
+                })
+                option_labels = {
+                    str(option.get("OptionId")): str(option.get("OptionText") or option.get("Translation") or option.get("OptionId"))
+                    for option in (question.options if question else [])
+                    if isinstance(option, dict)
+                }
+                values = row.get("AnswerValues") or []
+                if isinstance(values, str):
+                    values = [part.strip() for part in values.split(",") if part.strip()]
+                readable = [str(value) for value in values]
+                readable.extend(
+                    option_labels.get(str(value), str(value))
+                    for value in (row.get("AnswerIDs") or [])
+                )
+                for value in readable:
+                    if value and value not in detail["values"]:
+                        detail["values"].append(value)
+            return list(grouped.values())
         details = []
         for datapoint in self._quota_datapoints(obj):
             if not isinstance(datapoint, dict):
@@ -243,6 +300,7 @@ class SurveyListSerializer(serializers.ModelSerializer):
     display_company_name = serializers.SerializerMethodField()
     country_label = serializers.SerializerMethodField()
     progress_percent = serializers.SerializerMethodField()
+    completes = serializers.SerializerMethodField()
     source_created_display = serializers.SerializerMethodField()
     source_modified_display = serializers.SerializerMethodField()
     start_link = serializers.SerializerMethodField()
@@ -260,6 +318,15 @@ class SurveyListSerializer(serializers.ModelSerializer):
             "detail_synced_at", "quota_synced_at", "targeting_synced_at", "created_at", "updated_at",
             "progress_percent",
         ]
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get("request")
+        if request and not has_function_access(request.user, "projects.column.client_name"):
+            data["client_name"] = ""
+            data["display_company_name"] = ""
+            data["company_name"] = ""
+        return data
 
     def get_country_label(self, obj) -> str:
         return " ".join(part for part in [obj.country_code, obj.language_code] if part) or obj.country
@@ -280,7 +347,13 @@ class SurveyListSerializer(serializers.ModelSerializer):
         return obj.company_name
 
     def get_progress_percent(self, obj) -> float:
-        return round((obj.completes / obj.sample_size) * 100, 1) if obj.sample_size else 0
+        completes = self.get_completes(obj)
+        return round((completes / obj.sample_size) * 100, 1) if obj.sample_size else 0
+
+    def get_completes(self, obj) -> int:
+        """Return combined platform completes for every user on this survey."""
+
+        return int(getattr(obj, "platform_completes", obj.completes) or 0)
 
     def get_source_created_display(self, obj) -> str | None:
         raw_data = obj.raw_data or {}
@@ -524,6 +597,9 @@ class DashboardResponseSerializer(serializers.Serializer):
 
 
 class SurveyAttemptSerializer(serializers.ModelSerializer):
+    prescreener_uid = serializers.SerializerMethodField()
+    registered_profile_uid = serializers.CharField(source="prescreener_uid", read_only=True)
+    profile_was_reused = serializers.SerializerMethodField()
     survey_local_id = serializers.CharField(source="survey.local_id", read_only=True)
     survey_source_id = serializers.SerializerMethodField()
     survey_name = serializers.CharField(source="survey.name", read_only=True)
@@ -550,7 +626,7 @@ class SurveyAttemptSerializer(serializers.ModelSerializer):
     class Meta:
         model = SurveyAttempt
         fields = [
-            "rid", "prescreener_uid", "survey_local_id", "survey_source_id", "survey_name", "company_name", "country", "country_code",
+            "rid", "pid", "prescreener_uid", "registered_profile_uid", "profile_was_reused", "survey_local_id", "survey_source_id", "survey_name", "company_name", "country", "country_code",
             "language_code", "platform_user", "user_id", "user_name", "username", "user_email", "supplier",
             "supplier_name", "vendor", "vendor_name", "client", "client_name", "client_allocation", "survey_allocation", "supplier_code",
             "buyer_id", "source_cpi_snapshot", "cpi_snapshot_source", "cpi_cut_percent_snapshot", "payable_cpi_snapshot", "cpi_currency_snapshot",
@@ -567,6 +643,12 @@ class SurveyAttemptSerializer(serializers.ModelSerializer):
         if not obj.platform_user:
             return "Deleted user"
         return obj.platform_user.get_full_name() or obj.platform_user.username
+
+    def get_prescreener_uid(self, obj) -> str:
+        return obj.provider_profile_uid or obj.prescreener_uid or ""
+
+    def get_profile_was_reused(self, obj) -> bool:
+        return bool(obj.provider_profile_uid)
 
     def get_survey_source_id(self, obj) -> str:
         return str(obj.survey.source_identifier)
@@ -586,14 +668,12 @@ class SurveyAttemptSerializer(serializers.ModelSerializer):
     @extend_schema_field(serializers.DecimalField(max_digits=12, decimal_places=2, allow_null=True))
     def get_source_cpi_snapshot(self, obj):
         request = self.context.get("request")
-        if request and is_external_vendor_scope(request.user):
-            return None
-        return visible_cpi_for_user(request.user, obj.source_cpi_snapshot) if request else obj.source_cpi_snapshot
+        return viewer_attempt_cpi(obj, request.user) if request else obj.source_cpi_snapshot
 
     @extend_schema_field(serializers.DecimalField(max_digits=12, decimal_places=2, allow_null=True))
     def get_payable_cpi_snapshot(self, obj):
         request = self.context.get("request")
-        return visible_cpi_for_user(request.user, obj.payable_cpi_snapshot) if request else obj.payable_cpi_snapshot
+        return viewer_attempt_cpi(obj, request.user) if request else obj.payable_cpi_snapshot
 
     def get_status_label(self, obj) -> str:
         if obj.status in {SurveyAttempt.Status.INITIATED, SurveyAttempt.Status.REDIRECTED}:

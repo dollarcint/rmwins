@@ -63,15 +63,50 @@ def _normalize_profile_value(attribute: str, value) -> str:
     return cleaned.lower()[:191]
 
 
+def _canonical_dimension_key(value) -> str:
+    """Use one stable JSON key for mappings learned from every provider."""
+
+    return _clean_token(value)
+
+
+def _provider_mapping_index(survey, questions):
+    """Load canonical question/option mappings once for a submission.
+
+    Mappings are code-owned operational metadata in the primary database.  The
+    vault stores only the resulting provider-neutral key/value snapshot, which
+    keeps future matching independent from provider question IDs.
+    """
+
+    if not questions or not getattr(survey, "integration_id", None):
+        return {}
+    from surveys.models import ProviderQuestionMapping
+
+    provider_code = str(survey.integration.provider_code or "").strip().lower()
+    external_ids = [str(question.question_id) for question in questions.values()]
+    mappings = (
+        ProviderQuestionMapping.objects.filter(
+            provider_code=provider_code,
+            country_code__iexact=str(survey.country_code or ""),
+            language_code__iexact=str(survey.language_code or ""),
+            external_question_id__in=external_ids,
+            is_active=True,
+        )
+        .select_related("canonical_question")
+        .prefetch_related("option_mappings__canonical_option")
+    )
+    return {str(mapping.external_question_id): mapping for mapping in mappings}
+
+
 def _age_group(age: int | None) -> str:
     if age is None:
         return ""
-    if age < 18:
-        return "under-18"
-    for lower, upper in ((18, 24), (25, 34), (35, 44), (45, 54), (55, 64)):
+    for lower, upper in (
+        (13, 17), (18, 24), (25, 29), (30, 34),
+        (35, 39), (40, 44), (45, 49), (50, 54),
+    ):
         if lower <= age <= upper:
             return f"{lower}-{upper}"
-    return "65+"
+    return ""
 
 
 def _age_from_value(value, submitted_at) -> int | None:
@@ -101,6 +136,7 @@ def _question_snapshots(attempt, answers):
         str(question.pk): question
         for question in attempt.survey.targeting_questions.filter(pk__in=question_ids)
     }
+    provider_mappings = _provider_mapping_index(attempt.survey, questions)
     snapshots = []
     dimensions = {
         "country": [attempt.survey.country_code or attempt.survey.country] if (attempt.survey.country_code or attempt.survey.country) else [],
@@ -123,10 +159,37 @@ def _question_snapshots(attempt, answers):
         labels = [option_map.get(value, value) for value in values]
         question_key = str(payload.get("question_key") or (question.key if question else ""))
         question_text = str(payload.get("question_text") or (question.text if question else ""))
-        question_type = str(question.question_type if question else "")
-        question_category = str(question.category if question else "")
-        canonical = _canonical_attribute(question_key, question_text, question_category)
-        reusable_values = labels or values or upstream_values
+        question_type = str(
+            payload.get("question_type") or (question.question_type if question else "")
+        )
+        question_category = str(
+            payload.get("question_category") or (question.category if question else "")
+        )
+        mapping = provider_mappings.get(str(question.question_id)) if question else None
+        explicit_canonical = (
+            (question.raw_data or {}).get("canonical_key") if question else ""
+        ) or (mapping.canonical_question.code if mapping else "")
+        canonical = _canonical_dimension_key(
+            explicit_canonical
+            or _canonical_attribute(question_key, question_text, question_category)
+            or (f"{attempt.survey.integration.provider_code}_{question.question_id}" if question else "")
+        )
+        mapped_values = []
+        if mapping:
+            option_values = {
+                str(item.external_value): str(
+                    item.canonical_value
+                    or (item.canonical_option.normalized_value if item.canonical_option_id else "")
+                    or (item.canonical_option.code if item.canonical_option_id else "")
+                )
+                for item in mapping.option_mappings.all()
+                if item.is_active
+            }
+            for value in values + upstream_values:
+                mapped = option_values.get(str(value))
+                if mapped and mapped not in mapped_values:
+                    mapped_values.append(mapped)
+        reusable_values = mapped_values or labels or values or upstream_values
         normalized_values = [_normalize_profile_value(canonical, value) for value in reusable_values]
         normalized_values = [value for value in normalized_values if value]
         if canonical and normalized_values:
@@ -162,6 +225,72 @@ def _question_snapshots(attempt, answers):
     return snapshots, dimensions, age, _age_group(age), gender, ethnicity, postal_code
 
 
+def answers_with_entry_postal_code(attempt, answers):
+    """Add an IP-derived postal value to the vault payload only when absent.
+
+    The returned synthetic answer is never passed to the provider and is never
+    rendered as a prescreener question. It exists solely in Panelist Data.
+    """
+
+    enriched = copy.deepcopy(answers or {})
+    *_, postal_code = _question_snapshots(attempt, enriched)
+    geo_postal = str((attempt.entry_client_data or {}).get("geo_postal_code") or "").strip()
+    if postal_code or not geo_postal:
+        return enriched
+    enriched["system_ip_postal"] = {
+        "question_id": "system_ip_postal",
+        "question_key": "postal_code",
+        "question_text": "Postal code (derived from entry IP)",
+        "values": [geo_postal],
+        "upstream_values": [geo_postal],
+    }
+    return enriched
+
+
+def wrong_target_country_answers(attempt, location):
+    """Build the vault-only audit answers for an entry-country rejection."""
+
+    actual_code = str((location or {}).get("country_code") or "").upper()
+    actual_name = str((location or {}).get("country") or "").strip()
+    actual = " · ".join(value for value in (actual_code, actual_name) if value)
+    expected_code = str(attempt.survey.country_code or "").upper()
+    expected_name = str(attempt.survey.country or "").strip()
+    expected = " · ".join(value for value in (expected_code, expected_name) if value)
+    answers = {
+        "system_target_validation": {
+            "question_id": "system_target_validation",
+            "question_key": "entry_validation",
+            "question_text": "Entry validation result",
+            "values": ["Wrong target country"],
+            "upstream_values": ["Wrong target country"],
+        },
+        "system_detected_market": {
+            "question_id": "system_detected_market",
+            "question_key": "detected_market",
+            "question_text": "Detected entry market",
+            "values": [actual or "Unknown"],
+            "upstream_values": [actual_code or actual or "Unknown"],
+        },
+        "system_target_market": {
+            "question_id": "system_target_market",
+            "question_key": "target_market",
+            "question_text": "Required survey market",
+            "values": [expected or "Unknown"],
+            "upstream_values": [expected_code or expected or "Unknown"],
+        },
+    }
+    geo_postal = str((location or {}).get("postal_code") or "").strip()
+    if geo_postal:
+        answers["system_ip_postal"] = {
+            "question_id": "system_ip_postal",
+            "question_key": "postal_code",
+            "question_text": "Postal code (derived from entry IP)",
+            "values": [geo_postal],
+            "upstream_values": [geo_postal],
+        }
+    return answers
+
+
 def capture_prescreener_submission(attempt, answers, *, submitted_at=None):
     """Persist one immutable, idempotent RID/UID submission in the vault."""
     if not settings.PRESCREENER_VAULT_ENABLED:
@@ -174,6 +303,10 @@ def capture_prescreener_submission(attempt, answers, *, submitted_at=None):
     attempt.submitted_at = submitted_at
     snapshots, dimensions, age, age_group, gender, ethnicity, postal_code = _question_snapshots(attempt, answers)
     survey = attempt.survey
+    integration = getattr(survey, "integration", None)
+    source_client_code = str(
+        getattr(getattr(integration, "client", None), "code", "") or ""
+    ).strip().lower()
     raw_answers = copy.deepcopy(answers)
 
     try:
@@ -184,6 +317,12 @@ def capture_prescreener_submission(attempt, answers, *, submitted_at=None):
                     raise PrescreenerVaultError("Vault UID is already mapped to a different RID.")
                 if existing.raw_answers != raw_answers:
                     raise PrescreenerVaultError("This RID/UID already has a different immutable submission.")
+                if not existing.source_client_code and source_client_code:
+                    PrescreenerSubmission.objects.using(DATABASE_ALIAS).filter(
+                        pk=existing.pk, source_client_code=""
+                    ).update(source_client_code=source_client_code)
+                    existing.source_client_code = source_client_code
+                    transaction.on_commit(invalidate_vault_cache, using=DATABASE_ALIAS)
                 return existing, False
             rid_owner = PrescreenerSubmission.objects.using(DATABASE_ALIAS).filter(rid=attempt.rid).first()
             if rid_owner:
@@ -192,6 +331,7 @@ def capture_prescreener_submission(attempt, answers, *, submitted_at=None):
             submission = PrescreenerSubmission.objects.using(DATABASE_ALIAS).create(
                 uid=uid,
                 rid=attempt.rid,
+                source_client_code=source_client_code,
                 country=survey.country,
                 country_code=survey.country_code.upper(),
                 language=survey.language,

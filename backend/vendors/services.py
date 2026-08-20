@@ -6,7 +6,19 @@ from decimal import Decimal, ROUND_HALF_UP
 
 from django.conf import settings
 from django.db import transaction
-from django.db.models import Count, F, Prefetch, Q
+from django.db.models import (
+    Count,
+    DecimalField,
+    Exists,
+    ExpressionWrapper,
+    F,
+    OuterRef,
+    Prefetch,
+    Q,
+    Subquery,
+    Value,
+)
+from django.db.models.functions import Coalesce, Least, Round
 from django.utils import timezone
 
 from accounts.models import EmployeeProfile
@@ -18,6 +30,7 @@ from .models import (
     OrganizationClientAccess,
     OrganizationUnit,
     VendorClientAllocation,
+    VendorAPIKey,
     VendorSurveyAllocation,
 )
 
@@ -34,9 +47,42 @@ class AllocationUnavailable(ValueError):
 class VendorSurveyContext:
     vendor_id: int
     client_allocation: VendorClientAllocation
-    survey_allocation: VendorSurveyAllocation
+    survey_allocation: VendorSurveyAllocation | None
     cpi_cut_percent: Decimal
     payable_cpi: Decimal | None
+
+
+@dataclass(frozen=True)
+class OrganizationClientPolicy:
+    """The closest explicit rule for one client in a user's unit ancestry."""
+
+    client_id: int
+    is_active: bool
+    min_cpi: Decimal | None
+    max_cpi: Decimal | None
+    source_unit_id: int
+
+
+def _cpi_in_range(value, minimum, maximum) -> bool:
+    if value is None:
+        return minimum is None and maximum is None
+    return not ((minimum is not None and value < minimum) or (maximum is not None and value > maximum))
+
+
+def _survey_policy_q(policies, *, cpi_field="cpi"):
+    """Build a per-client visibility predicate without exposing uncapped siblings."""
+
+    combined = Q(pk__in=[])
+    for policy in policies:
+        if not policy.is_active:
+            continue
+        clause = Q(client_id=policy.client_id)
+        if policy.min_cpi is not None:
+            clause &= Q(**{f"{cpi_field}__gte": policy.min_cpi})
+        if policy.max_cpi is not None:
+            clause &= Q(**{f"{cpi_field}__lte": policy.max_cpi})
+        combined |= clause
+    return combined
 
 
 def organization_unit_rollup_counts(workspace_owner_ids) -> dict[str, dict[int, int]]:
@@ -53,13 +99,12 @@ def organization_unit_rollup_counts(workspace_owner_ids) -> dict[str, dict[int, 
         .values("organization_unit_id")
         .annotate(total=Count("id"))
     }
-    direct_clients: dict[int, set[int]] = {}
-    for unit_id, client_id in OrganizationClientAccess.objects.filter(
+    direct_client_rules: dict[int, dict[int, bool]] = {}
+    for unit_id, client_id, is_active in OrganizationClientAccess.objects.filter(
         organization_unit_id__in=unit_ids,
-        is_active=True,
         client__is_active=True,
-    ).values_list("organization_unit_id", "client_id"):
-        direct_clients.setdefault(unit_id, set()).add(client_id)
+    ).values_list("organization_unit_id", "client_id", "is_active"):
+        direct_client_rules.setdefault(unit_id, {})[client_id] = is_active
 
     children: dict[int, list[int]] = {}
     for row in units:
@@ -68,14 +113,28 @@ def organization_unit_rollup_counts(workspace_owner_ids) -> dict[str, dict[int, 
 
     member_rollups: dict[int, int] = {}
     client_rollups: dict[int, set[int]] = {}
+    effective_clients: dict[int, set[int]] = {}
+
+    def apply_inheritance(unit_id: int, inherited: dict[int, bool], trail=frozenset()):
+        if unit_id in trail:
+            return
+        policies = dict(inherited)
+        policies.update(direct_client_rules.get(unit_id, {}))
+        effective_clients[unit_id] = {client_id for client_id, allowed in policies.items() if allowed}
+        for child_id in children.get(unit_id, []):
+            apply_inheritance(child_id, policies, trail | {unit_id})
+
+    roots = [row["id"] for row in units if row["parent_id"] not in unit_ids]
+    for root_id in roots:
+        apply_inheritance(root_id, {})
 
     def visit(unit_id: int, trail: frozenset[int] = frozenset()) -> tuple[int, set[int]]:
         if unit_id in member_rollups:
             return member_rollups[unit_id], client_rollups[unit_id]
         if unit_id in trail:
-            return direct_members.get(unit_id, 0), set(direct_clients.get(unit_id, set()))
+            return direct_members.get(unit_id, 0), set(effective_clients.get(unit_id, set()))
         members = direct_members.get(unit_id, 0)
-        clients = set(direct_clients.get(unit_id, set()))
+        clients = set(effective_clients.get(unit_id, set()))
         next_trail = trail | {unit_id}
         for child_id in children.get(unit_id, []):
             child_members, child_clients = visit(child_id, next_trail)
@@ -92,7 +151,10 @@ def organization_unit_rollup_counts(workspace_owner_ids) -> dict[str, dict[int, 
         "members": member_rollups,
         "clients": {unit_id: len(client_ids) for unit_id, client_ids in client_rollups.items()},
         "direct_members": {unit_id: direct_members.get(unit_id, 0) for unit_id in unit_ids},
-        "direct_clients": {unit_id: len(direct_clients.get(unit_id, set())) for unit_id in unit_ids},
+        "direct_clients": {
+            unit_id: sum(1 for allowed in direct_client_rules.get(unit_id, {}).values() if allowed)
+            for unit_id in unit_ids
+        },
     }
 
 
@@ -129,58 +191,87 @@ def _available_quantity_q(prefix="") -> Q:
     })
 
 
-def organization_client_ids_for_user(user) -> set[int] | None:
-    """Return the nearest explicit unit grant set for an assigned employee.
+def organization_client_policies_for_user(user) -> dict[int, OrganizationClientPolicy] | None:
+    """Resolve per-client Branch -> Sub-branch -> Shift inheritance.
 
-    An exact Shift grant overrides broader Sub-branch/Branch grants. When the
-    Shift has no direct grants, the closest ancestor with grants is inherited.
-    Root and unassigned accounts remain unscoped for backward compatibility.
+    Every child inherits each parent client independently. A child rule only
+    overrides that same client, so it can disable access or replace the CPI
+    range without accidentally removing unrelated parent grants.
     """
 
     if user.is_superuser:
-        user._organization_client_ids_cache = None
+        user._organization_client_policies_cache = None
         return None
-    if hasattr(user, "_organization_client_ids_cache"):
-        return user._organization_client_ids_cache
+    if hasattr(user, "_organization_client_policies_cache"):
+        return user._organization_client_policies_cache
     profile = EmployeeProfile.objects.select_related(
         "organization_unit__parent__parent"
     ).filter(user=user).first()
     if not profile or not profile.organization_unit_id:
-        user._organization_client_ids_cache = None
+        user._organization_client_policies_cache = None
         return None
     current_unit = profile.organization_unit
+    ancestry = []
     visited_units = set()
     while current_unit and current_unit.pk not in visited_units:
         visited_units.add(current_unit.pk)
         if not current_unit.is_active:
-            user._organization_client_ids_cache = set()
-            return set()
-        direct_client_ids = set(
-            OrganizationClientAccess.objects.filter(
-                organization_unit=current_unit,
-                client__is_active=True,
-                is_active=True,
-            ).values_list("client_id", flat=True)
-        )
-        if direct_client_ids:
-            user._organization_client_ids_cache = direct_client_ids
-            return direct_client_ids
+            user._organization_client_policies_cache = {}
+            return {}
+        ancestry.append(current_unit.pk)
         current_unit = current_unit.parent
-    user._organization_client_ids_cache = set()
-    return set()
+    rules = OrganizationClientAccess.objects.filter(
+        organization_unit_id__in=ancestry,
+        client__is_active=True,
+    ).values(
+        "organization_unit_id",
+        "client_id",
+        "is_active",
+        "min_cpi",
+        "max_cpi",
+        "inherit_cpi_range",
+    )
+    rules_by_unit = {}
+    for rule in rules:
+        rules_by_unit.setdefault(rule["organization_unit_id"], []).append(rule)
+    policies = {}
+    for unit_id in reversed(ancestry):
+        for rule in rules_by_unit.get(unit_id, []):
+            parent_policy = policies.get(rule["client_id"])
+            inherit_cpi_range = bool(rule["inherit_cpi_range"] and parent_policy is not None)
+            policies[rule["client_id"]] = OrganizationClientPolicy(
+                client_id=rule["client_id"],
+                is_active=rule["is_active"],
+                min_cpi=parent_policy.min_cpi if inherit_cpi_range else rule["min_cpi"],
+                max_cpi=parent_policy.max_cpi if inherit_cpi_range else rule["max_cpi"],
+                source_unit_id=unit_id,
+            )
+    user._organization_client_policies_cache = policies
+    return policies
+
+
+def organization_client_ids_for_user(user) -> set[int] | None:
+    policies = organization_client_policies_for_user(user)
+    if policies is None:
+        return None
+    return {client_id for client_id, policy in policies.items() if policy.is_active}
 
 
 def scope_surveys_for_user(queryset, user):
-    """Expose only explicitly allocated projects with client and project capacity."""
+    """Expose every project under an active client grant.
+
+    Project allocations are optional overrides. When one exists it can disable
+    or cap that one project; otherwise the shared client complete cap applies.
+    """
 
     vendor_id = vendor_scope_user_id(user)
-    organization_client_ids = organization_client_ids_for_user(user)
+    organization_policies = organization_client_policies_for_user(user)
     if not vendor_id:
-        if organization_client_ids is None:
+        if organization_policies is None:
             return queryset
-        return queryset.filter(client_id__in=organization_client_ids).distinct()
+        return queryset.filter(_survey_policy_q(organization_policies.values())).distinct()
     now = timezone.now()
-    client_allocations = (
+    client_allocations = list(
         VendorClientAllocation.objects.filter(
             vendor_id=vendor_id,
             vendor__is_active=True,
@@ -192,27 +283,73 @@ def scope_surveys_for_user(queryset, user):
         .filter(_available_quantity_q())
         .select_related("vendor", "vendor__employee_profile", "vendor__vendor_commercial_profile", "client")
     )
+    if not client_allocations:
+        return queryset.none()
+    allocation_ids = [row.pk for row in client_allocations]
+    supplier_policies = [
+        OrganizationClientPolicy(
+            client_id=row.client_id,
+            is_active=True,
+            min_cpi=row.min_cpi,
+            max_cpi=row.max_cpi,
+            source_unit_id=0,
+        )
+        for row in client_allocations
+    ]
+    all_project_rules = VendorSurveyAllocation.objects.filter(
+        client_allocation_id__in=allocation_ids,
+        survey_id=OuterRef("pk"),
+    )
     available_rules = (
-        VendorSurveyAllocation.objects.filter(client_allocation__in=client_allocations, is_active=True)
+        VendorSurveyAllocation.objects.filter(client_allocation_id__in=allocation_ids, is_active=True)
         .filter(_active_window_q(now))
         .filter(_available_quantity_q())
         .select_related("client_allocation", "client_allocation__vendor", "client_allocation__vendor__employee_profile")
     )
     scoped = (
-        queryset.filter(vendor_allocations__in=available_rules, remaining__gt=0)
+        queryset.filter(_survey_policy_q(supplier_policies), remaining__gt=0)
+        .annotate(
+            request_has_project_rule=Exists(all_project_rules),
+            request_has_available_project_rule=Exists(
+                available_rules.filter(survey_id=OuterRef("pk"))
+            ),
+        )
+        .filter(
+            Q(request_has_project_rule=False)
+            | Q(request_has_available_project_rule=True)
+        )
         .prefetch_related(
-            Prefetch("client__vendor_allocations", queryset=client_allocations, to_attr="request_vendor_allocations"),
+            Prefetch(
+                "client__vendor_allocations",
+                queryset=VendorClientAllocation.objects.filter(pk__in=allocation_ids).select_related(
+                    "vendor", "vendor__employee_profile", "vendor__vendor_commercial_profile", "client"
+                ),
+                to_attr="request_vendor_allocations",
+            ),
             Prefetch("vendor_allocations", queryset=available_rules, to_attr="request_vendor_survey_allocations"),
         )
         .distinct()
     )
-    if organization_client_ids is not None:
-        scoped = scoped.filter(client_id__in=organization_client_ids)
+    if organization_policies is not None:
+        scoped = scoped.filter(_survey_policy_q(organization_policies.values()))
     return scoped
 
 
+def scope_surveys_for_api_key(queryset, api_key):
+    """Apply the client grants explicitly selected when an API key was issued."""
+
+    if not isinstance(api_key, VendorAPIKey):
+        return queryset
+    client_ids = api_key.client_allocations.filter(
+        vendor_id=api_key.vendor_id,
+        is_active=True,
+        client__is_active=True,
+    ).values("client_id")
+    return queryset.filter(client_id__in=Subquery(client_ids)).distinct()
+
+
 def role_cpi_visibility_percent(user) -> Decimal:
-    """Return the configured CPI percentage visible to an employee role."""
+    """Return the configured CPI percentage for an internal employee role."""
 
     profile = getattr(user, "employee_profile", None)
     role = getattr(profile, "role", None) if profile else None
@@ -230,18 +367,17 @@ def role_cpi_visibility_percent(user) -> Decimal:
 
 
 def visible_amount_for_user(user, value) -> Decimal | None:
-    """Apply employee role visibility to a monetary total without a per-CPI cap."""
+    """Apply role visibility to a monetary total without the per-survey cap."""
 
     if value is None:
         return None
-    visible_percent = role_cpi_visibility_percent(user)
     return (
-        Decimal(value) * visible_percent / Decimal("100.00")
+        Decimal(value) * role_cpi_visibility_percent(user) / Decimal("100.00")
     ).quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
 
 
 def visible_cpi_for_user(user, value) -> Decimal | None:
-    """Apply the single role CPI policy used by projects, reports and exports."""
+    """Apply Alessar's role cut and Manager $5 maximum CPI policy."""
 
     visible_cpi = visible_amount_for_user(user, value)
     profile = getattr(user, "employee_profile", None)
@@ -254,16 +390,20 @@ def visible_cpi_for_user(user, value) -> Decimal | None:
         and role
         and role.slug == "manager"
     ):
-        visible_cpi = min(visible_cpi, MANAGER_CPI_CAP)
+        return min(visible_cpi, MANAGER_CPI_CAP)
     return visible_cpi
 
 
 def resolve_vendor_survey_context(user, survey: Survey, *, require_capacity=True, for_update=False):
-    """Resolve the supplier's active client grant and mandatory project allocation."""
+    """Resolve the supplier client grant and optional per-project override."""
 
-    organization_client_ids = organization_client_ids_for_user(user)
-    if organization_client_ids is not None and survey.client_id not in organization_client_ids:
-        raise AllocationUnavailable("This client is not assigned to the user's organization unit.")
+    organization_policies = organization_client_policies_for_user(user)
+    if organization_policies is not None:
+        organization_policy = organization_policies.get(survey.client_id)
+        if not organization_policy or not organization_policy.is_active:
+            raise AllocationUnavailable("This client is not assigned to the user's organization unit.")
+        if not _cpi_in_range(survey.cpi, organization_policy.min_cpi, organization_policy.max_cpi):
+            raise AllocationUnavailable("This project's CPI is outside the organization unit's allowed range.")
     vendor_id = vendor_scope_user_id(user)
     if not vendor_id:
         return None
@@ -283,6 +423,8 @@ def resolve_vendor_survey_context(user, survey: Survey, *, require_capacity=True
     ).first()
     if not client_allocation or not _is_active_now(client_allocation, now):
         raise AllocationUnavailable("This client is not allocated to the supplier.")
+    if not _cpi_in_range(survey.cpi, client_allocation.min_cpi, client_allocation.max_cpi):
+        raise AllocationUnavailable("This project's CPI is outside the supplier's client policy.")
     if require_capacity and client_allocation.remaining_quantity < 1:
         raise AllocationUnavailable("Client quantity is exhausted.")
 
@@ -293,17 +435,19 @@ def resolve_vendor_survey_context(user, survey: Survey, *, require_capacity=True
         client_allocation=client_allocation,
         survey=survey,
     ).first()
-    if not survey_allocation:
-        raise AllocationUnavailable("This project is not allocated to the supplier.")
-    if not _is_active_now(survey_allocation, now):
+    if survey_allocation and not _is_active_now(survey_allocation, now):
         raise AllocationUnavailable("This project is disabled or outside its allocation dates.")
-    if require_capacity and survey_allocation.remaining_quantity < 1:
+    if require_capacity and survey_allocation and survey_allocation.remaining_quantity < 1:
         raise AllocationUnavailable("Project complete cap is exhausted.")
     if require_capacity and survey.remaining < 1:
         raise AllocationUnavailable("Upstream survey quantity is exhausted.")
 
     account_type = client_allocation.vendor.employee_profile.account_type
-    cut = survey_allocation.effective_cpi_cut_percent
+    cut = (
+        survey_allocation.effective_cpi_cut_percent
+        if survey_allocation
+        else client_allocation.effective_cpi_cut_percent
+    )
     if account_type == EmployeeProfile.AccountType.INTERNAL_VENDOR:
         cut = Decimal("0.00")
     return VendorSurveyContext(
@@ -347,6 +491,130 @@ def survey_pricing_for_user(user, survey: Survey) -> tuple[Decimal | None, Decim
     return apply_employee_role_percentage(context.payable_cpi, context.cpi_cut_percent)
 
 
+def annotate_survey_pricing_for_user(queryset, user, *, alias="visible_cpi"):
+    """Annotate the exact CPI displayed to ``user`` for DB filtering/sorting.
+
+    The serializer already applies supplier/client/project cuts and an employee
+    role's visibility percentage. Projects filters must use the same price,
+    otherwise a TL can see a cut CPI while filtering against the hidden source
+    CPI. The expression is rounded to cents to match the displayed/exported
+    value at inclusive range boundaries.
+    """
+
+    money_field = DecimalField(max_digits=18, decimal_places=2)
+    calculation_field = DecimalField(max_digits=20, decimal_places=8)
+    cut_field = DecimalField(max_digits=7, decimal_places=4)
+    hundred = Value(Decimal("100.00"), output_field=cut_field)
+    zero_cut = Value(Decimal("0.00"), output_field=cut_field)
+
+    profile = EmployeeProfile.objects.select_related("role").filter(user=user).first()
+    role_percent = Decimal("100.00")
+    if (
+        not getattr(user, "is_superuser", False)
+        and profile
+        and profile.account_type == EmployeeProfile.AccountType.EMPLOYEE
+        and profile.role_id
+    ):
+        role_percent = min(
+            Decimal("100.00"),
+            max(Decimal("0.00"), Decimal(profile.role.cpi_visibility_percent)),
+        )
+
+    vendor_id = vendor_scope_user_id(user)
+    cut_expression = zero_cut
+    if vendor_id:
+        vendor_profile = EmployeeProfile.objects.filter(user_id=vendor_id).first()
+        if (
+            vendor_profile
+            and vendor_profile.account_type != EmployeeProfile.AccountType.INTERNAL_VENDOR
+        ):
+            now = timezone.now()
+            client_cuts = (
+                VendorClientAllocation.objects.filter(
+                    vendor_id=vendor_id,
+                    vendor__is_active=True,
+                    vendor__vendor_commercial_profile__is_active=True,
+                    client_id=OuterRef("client_id"),
+                    client__is_active=True,
+                    is_active=True,
+                )
+                .filter(_active_window_q(now))
+                .filter(_available_quantity_q())
+                .annotate(
+                    resolved_cut=Coalesce(
+                        "cpi_cut_override_percent",
+                        "vendor__vendor_commercial_profile__default_cpi_cut_percent",
+                        zero_cut,
+                        output_field=cut_field,
+                    )
+                )
+                .values("resolved_cut")[:1]
+            )
+            project_cuts = (
+                VendorSurveyAllocation.objects.filter(
+                    client_allocation__vendor_id=vendor_id,
+                    client_allocation__vendor__is_active=True,
+                    client_allocation__vendor__vendor_commercial_profile__is_active=True,
+                    client_allocation__client_id=OuterRef("client_id"),
+                    client_allocation__client__is_active=True,
+                    client_allocation__is_active=True,
+                    survey_id=OuterRef("pk"),
+                    is_active=True,
+                )
+                .filter(_active_window_q(now))
+                .filter(_available_quantity_q())
+                .filter(_active_window_q(now, "client_allocation__"))
+                .filter(_available_quantity_q("client_allocation__"))
+                .annotate(
+                    resolved_cut=Coalesce(
+                        "cpi_cut_override_percent",
+                        "client_allocation__cpi_cut_override_percent",
+                        "client_allocation__vendor__vendor_commercial_profile__default_cpi_cut_percent",
+                        zero_cut,
+                        output_field=cut_field,
+                    )
+                )
+                .values("resolved_cut")[:1]
+            )
+            cut_expression = Coalesce(
+                Subquery(project_cuts, output_field=cut_field),
+                Subquery(client_cuts, output_field=cut_field),
+                zero_cut,
+                output_field=cut_field,
+            )
+
+    after_allocation_cut = ExpressionWrapper(
+        F("cpi") * (hundred - cut_expression) / hundred,
+        output_field=calculation_field,
+    )
+    visible_expression = ExpressionWrapper(
+        after_allocation_cut
+        * Value(role_percent, output_field=cut_field)
+        / hundred,
+        output_field=calculation_field,
+    )
+    if (
+        not getattr(user, "is_superuser", False)
+        and profile
+        and profile.account_type == EmployeeProfile.AccountType.EMPLOYEE
+        and profile.role_id
+        and profile.role.slug == "manager"
+    ):
+        visible_expression = Least(
+            visible_expression,
+            Value(MANAGER_CPI_CAP, output_field=money_field),
+        )
+    return queryset.annotate(
+        **{
+            alias: Round(
+                visible_expression,
+                precision=2,
+                output_field=money_field,
+            )
+        }
+    )
+
+
 @transaction.atomic
 def reserve_attempt_capacity(
     attempt: SurveyAttempt,
@@ -366,9 +634,7 @@ def reserve_attempt_capacity(
     if existing:
         return existing
 
-    if survey_allocation is None:
-        raise AllocationUnavailable("An explicit project allocation is required.")
-    if client_allocation is None:
+    if client_allocation is None and survey_allocation is not None:
         client_allocation = survey_allocation.client_allocation
     if client_allocation is None:
         raise AllocationUnavailable("A client allocation is required.")
@@ -391,23 +657,27 @@ def reserve_attempt_capacity(
         raise AllocationUnavailable("Supplier or client access is inactive.")
     if not commercial_profile or not commercial_profile.is_active:
         raise AllocationUnavailable("Supplier commercial access is inactive.")
-    if attempt.survey_id != locked_survey_allocation.survey_id:
+    if locked_survey_allocation and attempt.survey_id != locked_survey_allocation.survey_id:
         raise AllocationUnavailable("Attempt survey does not match the assigned survey.")
     if attempt.survey.client_id != client_allocation.client_id:
         raise AllocationUnavailable("Survey is not mapped to the allocation's client.")
     if not _is_active_now(client_allocation, now):
         raise AllocationUnavailable("Client allocation is inactive or outside its active dates.")
-    if not _is_active_now(locked_survey_allocation, now):
+    if locked_survey_allocation and not _is_active_now(locked_survey_allocation, now):
         raise AllocationUnavailable("Project allocation is inactive or outside its active dates.")
     if client_allocation.remaining_quantity < 1:
         raise AllocationUnavailable("Client quantity is exhausted.")
-    if locked_survey_allocation.remaining_quantity < 1:
+    if locked_survey_allocation and locked_survey_allocation.remaining_quantity < 1:
         raise AllocationUnavailable("Project complete cap is exhausted.")
     if attempt.survey.remaining < 1:
         raise AllocationUnavailable("Upstream survey quantity is exhausted.")
 
     vendor_profile = client_allocation.vendor.employee_profile
-    cut = locked_survey_allocation.effective_cpi_cut_percent
+    cut = (
+        locked_survey_allocation.effective_cpi_cut_percent
+        if locked_survey_allocation
+        else client_allocation.effective_cpi_cut_percent
+    )
     if vendor_profile.account_type == EmployeeProfile.AccountType.INTERNAL_VENDOR:
         cut = Decimal("0.00")
     source_cpi = attempt.survey.cpi
@@ -415,8 +685,9 @@ def reserve_attempt_capacity(
 
     client_allocation.reserved_quantity += 1
     client_allocation.save(update_fields=["reserved_quantity", "updated_at"])
-    locked_survey_allocation.reserved_quantity += 1
-    locked_survey_allocation.save(update_fields=["reserved_quantity", "updated_at"])
+    if locked_survey_allocation:
+        locked_survey_allocation.reserved_quantity += 1
+        locked_survey_allocation.save(update_fields=["reserved_quantity", "updated_at"])
 
     SurveyAttempt.objects.filter(pk=attempt.pk).update(
         vendor=client_allocation.vendor,

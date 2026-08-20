@@ -11,6 +11,18 @@ from django.db.models import F, Q
 
 PERCENTAGE_VALIDATORS = [MinValueValidator(Decimal("0.00")), MaxValueValidator(Decimal("100.00"))]
 
+PROFILE_REUSE_AGE_GROUPS = (
+    "13-17", "18-24", "25-29", "30-34", "35-39", "40-44", "45-49", "50-54",
+)
+
+
+def default_profile_reuse_age_groups():
+    return list(PROFILE_REUSE_AGE_GROUPS)
+
+
+def default_profile_reuse_genders():
+    return ["male", "female"]
+
 
 class Client(models.Model):
     """A survey buyer/source account controlled by the platform owner."""
@@ -59,6 +71,75 @@ class ClientIntegration(models.Model):
         help_text="Provider credential names mapped to environment-variable names; never secret values.",
     )
     config = models.JSONField(default=dict, blank=True, help_text="Non-secret provider configuration.")
+    profile_reuse_enabled = models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text="Allow this client to receive an eligible previously registered profile UID.",
+    )
+    profile_reuse_eligible_after_days = models.PositiveSmallIntegerField(
+        default=60,
+        validators=[MinValueValidator(1), MaxValueValidator(730)],
+        help_text="Minimum age of a registered UID before it enters the reuse queue.",
+    )
+    profile_reuse_monthly_percentage = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=Decimal("30.00"),
+        validators=PERCENTAGE_VALIDATORS,
+        help_text="Percentage of the previous calendar month's attempts available as this month's reuse budget.",
+    )
+    profile_reuse_country_codes = models.JSONField(
+        default=list,
+        blank=True,
+        help_text="Allowed ISO country codes. Empty means every country served by this integration.",
+    )
+    profile_reuse_age_groups = models.JSONField(
+        default=default_profile_reuse_age_groups,
+        blank=True,
+    )
+    profile_reuse_genders = models.JSONField(
+        default=default_profile_reuse_genders,
+        blank=True,
+    )
+    profile_rereuse_enabled = models.BooleanField(
+        default=False,
+        help_text="Allow profiles that already completed one reuse round to enter a separate queue.",
+    )
+    profile_rereuse_percentage = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        default=Decimal("50.00"),
+        validators=PERCENTAGE_VALIDATORS,
+        help_text="Share of the monthly reuse target reserved for already-reused profiles.",
+    )
+    profile_rereuse_cooldown_days = models.PositiveSmallIntegerField(
+        default=30,
+        validators=[MinValueValidator(1), MaxValueValidator(730)],
+        help_text="Minimum cooldown after a profile reuse before it can be used again.",
+    )
+    profile_reuse_first_delay_minutes = models.PositiveIntegerField(
+        default=86400,
+        validators=[MinValueValidator(1), MaxValueValidator(1051200)],
+        help_text=(
+            "Minimum age of a newly registered profile before its first reuse, "
+            "stored in minutes so the policy can be expressed in minutes, hours, or days."
+        ),
+    )
+    profile_reuse_min_interval_minutes = models.PositiveIntegerField(
+        default=43200,
+        validators=[MinValueValidator(1), MaxValueValidator(1051200)],
+        help_text="Minimum time between two reuses of the same UID.",
+    )
+    profile_reuse_max_uses_per_window = models.PositiveSmallIntegerField(
+        default=1,
+        validators=[MinValueValidator(1), MaxValueValidator(1000)],
+        help_text="Maximum reuses allowed for one UID inside the configured rolling window.",
+    )
+    profile_reuse_window_minutes = models.PositiveIntegerField(
+        default=1440,
+        validators=[MinValueValidator(1), MaxValueValidator(1051200)],
+        help_text="Rolling window used by the per-UID reuse limit.",
+    )
     encrypted_api_token = models.TextField(blank=True, editable=False)
     credential_fingerprint = models.CharField(max_length=64, blank=True, editable=False)
     credential_last_four = models.CharField(max_length=4, blank=True, editable=False)
@@ -260,6 +341,26 @@ class OrganizationClientAccess(models.Model):
         related_name="client_access_rules",
     )
     client = models.ForeignKey(Client, on_delete=models.PROTECT, related_name="organization_access_rules")
+    min_cpi = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal("0.00"))],
+        help_text="Optional source-CPI floor inherited by child units.",
+    )
+    max_cpi = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal("0.00"))],
+        help_text="Optional source-CPI ceiling inherited by child units.",
+    )
+    inherit_cpi_range = models.BooleanField(
+        default=True,
+        help_text="When enabled, a child rule keeps the closest parent rule's CPI range.",
+    )
     is_active = models.BooleanField(default=True, db_index=True)
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -278,6 +379,10 @@ class OrganizationClientAccess(models.Model):
                 fields=["organization_unit", "client"],
                 name="unique_client_access_per_organization_unit",
             ),
+            models.CheckConstraint(
+                condition=Q(min_cpi__isnull=True) | Q(max_cpi__isnull=True) | Q(min_cpi__lte=F("max_cpi")),
+                name="organization_client_cpi_range_valid",
+            ),
         ]
         indexes = [
             models.Index(fields=["organization_unit", "is_active"]),
@@ -293,6 +398,8 @@ class OrganizationClientAccess(models.Model):
             errors["client"] = "Select a client."
         if errors:
             raise ValidationError(errors)
+        if self.min_cpi is not None and self.max_cpi is not None and self.min_cpi > self.max_cpi:
+            raise ValidationError({"max_cpi": "Maximum CPI must be greater than or equal to minimum CPI."})
         owner = self.organization_unit.workspace_owner
         profile = getattr(owner, "employee_profile", None)
         if getattr(profile, "account_type", "") == "internal_vendor":
@@ -375,6 +482,12 @@ class VendorAPIKey(models.Model):
         on_delete=models.PROTECT,
         related_name="vendor_api_keys",
     )
+    client_allocations = models.ManyToManyField(
+        "VendorClientAllocation",
+        blank=True,
+        related_name="api_keys",
+        help_text="Client grants this key may expose. Project visibility and caps still follow the live allocation rules.",
+    )
     name = models.CharField(max_length=120)
     prefix = models.CharField(max_length=16, db_index=True)
     last_four = models.CharField(max_length=4)
@@ -434,6 +547,22 @@ class VendorClientAllocation(models.Model):
         validators=PERCENTAGE_VALIDATORS,
         help_text="Optional client-specific cut. Blank uses the supplier commercial default.",
     )
+    min_cpi = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal("0.00"))],
+        help_text="Optional source-CPI floor for this supplier/client grant.",
+    )
+    max_cpi = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(Decimal("0.00"))],
+        help_text="Optional source-CPI ceiling for this supplier/client grant.",
+    )
     starts_at = models.DateTimeField(null=True, blank=True)
     ends_at = models.DateTimeField(null=True, blank=True)
     is_active = models.BooleanField(default=True, db_index=True)
@@ -459,6 +588,10 @@ class VendorClientAllocation(models.Model):
                 condition=Q(reserved_quantity__lte=F("quantity_limit") - F("consumed_quantity")),
                 name="client_reserved_within_remaining",
             ),
+            models.CheckConstraint(
+                condition=Q(min_cpi__isnull=True) | Q(max_cpi__isnull=True) | Q(min_cpi__lte=F("max_cpi")),
+                name="vendor_client_cpi_range_valid",
+            ),
         ]
         indexes = [models.Index(fields=["vendor", "is_active"]), models.Index(fields=["client", "is_active"])]
 
@@ -481,6 +614,8 @@ class VendorClientAllocation(models.Model):
             raise ValidationError({"vendor": "Client allocations can only be assigned to supplier accounts."})
         if account_type == "internal_vendor" and self.cpi_cut_override_percent not in {None, Decimal("0.00")}:
             raise ValidationError({"cpi_cut_override_percent": "Internal suppliers cannot have a CPI cut."})
+        if self.min_cpi is not None and self.max_cpi is not None and self.min_cpi > self.max_cpi:
+            raise ValidationError({"max_cpi": "Maximum CPI must be greater than or equal to minimum CPI."})
         if self.ends_at and self.starts_at and self.ends_at <= self.starts_at:
             raise ValidationError({"ends_at": "End time must be after start time."})
         if self.consumed_quantity + self.reserved_quantity > self.quantity_limit:

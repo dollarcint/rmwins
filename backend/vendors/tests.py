@@ -1,7 +1,9 @@
 from datetime import timedelta
 from decimal import Decimal
+from pathlib import Path
 
 from django.contrib.auth import get_user_model
+from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.test import TestCase
 from django.urls import reverse
@@ -42,10 +44,12 @@ class VendorFoundationTests(TestCase):
         self.employee = User.objects.create_user("ordinary-employee")
         EmployeeProfile.objects.filter(user=self.internal).update(
             account_type=EmployeeProfile.AccountType.INTERNAL_VENDOR,
+            role=Role.objects.get(slug="admin"),
             created_by=self.owner,
         )
         EmployeeProfile.objects.filter(user=self.external).update(
             account_type=EmployeeProfile.AccountType.EXTERNAL_VENDOR,
+            role=Role.objects.get(slug="external-vendor"),
             created_by=self.owner,
         )
         self.client_record = Client.objects.create(
@@ -206,7 +210,7 @@ class VendorFoundationTests(TestCase):
         with self.assertRaisesMessage(AllocationUnavailable, "Project complete cap is exhausted"):
             reserve_attempt_capacity(self.attempt("Ua7Hh8Ii9J"), self.external_survey_allocation)
 
-    def test_client_grant_requires_explicit_project_allocation(self):
+    def test_client_grant_exposes_all_projects_and_uses_shared_capacity(self):
         unallocated_survey = Survey.objects.create(
             client=self.client_record,
             source_id=88002,
@@ -238,7 +242,7 @@ class VendorFoundationTests(TestCase):
         listing = api.get(reverse("survey-list"))
         self.assertEqual(listing.status_code, 200)
         rows = {item["source_id"]: item for item in listing.data["results"]}
-        self.assertEqual(set(rows), {88001})
+        self.assertEqual(set(rows), {88001, 88002})
 
         start = self.client.get(
             reverse("survey-start"),
@@ -249,8 +253,17 @@ class VendorFoundationTests(TestCase):
                 "code": unallocated_survey.local_id,
             },
         )
-        self.assertEqual(start.status_code, 400)
-        self.assertFalse(SurveyAttempt.objects.filter(survey=unallocated_survey).exists())
+        self.assertEqual(start.status_code, 302)
+        created_attempt = SurveyAttempt.objects.get(survey=unallocated_survey)
+        reservation = created_attempt.allocation_reservation
+        self.assertEqual(reservation.client_allocation, self.external_client_allocation)
+        self.assertIsNone(reservation.survey_allocation)
+
+        created_attempt.status = SurveyAttempt.Status.COMPLETED
+        created_attempt.save(update_fields=["status"])
+        finalize_attempt_capacity(created_attempt)
+        self.external_client_allocation.refresh_from_db()
+        self.assertEqual(self.external_client_allocation.consumed_quantity, 1)
 
     def test_superuser_can_manage_foundation_api_and_employee_cannot(self):
         owner_api = APIClient()
@@ -263,7 +276,7 @@ class VendorFoundationTests(TestCase):
         self.assertEqual(response.status_code, 201)
         directory = owner_api.get(reverse("vendor-directory-list"))
         self.assertEqual(directory.status_code, 200)
-        self.assertEqual(directory.data["count"], 2)
+        self.assertEqual(directory.data["count"], 1)
 
         employee_api = APIClient()
         employee_api.force_authenticate(self.employee)
@@ -325,7 +338,7 @@ class VendorFoundationTests(TestCase):
         self.assertEqual(self.external_client_allocation.reserved_quantity, 0)
         self.assertEqual(self.external_survey_allocation.reserved_quantity, 0)
 
-    def test_inactive_project_allocation_hides_project_without_client_fallback(self):
+    def test_inactive_project_override_hides_only_that_project(self):
         second = Survey.objects.create(
             client=self.client_record,
             source_id=88004,
@@ -344,7 +357,22 @@ class VendorFoundationTests(TestCase):
         api = APIClient()
         api.force_authenticate(self.external)
         ids = {row["source_id"] for row in api.get(reverse("survey-list")).data["results"]}
-        self.assertEqual(ids, set())
+        self.assertEqual(ids, {88004})
+
+    def test_external_client_cpi_range_filters_list_and_direct_start(self):
+        self.external_client_allocation.min_cpi = Decimal("11.00")
+        self.external_client_allocation.max_cpi = Decimal("20.00")
+        self.external_client_allocation.save(update_fields=["min_cpi", "max_cpi"])
+        UserFunctionOverride.objects.create(
+            user=self.external,
+            function=AccessFunction.objects.get(code="projects.view"),
+            effect=UserFunctionOverride.Effect.ALLOW,
+        )
+        api = APIClient()
+        api.force_authenticate(self.external)
+        self.assertEqual(api.get(reverse("survey-list")).data["count"], 0)
+        with self.assertRaisesMessage(AllocationUnavailable, "outside"):
+            resolve_vendor_survey_context(self.external, self.survey)
 
     def test_allocation_manager_can_open_workspace_and_use_safe_options(self):
         for code in ("allocations.view", "vendors.tab.clients", "vendors.column.client.client"):
@@ -361,7 +389,7 @@ class VendorFoundationTests(TestCase):
         self.assertNotContains(page, "Project allocations")
         options = self.client.get(reverse("vendor-management-options"))
         self.assertEqual(options.status_code, 200)
-        self.assertEqual(len(options.json()["vendors"]), 2)
+        self.assertEqual(len(options.json()["vendors"]), 1)
         self.assertIn(self.client_record.pk, {item["id"] for item in options.json()["clients"]})
         self.assertEqual(self.client.get(reverse("vendor-survey-allocation-list")).status_code, 403)
 
@@ -374,6 +402,79 @@ class VendorFoundationTests(TestCase):
         self.assertContains(page, 'id="surveyAllocationModal"')
         self.assertContains(page, 'id="vendorApiKeyModal"')
         self.assertNotContains(page, 'id="vendorManagementForm"')
+        script = (Path(settings.BASE_DIR) / "static" / "vendors" / "management.js").read_text(encoding="utf-8")
+        self.assertIn("closest('button[data-edit-policy]')", script)
+        self.assertNotIn("closest('[data-edit-policy]')", script)
+        self.assertIn("closest('button[data-revoke-api-key]')", script)
+        self.assertNotIn("closest('[data-revoke-api-key]')", script)
+
+    def test_supplier_directory_hides_profiles_without_the_required_role(self):
+        EmployeeProfile.objects.filter(user=self.internal).update(role=None)
+        api = APIClient()
+        api.force_authenticate(self.owner)
+
+        directory = api.get(reverse("vendor-directory-list"))
+        self.assertEqual(directory.status_code, 200)
+        self.assertNotIn(self.internal.pk, [row["id"] for row in directory.data["results"]])
+        options = api.get(reverse("vendor-management-options"))
+        self.assertNotIn(self.internal.pk, [row["id"] for row in options.data["vendors"]])
+
+    def test_directory_reports_average_effective_client_cut(self):
+        second_client = Client.objects.create(
+            code="average-cut-client", name="Average Cut Client", created_by=self.owner,
+        )
+        VendorClientAllocation.objects.create(
+            vendor=self.external,
+            client=second_client,
+            quantity_limit=10,
+            cpi_cut_override_percent=Decimal("50.00"),
+            created_by=self.owner,
+        )
+        api = APIClient()
+        api.force_authenticate(self.owner)
+        response = api.get(reverse("vendor-directory-list"))
+        row = next(item for item in response.data["results"] if item["id"] == self.external.pk)
+        self.assertEqual(row["active_client_allocation_count"], 2)
+        self.assertEqual(Decimal(row["average_client_cpi_cut_percent"]), Decimal("40.00"))
+
+    def test_api_key_can_be_scoped_to_one_selected_client(self):
+        self.external_policy.delivery_mode = VendorCommercialProfile.DeliveryMode.BOTH
+        self.external_policy.save(update_fields=["delivery_mode", "updated_at"])
+        second_client = Client.objects.create(
+            code="key-scope-client", name="Key Scope Client", created_by=self.owner,
+        )
+        second_survey = Survey.objects.create(
+            client=second_client,
+            source_id=88007,
+            name="Key scoped survey",
+            status=Survey.Status.LIVE,
+            remaining=5,
+            cpi=Decimal("8.00"),
+        )
+        second_allocation = VendorClientAllocation.objects.create(
+            vendor=self.external,
+            client=second_client,
+            quantity_limit=5,
+            created_by=self.owner,
+        )
+        owner_api = APIClient()
+        owner_api.force_authenticate(self.owner)
+        issued = owner_api.post(reverse("vendor-api-key-list"), {
+            "vendor": self.external.pk,
+            "name": "One client only",
+            "client_allocations": [second_allocation.pk],
+        }, format="json")
+        self.assertEqual(issued.status_code, 201)
+        self.assertEqual(issued.data["client_names"], [second_client.name])
+
+        listing = APIClient().get(reverse("survey-list"), HTTP_X_API_KEY=issued.data["api_key"])
+        self.assertEqual(listing.status_code, 200)
+        self.assertEqual([row["source_id"] for row in listing.data["results"]], [second_survey.source_id])
+
+        allocation_detail = owner_api.get(
+            reverse("vendor-client-allocation-detail", kwargs={"pk": second_allocation.pk})
+        )
+        self.assertEqual(allocation_detail.data["api_key_scopes"][0]["name"], "One client only")
 
     def test_api_key_inherits_live_client_scope_and_different_client_cuts(self):
         self.external_policy.delivery_mode = VendorCommercialProfile.DeliveryMode.BOTH
@@ -417,6 +518,7 @@ class VendorFoundationTests(TestCase):
         issued = owner_api.post(reverse("vendor-api-key-list"), {
             "vendor": self.external.pk,
             "name": "UAT integration",
+            "client_allocations": [self.external_client_allocation.pk, second_client_allocation.pk],
         }, format="json")
         self.assertEqual(issued.status_code, 201)
         raw_key = issued.data["api_key"]
@@ -436,6 +538,21 @@ class VendorFoundationTests(TestCase):
 
         filtered = vendor_api.get(reverse("survey-list"), {"client_name": second_client.name}, HTTP_X_API_KEY=raw_key)
         self.assertEqual([row["source_id"] for row in filtered.data["results"]], [second_survey.source_id])
+        UserFunctionOverride.objects.create(
+            user=self.external,
+            function=AccessFunction.objects.get(code="projects.filter.cpi"),
+            effect=UserFunctionOverride.Effect.ALLOW,
+        )
+        visible_cpi_filtered = vendor_api.get(
+            reverse("survey-list"),
+            {"min_cpi": "5.50", "max_cpi": "7.50", "ordering": "-cpi"},
+            HTTP_X_API_KEY=raw_key,
+        )
+        self.assertEqual(visible_cpi_filtered.status_code, 200)
+        self.assertEqual(
+            [row["source_id"] for row in visible_cpi_filtered.data["results"]],
+            [self.survey.source_id],
+        )
         key_record = VendorAPIKey.objects.get(pk=issued.data["id"])
         self.assertIsNotNone(key_record.last_used_at)
 
@@ -475,6 +592,7 @@ class VendorFoundationTests(TestCase):
         issued = owner_api.post(reverse("vendor-api-key-list"), {
             "vendor": self.external.pk,
             "name": "API-only integration",
+            "client_allocations": [self.external_client_allocation.pk],
         }, format="json")
         self.assertEqual(issued.status_code, 201)
         self.assertEqual(
@@ -627,7 +745,7 @@ class OrganizationHierarchyTests(TestCase):
                 organization_unit=branch, client=self.client_b, created_by=self.owner,
             ),
             OrganizationClientAccess(
-                organization_unit=shift, client=self.client_a, created_by=self.owner,
+                organization_unit=shift, client=self.client_b, is_active=False, created_by=self.owner,
             ),
         ])
         employee = get_user_model().objects.create_user("shift-override-employee")
@@ -648,6 +766,55 @@ class OrganizationHierarchyTests(TestCase):
         )
         with self.assertRaisesMessage(AllocationUnavailable, "not assigned"):
             resolve_vendor_survey_context(employee, self.survey_b)
+
+    def test_child_inherits_parent_cpi_range_and_can_override_it(self):
+        branch, sub_branch, shift = self.create_tree(self.owner, "cpi-policy")
+        OrganizationClientAccess.objects.create(
+            organization_unit=branch,
+            client=self.client_a,
+            min_cpi=Decimal("2.00"),
+            max_cpi=Decimal("3.50"),
+            created_by=self.owner,
+        )
+        employee = get_user_model().objects.create_user("cpi-policy-employee")
+        EmployeeProfile.objects.filter(user=employee).update(
+            organization_unit=shift,
+            created_by=self.owner,
+            role=Role.objects.get(slug="employee"),
+        )
+        api = APIClient()
+        api.force_authenticate(employee)
+        self.assertEqual(
+            {row["source_id"] for row in api.get(reverse("survey-list")).data["results"]},
+            {self.survey_a.source_id},
+        )
+
+        sub_policy = OrganizationClientAccess.objects.create(
+            organization_unit=sub_branch,
+            client=self.client_a,
+            created_by=self.owner,
+        )
+        OrganizationClientAccess.objects.create(
+            organization_unit=shift,
+            client=self.client_a,
+            created_by=self.owner,
+        )
+        employee = get_user_model().objects.get(pk=employee.pk)
+        api.force_authenticate(employee)
+        self.assertEqual(
+            {row["source_id"] for row in api.get(reverse("survey-list")).data["results"]},
+            {self.survey_a.source_id},
+        )
+
+        sub_policy.min_cpi = Decimal("4.00")
+        sub_policy.max_cpi = Decimal("8.00")
+        sub_policy.inherit_cpi_range = False
+        sub_policy.save(update_fields=["min_cpi", "max_cpi", "inherit_cpi_range", "updated_at"])
+        employee = get_user_model().objects.get(pk=employee.pk)
+        api.force_authenticate(employee)
+        self.assertEqual(api.get(reverse("survey-list")).data["count"], 0)
+        with self.assertRaisesMessage(AllocationUnavailable, "outside"):
+            resolve_vendor_survey_context(employee, self.survey_a)
 
     def test_shift_members_and_clients_roll_up_to_parent_totals(self):
         branch, sub_branch, shift = self.create_tree(self.owner, "rollup")
@@ -673,6 +840,19 @@ class OrganizationHierarchyTests(TestCase):
         self.assertEqual(units[branch.pk]["direct_client_count"], 0)
         self.assertEqual(units[shift.pk]["direct_member_count"], 2)
         self.assertEqual(units[shift.pk]["direct_client_count"], 1)
+
+    def test_branch_client_is_counted_as_inherited_for_every_child(self):
+        branch, sub_branch, shift = self.create_tree(self.owner, "inherited-count")
+        OrganizationClientAccess.objects.create(
+            organization_unit=branch, client=self.client_a, created_by=self.owner,
+        )
+        response = self.owner_api.get(reverse("organization-unit-list"))
+        units = {row["id"]: row for row in response.data["results"]}
+        for unit in (branch, sub_branch, shift):
+            self.assertEqual(units[unit.pk]["client_count"], 1)
+        self.assertEqual(units[branch.pk]["direct_client_count"], 1)
+        self.assertEqual(units[sub_branch.pk]["direct_client_count"], 0)
+        self.assertEqual(units[shift.pk]["direct_client_count"], 0)
 
     def test_user_creation_assigns_team_leads_and_employees_to_shifts(self):
         branch, _, shift = self.create_tree(self.owner, "people")

@@ -7,6 +7,8 @@ from django.core.validators import MinValueValidator
 from django.db import models, transaction
 from django.utils import timezone
 
+from .identifiers import generate_platform_pid
+
 
 class LocalIdSequence(models.Model):
     """Monthly counter used to issue 14-digit IDs such as 20260800000001."""
@@ -128,7 +130,10 @@ class Survey(models.Model):
 
     class Meta:
         ordering = ["-source_modified_at", "-created_at"]
-        indexes = [models.Index(fields=["status", "country_code"])]
+        indexes = [
+            models.Index(fields=["status", "country_code"]),
+            models.Index(fields=["client", "cpi"]),
+        ]
         constraints = [
             models.UniqueConstraint(fields=["integration", "source_id"], name="unique_integration_survey_source"),
             models.UniqueConstraint(fields=["integration", "source_key"], name="unique_integration_survey_key"),
@@ -329,6 +334,48 @@ class SyncRun(models.Model):
         ordering = ["-started_at"]
 
 
+class CintWebhookDelivery(models.Model):
+    """Auditable, replay-safe receipt for one Cint Opportunities callback."""
+
+    class Status(models.TextChoices):
+        RECEIVED = "received", "Received"
+        PROCESSING = "processing", "Processing"
+        PROCESSED = "processed", "Processed"
+        PARTIAL = "partial", "Partial"
+        FAILED = "failed", "Failed"
+
+    integration = models.ForeignKey(
+        "vendors.ClientIntegration",
+        on_delete=models.PROTECT,
+        related_name="cint_webhook_deliveries",
+    )
+    event_key = models.CharField(max_length=64, unique=True, db_index=True)
+    payload_sha256 = models.CharField(max_length=64, db_index=True)
+    signature_timestamp = models.PositiveBigIntegerField(null=True, blank=True)
+    signature_key_id = models.CharField(max_length=80, blank=True)
+    signature_header = models.TextField(blank=True)
+    payload = models.JSONField(default=list)
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.RECEIVED,
+        db_index=True,
+    )
+    item_count = models.PositiveIntegerField(default=0)
+    created_count = models.PositiveIntegerField(default=0)
+    updated_count = models.PositiveIntegerField(default=0)
+    closed_count = models.PositiveIntegerField(default=0)
+    skipped_count = models.PositiveIntegerField(default=0)
+    error_count = models.PositiveIntegerField(default=0)
+    error = models.TextField(blank=True)
+    received_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    processed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-received_at"]
+        indexes = [models.Index(fields=["integration", "status", "received_at"])]
+
+
 class SurveyAttempt(models.Model):
     class Status(models.TextChoices):
         INITIATED = "initiated", "Initiated"
@@ -339,6 +386,17 @@ class SurveyAttempt(models.Model):
         QUALITY_TERMINATED = "4", "Quality terminated"
 
     rid = models.CharField(max_length=10, unique=True, db_index=True)
+    pid = models.CharField(
+        max_length=9,
+        unique=True,
+        db_index=True,
+        editable=False,
+        default=generate_platform_pid,
+        help_text=(
+            "Platform tracking ID. Generated as 6-9 mixed alphanumeric characters; "
+            "kept separate from the provider-specific PID parameter."
+        ),
+    )
     prescreener_uid = models.CharField(
         max_length=19,
         unique=True,
@@ -346,6 +404,13 @@ class SurveyAttempt(models.Model):
         blank=True,
         editable=False,
         help_text="Stable XXXX-XXXX-XXXX-XXXX identity for the isolated prescreener vault.",
+    )
+    provider_profile_uid = models.CharField(
+        max_length=19,
+        blank=True,
+        db_index=True,
+        editable=False,
+        help_text="Reusable UID actually sent to the provider; blank means prescreener_uid was used.",
     )
     survey = models.ForeignKey(Survey, related_name="attempts", on_delete=models.PROTECT)
     platform_user = models.ForeignKey(
@@ -436,3 +501,129 @@ class SurveyAttempt(models.Model):
 
     def calculate_loi_seconds(self, ended_at) -> int:
         return max(0, int((ended_at - self.loi_started_at).total_seconds()))
+
+
+class ProfileReuseMonthlyCounter(models.Model):
+    """Concurrency-safe monthly client budget for previously registered UIDs."""
+
+    integration = models.ForeignKey(
+        "vendors.ClientIntegration",
+        on_delete=models.PROTECT,
+        related_name="profile_reuse_months",
+    )
+    period_start = models.DateField(db_index=True)
+    baseline_attempts = models.PositiveIntegerField(default=0)
+    target_reuses = models.PositiveIntegerField(default=0)
+    allocated_reuses = models.PositiveIntegerField(default=0)
+    first_reuse_allocated = models.PositiveIntegerField(default=0)
+    repeat_reuse_allocated = models.PositiveIntegerField(default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["integration", "period_start"],
+                name="unique_profile_reuse_month",
+            ),
+        ]
+        indexes = [models.Index(fields=["integration", "period_start"])]
+
+
+class ProfileReuseEvent(models.Model):
+    """Audit one journey that reused an existing vault RID/UID profile pair."""
+
+    integration = models.ForeignKey(
+        "vendors.ClientIntegration",
+        on_delete=models.PROTECT,
+        related_name="profile_reuse_events",
+    )
+    attempt = models.OneToOneField(
+        SurveyAttempt,
+        on_delete=models.PROTECT,
+        related_name="profile_reuse_event",
+    )
+    survey = models.ForeignKey(
+        Survey,
+        on_delete=models.PROTECT,
+        related_name="profile_reuse_events",
+        help_text="Denormalized project identity used for permanent same-project exclusion.",
+    )
+    registered_uid = models.CharField(max_length=19, db_index=True)
+    reused_rid = models.CharField(max_length=10, db_index=True)
+    reused_uid = models.CharField(max_length=19, db_index=True)
+    source_registered_at = models.DateTimeField()
+    source_usage_number = models.PositiveIntegerField()
+    reuse_pool = models.CharField(
+        max_length=16,
+        choices=(("first", "First reuse"), ("returning", "Returning profile")),
+        default="first",
+        db_index=True,
+    )
+    country_code = models.CharField(max_length=8, db_index=True)
+    age_group = models.CharField(max_length=20, db_index=True)
+    gender = models.CharField(max_length=20, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["integration", "created_at"]),
+            models.Index(fields=["integration", "country_code", "age_group", "gender"]),
+            models.Index(fields=["integration", "reused_uid", "created_at"]),
+        ]
+
+
+class ProfileReuseState(models.Model):
+    """Operational lock row that serializes concurrent reuse of one UID."""
+
+    integration = models.ForeignKey(
+        "vendors.ClientIntegration",
+        on_delete=models.PROTECT,
+        related_name="profile_reuse_states",
+    )
+    reused_uid = models.CharField(max_length=19)
+    last_reused_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    total_reuses = models.PositiveIntegerField(default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["integration", "reused_uid"],
+                name="unique_profile_reuse_state",
+            ),
+        ]
+        indexes = [models.Index(fields=["integration", "last_reused_at"])]
+
+
+class ProfileReuseProjectUsage(models.Model):
+    """Permanent no-repeat lock for one client UID on one survey project."""
+
+    integration = models.ForeignKey(
+        "vendors.ClientIntegration",
+        on_delete=models.PROTECT,
+        related_name="profile_reuse_project_usages",
+    )
+    survey = models.ForeignKey(
+        Survey,
+        on_delete=models.PROTECT,
+        related_name="profile_reuse_project_usages",
+    )
+    reused_uid = models.CharField(max_length=19)
+    first_attempt = models.ForeignKey(
+        SurveyAttempt,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="profile_reuse_project_locks",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["integration", "survey", "reused_uid"],
+                name="unique_profile_uid_per_project",
+            ),
+        ]
+        indexes = [models.Index(fields=["integration", "survey"])]

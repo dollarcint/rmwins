@@ -132,7 +132,7 @@ class ResearchForGoodIntegrationTests(TestCase):
         self.assertEqual(response.json()[0]["code"], "rfg")
         self.assertEqual(
             {provider["code"] for provider in response.json()},
-            {"rfg", "cint", "innovatemr", "custom"},
+            {"rfg", "cint", "innovatemr", "enligne", "custom"},
         )
         response = api.post("/api/v1/vendors/integrations/", {
             "client": self.client_record.pk,
@@ -256,11 +256,27 @@ class ResearchForGoodIntegrationTests(TestCase):
                 {"OptionId": 2, "OptionText": "Target answer"},
             ], raw_data={"targeting_choices": [2]},
         )
+        health_insurance = TargetingQuestion.objects.create(
+            survey=survey,
+            question_id=-5,
+            key="Type of health insurance",
+            text="Type of health insurance",
+            question_type="single",
+            options=[{"OptionId": 4, "OptionText": "Employer plan"}],
+            raw_data={
+                "datapoint": {"property": "HealthInsurance"},
+                "targeting_choices": [4],
+            },
+        )
         answers = {
             str(birthday.pk): {"question_key": birthday.key, "upstream_values": ["2000-01-01"]},
             str(gender.pk): {"question_key": gender.key, "upstream_values": ["M"]},
             str(postal.pk): {"question_key": postal.key, "upstream_values": ["12 345"]},
             str(income.pk): {"question_key": income.key, "upstream_values": ["2"]},
+            str(health_insurance.pk): {
+                "question_key": health_insurance.key,
+                "upstream_values": ["4"],
+            },
         }
         attempt = SurveyAttempt.objects.create(
             rid="Abc123Xyz9",
@@ -271,13 +287,15 @@ class ResearchForGoodIntegrationTests(TestCase):
         provider = ResearchForGoodProvider(self.integration)
         self.assertEqual(provider.validate_prescreener(survey, answers), (True, ""))
         outbound = parse_qs(urlsplit(provider.build_outbound_url(survey, attempt, answers)).query)
-        self.assertNotIn("tid", outbound)
-        self.assertEqual(outbound["rid"], [attempt.rid])
+        self.assertEqual(outbound["tid"], [attempt.rid])
+        self.assertEqual(outbound["rid"], [attempt.prescreener_uid])
         self.assertEqual(outbound["country"], ["US"])
         self.assertEqual(outbound["postalCode"], ["12345"])
         self.assertEqual(outbound["gender"], ["M"])
         self.assertEqual(outbound["birthday"], ["2000-01-01"])
         self.assertEqual(outbound["household_income"], ["2"])
+        self.assertEqual(outbound["HealthInsurance"], ["4"])
+        self.assertNotIn("Type of health insurance", outbound)
         self.assertEqual(outbound["code"], [survey.local_id])
 
         answers[str(birthday.pk)]["upstream_values"] = ["32"]
@@ -333,7 +351,8 @@ class ResearchForGoodIntegrationTests(TestCase):
         self.assertEqual([item["OptionId"] for item in question.options], [1, 2])
         self.assertEqual(question.options[1]["OptionText"], "Target")
         self.assertEqual(question.raw_data["targeting_choices"], [2])
-        self.assertEqual(question.raw_data["adapter_version"], 2)
+        self.assertEqual(question.raw_data["adapter_version"], 3)
+        self.assertEqual(question.raw_data["outbound_property"], "income")
         serialized = TargetingQuestionSerializer(question).data
         self.assertFalse(serialized["options"][0]["Qualifies"])
         self.assertTrue(serialized["options"][1]["Qualifies"])
@@ -458,7 +477,7 @@ class ResearchForGoodIntegrationTests(TestCase):
         ))
         payload = json.loads(session.request[1]["data"].decode())
         self.assertEqual(payload["fingerprint"], fingerprint)
-        self.assertEqual(payload["rid"], attempt.rid)
+        self.assertEqual(payload["rid"], attempt.prescreener_uid)
         self.assertEqual(payload["ip"], "187.143.120.25")
 
     def test_browser_result_shows_reason_without_trusting_unverified_complete(self):
@@ -631,14 +650,14 @@ class ResearchForGoodIntegrationTests(TestCase):
         )
         response = self.client.get("/survey/rfg/callback", {
             "result": "1",
-            "rid": attempt.rid,
+            "tid": attempt.rid,
+            "rid": attempt.prescreener_uid,
             "sesskey": "rfg-session-1",
         }, REMOTE_ADDR="15.222.163.99")
         self.assertEqual(response.status_code, 200)
+        # The provider returns UID in its field named rid, but our response and
+        # stored journey always retain the platform's canonical attempt RID.
         self.assertEqual(response.data["rid"], attempt.rid)
-        self.assertNotIn("tid", response.data)
-        self.assertNotIn("provider_tid", response.data)
-        self.assertNotIn("provider_rid", response.data)
         attempt.refresh_from_db()
         self.assertEqual(attempt.status, SurveyAttempt.Status.COMPLETED)
         self.assertTrue(attempt.is_verified)
@@ -652,7 +671,7 @@ class ResearchForGoodIntegrationTests(TestCase):
         self.assertContains(result_page, "Result recorded")
         self.assertNotContains(result_page, "Secure server confirmation is still pending")
 
-    def test_rfg_callback_and_result_reject_uid_and_require_platform_rid(self):
+    def test_rfg_callback_and_result_resolve_uid_to_canonical_platform_rid(self):
         self.integration.last_test_status = "success"
         self.integration.save(update_fields=["last_test_status"])
         survey = Survey.objects.create(
@@ -664,33 +683,53 @@ class ResearchForGoodIntegrationTests(TestCase):
         attempt = SurveyAttempt.objects.create(
             rid="Uid123Map9",
             prescreener_uid="Uid1-Call-Back2-0003",
+            provider_profile_uid="Old1-Call-Back2-0004",
             survey=survey,
             user_id="42",
             status=SurveyAttempt.Status.REDIRECTED,
         )
         callback = self.client.get("/survey/rfg/callback", {
             "result": "2",
-            "rid": attempt.prescreener_uid,
-        }, REMOTE_ADDR="15.222.163.99")
-        self.assertEqual(callback.status_code, 400)
-        attempt.refresh_from_db()
-        self.assertEqual(attempt.status, SurveyAttempt.Status.REDIRECTED)
-
-        result_page = self.client.get("/survey/rfg/result", {
-            "rid": attempt.prescreener_uid,
-            "result": "2",
-        })
-        self.assertEqual(result_page.status_code, 404)
-
-        callback = self.client.get("/survey/rfg/callback", {
-            "result": "2",
-            "rid": attempt.rid,
+            "rid": attempt.provider_profile_uid,
         }, REMOTE_ADDR="15.222.163.99")
         self.assertEqual(callback.status_code, 200)
+        self.assertEqual(callback.data["rid"], attempt.rid)
         attempt.refresh_from_db()
         self.assertEqual(attempt.status, SurveyAttempt.Status.TERMINATED)
 
-    def test_generic_status_rejects_uid_and_resolves_platform_rid(self):
+        result_page = self.client.get("/survey/rfg/result", {
+            "rid": attempt.provider_profile_uid,
+            "result": "2",
+        })
+        self.assertEqual(result_page.status_code, 200)
+        self.assertContains(result_page, attempt.rid)
+        self.assertNotContains(result_page, attempt.prescreener_uid)
+        self.assertNotContains(result_page, attempt.provider_profile_uid)
+
+        # Legacy callbacks that still echo the platform RID remain compatible.
+        legacy_result = self.client.get("/survey/rfg/result", {
+            "rid": attempt.rid,
+            "result": "2",
+        })
+        self.assertEqual(legacy_result.status_code, 200)
+
+        other_attempt = SurveyAttempt.objects.create(
+            rid="Other9Rid7",
+            prescreener_uid="Othr-Uid1-Test-0005",
+            survey=survey,
+            user_id="43",
+            status=SurveyAttempt.Status.REDIRECTED,
+        )
+        conflicting = self.client.get("/survey/rfg/callback", {
+            "result": "1",
+            "tid": attempt.rid,
+            "rid": other_attempt.prescreener_uid,
+        }, REMOTE_ADDR="15.222.163.99")
+        self.assertEqual(conflicting.status_code, 400)
+        other_attempt.refresh_from_db()
+        self.assertEqual(other_attempt.status, SurveyAttempt.Status.REDIRECTED)
+
+    def test_generic_status_resolves_uid_or_rid_and_displays_canonical_rfg_rid(self):
         survey = Survey.objects.create(
             client=self.client_record,
             integration=self.integration,
@@ -710,15 +749,20 @@ class ResearchForGoodIntegrationTests(TestCase):
             "rid": attempt.prescreener_uid,
         })
 
-        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response["Location"], f"/survey?status=2&pid={attempt.pid}")
+        clean_page = self.client.get(response["Location"])
+        self.assertEqual(clean_page.status_code, 200)
+        self.assertContains(clean_page, attempt.rid)
+        self.assertNotContains(clean_page, attempt.pid)
+        self.assertNotContains(clean_page, attempt.prescreener_uid)
 
         response = self.client.get("/survey", {
             "status": "2",
             "rid": attempt.rid,
         })
-        self.assertEqual(response.status_code, 200)
-        self.assertContains(response, attempt.rid)
-        self.assertNotContains(response, attempt.prescreener_uid)
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response["Location"], f"/survey?status=2&pid={attempt.pid}")
         attempt.refresh_from_db()
         self.assertEqual(attempt.status, SurveyAttempt.Status.TERMINATED)
 
@@ -743,8 +787,11 @@ class ResearchForGoodIntegrationTests(TestCase):
             "lid": attempt.rid,
         })
 
-        self.assertEqual(response.status_code, 200)
-        self.assertContains(response, attempt.rid)
-        self.assertNotContains(response, attempt.prescreener_uid)
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response["Location"], f"/survey?status=2&pid={attempt.pid}")
+        clean_page = self.client.get(response["Location"])
+        self.assertEqual(clean_page.status_code, 200)
+        self.assertContains(clean_page, attempt.rid)
+        self.assertNotContains(clean_page, attempt.prescreener_uid)
         attempt.refresh_from_db()
         self.assertEqual(attempt.status, SurveyAttempt.Status.TERMINATED)
