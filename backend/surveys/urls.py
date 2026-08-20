@@ -22,6 +22,7 @@ from .views import (
     user_hits_page,
     biobrain_survey_return,
     enligne_survey_postback,
+    gms_callback,
     innovatemr_callback,
     survey_start,
     supplier_survey_start,
@@ -41,6 +42,7 @@ router.register("survey-attempts", SurveyAttemptViewSet, basename="survey-attemp
 
 urlpatterns = [
     path("imr_callback", innovatemr_callback, name="innovatemr-callback"),
+    path("gms_callback", gms_callback, name="gms-callback"),
     path("api/cint/webhook/surveys", cint_opportunities_webhook, name="cint-opportunities-webhook"),
     path("survey/start", survey_start, name="survey-start"),
     path("supplier/start", supplier_survey_start, name="supplier-survey-start"),

@@ -2385,6 +2385,47 @@ def _record_innovatemr_result(
     return locked, first_authoritative_result
 
 
+def _record_gms_result(attempt, upstream_status, request):
+    """Persist GMS's first unsigned status redirect as the final outcome."""
+
+    with transaction.atomic():
+        locked = SurveyAttempt.objects.select_for_update().get(pk=attempt.pk)
+        now = timezone.now()
+        first_authoritative_result = not (
+            locked.is_verified or locked.status_source == "gms_redirect"
+        )
+        if first_authoritative_result:
+            locked.status = upstream_status
+            locked.status_source = "gms_redirect"
+            locked.is_verified = True
+            exit_client_data = get_request_client_data(request)
+            if locked.callback_at is None:
+                locked.callback_at = now
+                locked.loi_seconds = locked.calculate_loi_seconds(now)
+            locked.callback_ip = get_request_ip(request)
+            locked.exit_user_agent = exit_client_data.get("user_agent", "")
+            locked.exit_browser = exit_client_data.get("browser", "")
+            locked.exit_device = exit_client_data.get("device", "")
+            locked.exit_os = exit_client_data.get("os", "")
+            locked.exit_client_data = exit_client_data
+
+        locked.last_callback_at = now
+        locked.callback_count += 1
+        audit = dict(locked.upstream_transaction_data or {})
+        audit["gms_redirect"] = {
+            "upstream_status": str(upstream_status),
+            "duplicate": not first_authoritative_result,
+        }
+        locked.upstream_transaction_data = audit
+        locked.save(update_fields=[
+            "status", "callback_at", "last_callback_at", "callback_ip", "callback_count",
+            "status_source", "is_verified", "loi_seconds", "exit_user_agent", "exit_browser",
+            "exit_device", "exit_os", "exit_client_data", "upstream_transaction_data", "updated_at",
+        ])
+        finalize_attempt_capacity(locked)
+    return locked, first_authoritative_result
+
+
 def _respondent_result_redirect(attempt):
     from vendors.supplier_delivery import supplier_outcome_redirect
 
@@ -2468,6 +2509,48 @@ def innovatemr_callback(request):
         hash_valid=hash_valid,
         rejection_reason=rejection_reason,
     )
+    return _respondent_result_redirect(attempt)
+
+
+@require_http_methods(["GET"])
+def gms_callback(request):
+    """Record one of GMS's four status redirects without hash or reason fields."""
+
+    pid_values = request.GET.getlist("pid")
+    status_values = request.GET.getlist("status")
+    pid = pid_values[0].strip() if len(pid_values) == 1 else ""
+    upstream_status = status_values[0].strip() if len(status_values) == 1 else ""
+    if (
+        set(request.GET.keys()) != {"pid", "status"}
+        or len(pid_values) != 1
+        or len(status_values) != 1
+        or upstream_status not in STATUS_PAGES
+    ):
+        return render(request, "surveys/flow_error.html", {
+            "title": "Invalid GMS callback",
+            "message": "Exactly one pid and one status (1–4) are required.",
+        }, status=400)
+    if len(pid) != 10 or not pid.isalnum():
+        return render(request, "surveys/flow_error.html", {
+            "title": "Survey attempt not found",
+            "message": "This callback could not be attached to a survey attempt.",
+        }, status=404)
+
+    attempt = SurveyAttempt.objects.select_related(
+        "survey__integration", "survey__client"
+    ).filter(rid=pid).filter(
+        Q(survey__integration__provider_code="gms")
+        | Q(survey__client__provider_code="gms")
+        | Q(survey__client__code__iexact="gms")
+        | Q(survey__client__name__iexact="gms")
+    ).first()
+    if attempt is None:
+        return render(request, "surveys/flow_error.html", {
+            "title": "Survey attempt not found",
+            "message": "This callback could not be attached to a GMS survey attempt.",
+        }, status=404)
+
+    attempt, _ = _record_gms_result(attempt, upstream_status, request)
     return _respondent_result_redirect(attempt)
 
 

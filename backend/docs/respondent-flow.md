@@ -52,6 +52,15 @@ The server reconstructs the complete hydrated HTTPS callback URL with an empty `
 
 Only a verified status 1 is eligible to consume/credit a reserved completion. A missing, malformed or mismatched hash is recorded as `innovatemr_hash_rejected`, immediately mapped to quality/security termination, and releases rather than consumes capacity. That security decision cannot later be upgraded by a replay; an invalid replay also cannot downgrade a previously verified result. The hash and shared secret are never stored in the callback audit.
 
+GMS uses four separate unsigned redirects and does not send a termination-reason or hash parameter:
+
+- Complete: `https://rmwinsights.com/gms_callback?pid=[%%pid%%]&status=1`
+- Terminate: `https://rmwinsights.com/gms_callback?pid=[%%pid%%]&status=2`
+- Over quota: `https://rmwinsights.com/gms_callback?pid=[%%pid%%]&status=3`
+- Quality/security: `https://rmwinsights.com/gms_callback?pid=[%%pid%%]&status=4`
+
+The client must be named `GMS` or use the stable client/provider code `gms`. The callback accepts exactly `pid` and `status`; extra parameters are rejected. The first valid outcome is final and later refreshes cannot change it.
+
 The same transaction finalizes the vendor reservation: complete consumes the frozen quantity, while terminate, over-quota and quality-terminate release it. Reconciled upstream terminal statuses use the identical finalization service.
 
 When a survey still has a legacy redirect configured, the browser cannot return its result to this application. As a temporary fallback, Celery polls InnovateMR's authenticated `getSurveyTransactionsByCond/{surveyId}/{PID}` endpoint for recent redirected attempts. PID and `trackId` both contain our RID, so the task can reconcile the terminal status, upstream public IP, end time and LOI without access to the legacy destination. Direct callbacks remain preferred and win any race with polling.
