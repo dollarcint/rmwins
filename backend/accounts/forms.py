@@ -41,9 +41,20 @@ class FirstAdminSetupForm(forms.Form):
     password1 = forms.CharField(min_length=8, strip=False, widget=forms.PasswordInput)
     password2 = forms.CharField(min_length=8, strip=False, widget=forms.PasswordInput)
 
+    def __init__(self, *args, bootstrap_user=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.bootstrap_user = bootstrap_user
+
     def clean_username(self):
         username = self.cleaned_data["username"].strip()
-        if get_user_model().objects.filter(username__iexact=username).exists():
+        existing = get_user_model().objects.filter(username__iexact=username)
+        if self.bootstrap_user is not None:
+            existing = existing.exclude(pk=self.bootstrap_user.pk)
+            if username.casefold() == self.bootstrap_user.username.casefold():
+                raise forms.ValidationError(
+                    "Choose a new owner username to complete the one-time setup."
+                )
+        if existing.exists():
             raise forms.ValidationError("This username is already in use.")
         return username
 

@@ -537,7 +537,9 @@ expected = {
     "PRESCREENER_DB_PORT": "5432",
     "CACHE_ENABLED": "true",
     "ENABLE_SCHEDULED_JOBS": "false",
-    "FIRST_ADMIN_SETUP_ENABLED": "false",
+    "FIRST_ADMIN_SETUP_ENABLED": "true",
+    "FIRST_ADMIN_BOOTSTRAP_USERNAME": "rmwins_admin",
+    "FRONTEND_LOGIN_URL": "https://www.rmwinsights.com/login",
 }
 for key, wanted in expected.items():
     if values.get(key) != wanted:

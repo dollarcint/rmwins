@@ -299,6 +299,62 @@ class LoginAndSetupTests(TestCase):
         self.assertEqual(user.employee_profile.role.slug, "super-admin")
         self.assertEqual(self.client.get(reverse("first-admin-setup")).status_code, 404)
 
+    @override_settings(
+        FIRST_ADMIN_SETUP_ENABLED=True,
+        FIRST_ADMIN_BOOTSTRAP_USERNAME="rmwins_admin",
+        FRONTEND_LOGIN_URL="https://www.rmwinsights.com/login",
+    )
+    def test_bootstrap_setup_redirects_anonymous_user_to_frontend_login(self):
+        get_user_model().objects.create_superuser(
+            username="rmwins_admin",
+            email="bootstrap@example.test",
+            password="temporary-password-123",
+        )
+
+        response = self.client.get(reverse("first-admin-setup"))
+
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(
+            response.url.startswith("https://www.rmwinsights.com/login?next=")
+        )
+        self.assertIn("%2Fsetup%2F", response.url)
+
+    @override_settings(
+        FIRST_ADMIN_SETUP_ENABLED=True,
+        FIRST_ADMIN_BOOTSTRAP_USERNAME="rmwins_admin",
+        FRONTEND_LOGIN_URL="https://www.rmwinsights.com/login",
+    )
+    def test_authenticated_bootstrap_can_complete_one_time_owner_setup(self):
+        bootstrap = get_user_model().objects.create_superuser(
+            username="rmwins_admin",
+            email="bootstrap@example.test",
+            password="temporary-password-123",
+        )
+        self.client.force_login(bootstrap)
+
+        self.assertEqual(self.client.get(reverse("first-admin-setup")).status_code, 200)
+        response = self.client.post(
+            reverse("first-admin-setup"),
+            {
+                "first_name": "Real",
+                "last_name": "Owner",
+                "username": "workspace-owner",
+                "email": "owner@example.test",
+                "password1": "new-owner-password-123",
+                "password2": "new-owner-password-123",
+            },
+        )
+
+        self.assertRedirects(response, reverse("home"), fetch_redirect_response=False)
+        self.assertEqual(get_user_model().objects.count(), 1)
+        owner = get_user_model().objects.get(pk=bootstrap.pk)
+        self.assertEqual(owner.username, "workspace-owner")
+        self.assertEqual(owner.email, "owner@example.test")
+        self.assertTrue(owner.is_superuser)
+        self.assertTrue(owner.check_password("new-owner-password-123"))
+        self.assertEqual(owner.employee_profile.role.slug, "super-admin")
+        self.assertEqual(self.client.get(reverse("first-admin-setup")).status_code, 404)
+
 
 @override_settings(
     ALLOWED_HOSTS=["testserver", "api.rmwinsights.com"],

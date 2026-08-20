@@ -68,6 +68,9 @@ The wrapper:
 - creates `rmwins_admin` privately and stores its generated password only in
   `/home/www.rmwinsights.com/.config/rmwins/admin-credentials`
   (`root:root`, mode `0600`);
+- exposes the one-time `/setup/` flow only to that authenticated bootstrap
+  administrator; completing the form replaces the temporary username and
+  password and permanently closes setup;
 - installs/starts only the two `rmwins-*` systemd units;
 - verifies PostgreSQL, both Redis instances, Gunicorn, the frontend, and every
   Supervisor process before reporting success.
@@ -94,6 +97,11 @@ firewall-cmd --list-ports
 Never display `backend.env`, either Redis config, or `admin-credentials` in
 terminal output or logs. Read the generated administrator file only as root.
 Provider secrets remain a cutover blocker until the owner authorizes fresh values.
+
+Production login is rendered only by the React frontend at
+`https://www.rmwinsights.com/login`. The API host redirects `/login/` there.
+Visiting `/setup` on the frontend redirects to the API setup flow; an anonymous
+visitor is returned to the frontend login with a safe API-only `next` URL.
 
 ## Public cutover (only after private health passes)
 

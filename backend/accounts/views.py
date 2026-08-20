@@ -2,6 +2,7 @@
 
 import json
 import re
+from urllib.parse import urlencode
 
 from django.conf import settings
 from django.contrib import admin
@@ -195,18 +196,68 @@ def throttled_admin_login(request):
 
 
 def first_admin_setup(request):
-    if not settings.FIRST_ADMIN_SETUP_ENABLED or get_user_model().objects.exists():
+    if not settings.FIRST_ADMIN_SETUP_ENABLED:
         raise Http404
-    form = FirstAdminSetupForm(request.POST or None)
+
+    User = get_user_model()
+    existing_users = list(User.objects.order_by("pk")[:2])
+    bootstrap_user = None
+    if existing_users:
+        bootstrap_username = settings.FIRST_ADMIN_BOOTSTRAP_USERNAME
+        if (
+            len(existing_users) != 1
+            or not bootstrap_username
+            or normalize_login_username(existing_users[0].username)
+            != normalize_login_username(bootstrap_username)
+            or not existing_users[0].is_active
+            or not existing_users[0].is_staff
+            or not existing_users[0].is_superuser
+        ):
+            raise Http404
+        bootstrap_user = existing_users[0]
+        if not request.user.is_authenticated or request.user.pk != bootstrap_user.pk:
+            query = urlencode(
+                {"next": request.build_absolute_uri(reverse("first-admin-setup"))}
+            )
+            separator = "&" if "?" in settings.FRONTEND_LOGIN_URL else "?"
+            return redirect(f"{settings.FRONTEND_LOGIN_URL}{separator}{query}")
+
+    form = FirstAdminSetupForm(
+        request.POST or None,
+        bootstrap_user=bootstrap_user,
+    )
     if request.method == "POST" and form.is_valid():
         with transaction.atomic():
-            user = get_user_model().objects.create_superuser(
-                username=form.cleaned_data["username"],
-                email=form.cleaned_data["email"],
-                password=form.cleaned_data["password1"],
-                first_name=form.cleaned_data["first_name"],
-                last_name=form.cleaned_data["last_name"],
-            )
+            if bootstrap_user is None:
+                user = User.objects.create_superuser(
+                    username=form.cleaned_data["username"],
+                    email=form.cleaned_data["email"],
+                    password=form.cleaned_data["password1"],
+                    first_name=form.cleaned_data["first_name"],
+                    last_name=form.cleaned_data["last_name"],
+                )
+            else:
+                user = User.objects.select_for_update().get(pk=bootstrap_user.pk)
+                user.username = form.cleaned_data["username"]
+                user.email = form.cleaned_data["email"]
+                user.first_name = form.cleaned_data["first_name"]
+                user.last_name = form.cleaned_data["last_name"]
+                user.is_active = True
+                user.is_staff = True
+                user.is_superuser = True
+                user.set_password(form.cleaned_data["password1"])
+                user.save(
+                    update_fields=[
+                        "username",
+                        "email",
+                        "first_name",
+                        "last_name",
+                        "is_active",
+                        "is_staff",
+                        "is_superuser",
+                        "password",
+                    ]
+                )
             profile, _ = EmployeeProfile.objects.get_or_create(user=user)
             profile.role = Role.objects.filter(slug="super-admin").first()
             profile.save(update_fields=["role", "updated_at"])

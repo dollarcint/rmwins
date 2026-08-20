@@ -75,6 +75,13 @@ AUTH_LOGIN_WINDOW_SECONDS = max(
 # Local development may use the one-time setup form. Production bootstraps the
 # first administrator privately through the management command instead.
 FIRST_ADMIN_SETUP_ENABLED = env_bool("FIRST_ADMIN_SETUP_ENABLED", DEBUG)
+FIRST_ADMIN_BOOTSTRAP_USERNAME = os.getenv(
+    "FIRST_ADMIN_BOOTSTRAP_USERNAME", ""
+).strip()
+FRONTEND_LOGIN_URL = os.getenv(
+    "FRONTEND_LOGIN_URL",
+    f"{PUBLIC_RESULT_BASE_URL}/login" if PUBLIC_RESULT_BASE_URL else "/login",
+).strip()
 
 INSTALLED_APPS = [
     "django.contrib.admin",

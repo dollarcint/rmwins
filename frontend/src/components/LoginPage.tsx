@@ -25,8 +25,22 @@ function getDashboardBaseUrl() {
   return import.meta.env.DEV ? 'http://127.0.0.1:8000' : 'https://api.rmwinsights.com';
 }
 
+function getSafeNextUrl(dashboardBaseUrl: string) {
+  const requested = new URLSearchParams(window.location.search).get('next');
+  if (!requested) return '';
+
+  try {
+    const dashboardOrigin = new URL(dashboardBaseUrl).origin;
+    const resolved = new URL(requested, `${dashboardOrigin}/`);
+    return resolved.origin === dashboardOrigin ? resolved.toString() : '';
+  } catch {
+    return '';
+  }
+}
+
 export default function LoginPage() {
   const dashboardBaseUrl = useMemo(getDashboardBaseUrl, []);
+  const nextUrl = useMemo(() => getSafeNextUrl(dashboardBaseUrl), [dashboardBaseUrl]);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [rememberMe, setRememberMe] = useState(true);
@@ -48,7 +62,7 @@ export default function LoginPage() {
       })
       .then((session) => {
         if (session.authenticated && session.redirect_url) {
-          window.location.replace(session.redirect_url);
+          window.location.replace(nextUrl || session.redirect_url);
           return;
         }
         if (!session.csrf_token) throw new Error('Could not start a secure login session.');
@@ -61,7 +75,7 @@ export default function LoginPage() {
       });
 
     return () => controller.abort();
-  }, [dashboardBaseUrl]);
+  }, [dashboardBaseUrl, nextUrl]);
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -101,7 +115,7 @@ export default function LoginPage() {
         return;
       }
 
-      window.location.assign(result.redirect_url || `${dashboardBaseUrl}/`);
+      window.location.assign(nextUrl || result.redirect_url || `${dashboardBaseUrl}/`);
     } catch {
       setError('Unable to sign in right now. Please check your connection and try again.');
     } finally {
