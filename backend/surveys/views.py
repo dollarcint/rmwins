@@ -56,6 +56,7 @@ from vendors.services import (
     visible_cpi_for_user,
 )
 from vendors.access import is_external_vendor_scope, vendor_scope_user_id
+from vendors.models import VendorAPIKey
 
 from .filters import SurveyAttemptFilter, SurveyFilter
 from .dashboard import (
@@ -1580,6 +1581,70 @@ def _mark_attempt_redirected(attempt, answers, outbound_url):
     return bool(updated)
 
 
+@require_http_methods(["GET"])
+def supplier_survey_start(request):
+    """Claim a supplier respondent using a signed, API-key-scoped entry URL."""
+
+    if not _has_exact_query(request, {"key", "survey", "token", "pid"}):
+        return _invalid_survey_link(request)
+    public_id = request.GET.get("key", "").strip()
+    survey_local_id = request.GET.get("survey", "").strip()
+    token = request.GET.get("token", "").strip()
+    supplier_pid = request.GET.get("pid", "").strip()
+    if not supplier_pid or len(supplier_pid) > 160 or any(ord(char) < 32 for char in supplier_pid):
+        return _invalid_survey_link(request, "A valid supplier respondent ID is required.")
+
+    api_key = VendorAPIKey.objects.select_related(
+        "vendor", "vendor__employee_profile", "vendor__vendor_commercial_profile"
+    ).filter(public_id=public_id).first()
+    now = timezone.now()
+    commercial = getattr(getattr(api_key, "vendor", None), "vendor_commercial_profile", None)
+    if (
+        not api_key or not api_key.is_active or api_key.revoked_at
+        or (api_key.expires_at and api_key.expires_at <= now)
+        or not api_key.vendor.is_active or not commercial or not commercial.is_active
+        or not commercial.api_access_enabled
+    ):
+        return _invalid_survey_link(request, "This supplier link is inactive.", status_code=403)
+    from vendors.supplier_delivery import verify_supplier_entry_signature
+
+    if not verify_supplier_entry_signature(api_key, survey_local_id, token):
+        return _invalid_survey_link(request, "This supplier link signature is invalid.", status_code=403)
+    survey = scope_surveys_for_api_key(
+        scope_surveys_for_user(
+            Survey.objects.select_related("integration", "client"), api_key.vendor
+        ),
+        api_key,
+    ).filter(local_id=survey_local_id, status=Survey.Status.LIVE).first()
+    if not survey:
+        return _invalid_survey_link(request, "This project is not assigned to the supplier.", status_code=404)
+    entry_location = resolve_entry_geolocation(request)
+    entry_client_data = {
+        **get_request_client_data(request),
+        **geolocation_client_data(entry_location),
+    }
+    try:
+        with transaction.atomic():
+            allocation_context = resolve_vendor_survey_context(
+                api_key.vendor, survey, require_capacity=False, for_update=True
+            )
+            attempt = create_attempt(
+                survey,
+                api_key.vendor,
+                get_request_ip(request),
+                client_data=entry_client_data,
+                supplier_respondent_id=supplier_pid,
+            )
+            reserve_attempt_capacity(
+                attempt,
+                allocation_context.survey_allocation,
+                client_allocation=allocation_context.client_allocation,
+            )
+    except AllocationUnavailable as exc:
+        return _invalid_survey_link(request, str(exc), status_code=409)
+    return HttpResponseRedirect(f"{reverse('survey-start')}?rid={quote(attempt.rid)}")
+
+
 @require_http_methods(["GET", "POST"])
 def survey_start(request):
     """Validate copied links, run the prescreener and redirect one claimed attempt.
@@ -2321,6 +2386,13 @@ def _record_innovatemr_result(
 
 
 def _respondent_result_redirect(attempt):
+    from vendors.supplier_delivery import supplier_outcome_redirect
+
+    supplier_url = supplier_outcome_redirect(attempt)
+    if supplier_url:
+        response = HttpResponseRedirect(supplier_url)
+        response["Cache-Control"] = "no-store"
+        return response
     result_base_url = settings.PUBLIC_RESULT_BASE_URL or settings.PUBLIC_APP_BASE_URL
     if not result_base_url:
         result_base_url = "https://www.rmwinsights.com"
@@ -2513,6 +2585,15 @@ def survey_status(request):
             return HttpResponseRedirect(f"{reverse('survey-status')}?{clean_query}")
     else:
         status_label = "Unknown attempt"
+
+    if attempt and attempt.status in STATUS_PAGES:
+        from vendors.supplier_delivery import supplier_outcome_redirect
+
+        supplier_url = supplier_outcome_redirect(attempt)
+        if supplier_url:
+            response = HttpResponseRedirect(supplier_url)
+            response["Cache-Control"] = "no-store"
+            return response
 
     return render(request, "surveys/status.html", {
         **page,

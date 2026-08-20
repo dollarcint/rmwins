@@ -8,6 +8,7 @@ from rest_framework import serializers
 
 from accounts.access import effective_permission_codes
 from vendors.access import vendor_scope_user_id
+from vendors.models import VendorAPIKey
 from vendors.services import organization_client_ids_for_user, survey_pricing_for_user
 
 from .models import (
@@ -307,16 +308,19 @@ class SurveyListSerializer(serializers.ModelSerializer):
     cpi = serializers.SerializerMethodField()
     cpi_cut_percent = serializers.SerializerMethodField()
     vendor_pricing = serializers.SerializerMethodField()
+    survey_id = serializers.SerializerMethodField()
+    supplier_entry_link = serializers.SerializerMethodField()
+    supplier_id = serializers.SerializerMethodField()
 
     class Meta:
         model = Survey
         fields = [
-            "id", "local_id", "client", "client_name", "display_company_name", "source_id", "provider_code", "company_name", "name", "status", "sample_size", "completes", "remaining",
+            "id", "local_id", "survey_id", "supplier_id", "client", "client_name", "display_company_name", "source_id", "provider_code", "company_name", "name", "status", "sample_size", "completes", "remaining",
             "starts", "cpi", "cpi_cut_percent", "vendor_pricing", "loi", "incidence_rate", "country", "country_code", "country_label",
             "language", "language_code", "group_type", "buyer_id", "survey_type", "device_type", "entry_link", "start_link", "has_quota",
             "source_created_at", "source_modified_at", "source_created_display", "source_modified_display",
             "detail_synced_at", "quota_synced_at", "targeting_synced_at", "created_at", "updated_at",
-            "progress_percent",
+            "progress_percent", "supplier_entry_link",
         ]
 
     def _has_permission(self, code: str) -> bool:
@@ -356,7 +360,34 @@ class SurveyListSerializer(serializers.ModelSerializer):
             data["client_name"] = ""
             data["display_company_name"] = ""
             data["company_name"] = ""
+        request = self.context.get("request")
+        if request and isinstance(getattr(request, "auth", None), VendorAPIKey):
+            safe_link = data.get("supplier_entry_link")
+            data["entry_link"] = safe_link
+            data["start_link"] = safe_link
         return data
+
+    def get_survey_id(self, obj) -> str:
+        request = self.context.get("request")
+        if request and isinstance(getattr(request, "auth", None), VendorAPIKey):
+            from vendors.supplier_delivery import supplier_survey_identifier
+
+            return supplier_survey_identifier(request.user.vendor_commercial_profile, obj)
+        return str(obj.local_id)
+
+    def get_supplier_entry_link(self, obj) -> str | None:
+        request = self.context.get("request")
+        if not request or not isinstance(getattr(request, "auth", None), VendorAPIKey):
+            return None
+        from vendors.supplier_delivery import supplier_entry_link
+
+        return supplier_entry_link(request, request.auth, obj)
+
+    def get_supplier_id(self, obj) -> str | None:
+        request = self.context.get("request")
+        if request and isinstance(getattr(request, "auth", None), VendorAPIKey):
+            return request.user.vendor_commercial_profile.supplier_code
+        return None
 
     def get_country_label(self, obj) -> str:
         return " ".join(part for part in [obj.country_code, obj.language_code] if part) or obj.country

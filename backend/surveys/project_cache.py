@@ -54,7 +54,7 @@ def project_filter_metadata(
     cpi_field: str = "cpi",
 ) -> dict:
     key = stable_cache_key(
-        f"projects:v{_version()}:filters",
+        f"projects:v{_version()}:filters-v2",
         {
             "user_id": user_id,
             "client_scoped": client_scoped,
@@ -83,12 +83,18 @@ def project_filter_metadata(
             .distinct()
             .order_by("buyer_id")
         )
-        survey_types = list(
-            queryset.exclude(survey_type="")
-            .values_list("survey_type", flat=True)
-            .distinct()
-            .order_by("survey_type")
-        )
+        survey_type_rows = queryset.values_list("survey_type", "group_type").distinct()
+        survey_types = set()
+        for survey_type, group_type in survey_type_rows:
+            value = str(survey_type or group_type or "").strip()
+            normalized = value.casefold().replace("-", " ").replace("_", " ")
+            if normalized in {"b2b", "business", "business to business"} or "business" in normalized:
+                survey_types.add("B2B")
+            elif normalized in {"b2c", "consumer", "business to consumer"} or "consumer" in normalized:
+                survey_types.add("B2C")
+            elif value:
+                survey_types.add(value)
+        survey_types = sorted(survey_types, key=str.casefold)
         cpi_bounds = (
             queryset.aggregate(
                 minimum=Min(cpi_field),

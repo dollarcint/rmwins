@@ -455,6 +455,12 @@ class SurveyAttempt(models.Model):
         on_delete=models.PROTECT,
     )
     user_id = models.CharField(max_length=160, db_index=True)
+    supplier_respondent_id = models.CharField(
+        max_length=160,
+        blank=True,
+        db_index=True,
+        help_text="External supplier's respondent identifier, echoed only to that supplier's redirect.",
+    )
     supplier_code = models.CharField(max_length=40, blank=True)
     source_cpi_snapshot = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
     cpi_snapshot_source = models.CharField(

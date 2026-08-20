@@ -1979,7 +1979,7 @@ paths:
   /api/v1/vendors/client-allocations/:
     get:
       operationId: api_v1_vendors_client_allocations_list
-      summary: List supplier client grants and quantities
+      summary: List supplier client grants and redirects
       parameters:
       - in: query
         name: client
@@ -2043,7 +2043,7 @@ paths:
           description: ''
     post:
       operationId: api_v1_vendors_client_allocations_create
-      summary: Allocate a client and quantity to a supplier
+      summary: Allocate a client to a supplier
       tags:
       - Suppliers & allocations
       requestBody:
@@ -3384,61 +3384,11 @@ paths:
       responses:
         '204':
           description: No response body
-  /api/v1/vendors/reservations/:
+  /api/v1/vendors/supplier/clients/:
     get:
-      operationId: api_v1_vendors_reservations_list
-      summary: List allocation reservation audit records
-      parameters:
-      - in: query
-        name: client_allocation
-        schema:
-          type: integer
-      - in: query
-        name: client_allocation__vendor
-        schema:
-          type: integer
-      - name: ordering
-        required: false
-        in: query
-        description: Which field to use when ordering the results.
-        schema:
-          type: string
-      - name: page
-        required: false
-        in: query
-        description: A page number within the paginated result set.
-        schema:
-          type: integer
-      - name: page_size
-        required: false
-        in: query
-        description: Number of results to return per page.
-        schema:
-          type: integer
-      - name: search
-        required: false
-        in: query
-        description: A search term.
-        schema:
-          type: string
-      - in: query
-        name: status
-        schema:
-          type: string
-          enum:
-          - consumed
-          - expired
-          - released
-          - reserved
-        description: |-
-          * `reserved` - Reserved
-          * `consumed` - Consumed
-          * `released` - Released
-          * `expired` - Expired
-      - in: query
-        name: survey_allocation
-        schema:
-          type: integer
+      operationId: api_v1_vendors_supplier_clients_retrieve
+      description: List API-key-scoped clients without exposing owner allocation internals.
+      summary: List clients assigned to a supplier API key
       tags:
       - Suppliers & allocations
       security:
@@ -3449,35 +3399,12 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/PaginatedAllocationReservationList'
-          description: ''
-  /api/v1/vendors/reservations/{id}/:
-    get:
-      operationId: api_v1_vendors_reservations_retrieve
-      summary: Get an allocation reservation audit record
-      parameters:
-      - in: path
-        name: id
-        schema:
-          type: integer
-        description: A unique integer value identifying this allocation reservation.
-        required: true
-      tags:
-      - Suppliers & allocations
-      security:
-      - VendorApiKeyAuth: []
-      - cookieAuth: []
-      responses:
-        '200':
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/AllocationReservation'
+                $ref: '#/components/schemas/SupplierClientCatalogResponse'
           description: ''
   /api/v1/vendors/survey-allocations/:
     get:
       operationId: api_v1_vendors_survey_allocations_list
-      summary: List supplier project allocations and complete caps
+      summary: List supplier project exclusions
       parameters:
       - in: query
         name: client_allocation
@@ -3537,7 +3464,7 @@ paths:
           description: ''
     post:
       operationId: api_v1_vendors_survey_allocations_create
-      summary: Allocate a visible project with a complete cap
+      summary: Exclude one project from a supplier
       tags:
       - Vendors & allocations
       requestBody:
@@ -5704,11 +5631,11 @@ paths:
                 value:
                   confirm_upstream_mutation: true
                   payload:
-                    sUrl: https://panel.example/survey?status=1&rid=[%%pid%%]
-                    fUrl: https://panel.example/survey?status=2&rid=[%%pid%%]
-                    oUrl: https://panel.example/survey?status=3&rid=[%%pid%%]
-                    qTUrl: https://panel.example/survey?status=3&rid=[%%pid%%]
-                    tUrl: https://panel.example/survey?status=4&rid=[%%pid%%]
+                    sUrl: https://rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]
+                    fUrl: https://rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]
+                    oUrl: https://rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]
+                    qTUrl: https://rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]
+                    tUrl: https://rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]
                 summary: Confirmed live change
           application/x-www-form-urlencoded:
             schema:
@@ -5777,10 +5704,10 @@ paths:
                   confirm_upstream_mutation: true
                   survey_id: '16003381'
                   payload:
-                    sUrl: https://panel.example/survey?status=1&rid=[%%pid%%]
-                    fUrl: https://panel.example/survey?status=2&rid=[%%pid%%]
-                    oUrl: https://panel.example/survey?status=3&rid=[%%pid%%]
-                    tUrl: https://panel.example/survey?status=4&rid=[%%pid%%]
+                    sUrl: https://rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]
+                    fUrl: https://rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]
+                    oUrl: https://rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]
+                    tUrl: https://rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]
                 summary: Confirmed live change
           application/x-www-form-urlencoded:
             schema:
@@ -7632,86 +7559,6 @@ components:
         * `employee` - Employee
         * `internal_vendor` - Internal supplier
         * `external_vendor` - External supplier
-    AllocationReservation:
-      type: object
-      properties:
-        id:
-          type: integer
-          readOnly: true
-        attempt:
-          type: integer
-          readOnly: true
-        rid:
-          type: string
-          readOnly: true
-        vendor:
-          type: integer
-          readOnly: true
-        client_allocation:
-          type: integer
-          readOnly: true
-        survey_allocation:
-          type: integer
-          readOnly: true
-          nullable: true
-        survey:
-          type: integer
-          readOnly: true
-          nullable: true
-        quantity:
-          type: integer
-          readOnly: true
-        status:
-          allOf:
-          - $ref: '#/components/schemas/AllocationReservationStatusEnum'
-          readOnly: true
-        expires_at:
-          type: string
-          format: date-time
-          readOnly: true
-        finalized_at:
-          type: string
-          format: date-time
-          readOnly: true
-          nullable: true
-        reason:
-          type: string
-          readOnly: true
-        created_at:
-          type: string
-          format: date-time
-          readOnly: true
-        updated_at:
-          type: string
-          format: date-time
-          readOnly: true
-      required:
-      - attempt
-      - client_allocation
-      - created_at
-      - expires_at
-      - finalized_at
-      - id
-      - quantity
-      - reason
-      - rid
-      - status
-      - survey
-      - survey_allocation
-      - updated_at
-      - vendor
-    AllocationReservationStatusEnum:
-      enum:
-      - reserved
-      - consumed
-      - released
-      - expired
-      type: string
-      description: |-
-        * `reserved` - Reserved
-        * `consumed` - Consumed
-        * `released` - Released
-        * `expired` - Expired
     CanonicalOption:
       type: object
       properties:
@@ -8849,29 +8696,6 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/AccessFunction'
-    PaginatedAllocationReservationList:
-      type: object
-      required:
-      - count
-      - results
-      properties:
-        count:
-          type: integer
-          example: 123
-        next:
-          type: string
-          nullable: true
-          format: uri
-          example: http://api.example.org/accounts/?page=4
-        previous:
-          type: string
-          nullable: true
-          format: uri
-          example: http://api.example.org/accounts/?page=2
-        results:
-          type: array
-          items:
-            $ref: '#/components/schemas/AllocationReservation'
     PaginatedCanonicalQuestionList:
       type: object
       required:
@@ -9686,11 +9510,6 @@ components:
           type: integer
         client:
           type: integer
-        quantity_limit:
-          type: integer
-          maximum: 9223372036854775807
-          minimum: 0
-          format: int64
         cpi_cut_override_percent:
           type: string
           format: decimal
@@ -9718,6 +9537,26 @@ components:
           type: string
           format: date-time
           nullable: true
+        complete_redirect_url:
+          type: string
+          format: uri
+          maxLength: 2000
+        terminate_redirect_url:
+          type: string
+          format: uri
+          maxLength: 2000
+        over_quota_redirect_url:
+          type: string
+          format: uri
+          maxLength: 2000
+        quality_redirect_url:
+          type: string
+          format: uri
+          maxLength: 2000
+        invalid_redirect_url:
+          type: string
+          format: uri
+          maxLength: 2000
         is_active:
           type: boolean
     PatchedVendorCommercialProfileRequest:
@@ -9742,6 +9581,22 @@ components:
             * `panel` - Panel only
             * `api` - API only
             * `both` - Panel and API
+        survey_id_mode:
+          allOf:
+          - $ref: '#/components/schemas/SurveyIdModeEnum'
+          description: |-
+            Identifier exposed as survey_id in this supplier's API and redirects.
+
+            * `project_id` - RM Wins project ID
+            * `source_id` - Client survey ID
+        callback_hash_enabled:
+          type: boolean
+          description: Add an HMAC-SHA256 hash to respondent outcome redirects for
+            this supplier.
+        generate_callback_hash_secret:
+          type: boolean
+          writeOnly: true
+          default: false
         is_active:
           type: boolean
     PatchedVendorSurveyAllocationRequest:
@@ -9751,11 +9606,10 @@ components:
           type: integer
         survey:
           type: integer
-        quantity_limit:
-          type: integer
-          maximum: 9223372036854775807
-          minimum: 0
-          format: int64
+        is_excluded:
+          type: boolean
+          description: Hide this project while leaving every other project in the
+            client grant visible.
         cpi_cut_override_percent:
           type: string
           format: decimal
@@ -10003,6 +9857,37 @@ components:
       required:
       - name
       - slug
+    SupplierClientCatalogItem:
+      type: object
+      properties:
+        id:
+          type: integer
+        code:
+          type: string
+        name:
+          type: string
+        project_count:
+          type: integer
+        projects_url:
+          type: string
+      required:
+      - code
+      - id
+      - name
+      - project_count
+      - projects_url
+    SupplierClientCatalogResponse:
+      type: object
+      properties:
+        supplier_id:
+          type: string
+        clients:
+          type: array
+          items:
+            $ref: '#/components/schemas/SupplierClientCatalogItem'
+      required:
+      - clients
+      - supplier_id
     SurveyAttempt:
       type: object
       properties:
@@ -10378,6 +10263,13 @@ components:
         local_id:
           type: string
           readOnly: true
+        survey_id:
+          type: string
+          readOnly: true
+        supplier_id:
+          type: string
+          nullable: true
+          readOnly: true
         client:
           type: integer
           nullable: true
@@ -10529,6 +10421,10 @@ components:
         progress_percent:
           type: number
           format: double
+          readOnly: true
+        supplier_entry_link:
+          type: string
+          nullable: true
           readOnly: true
         test_entry_link:
           type: string
@@ -10568,9 +10464,20 @@ components:
       - source_id
       - source_modified_display
       - start_link
+      - supplier_entry_link
+      - supplier_id
+      - survey_id
       - targeting_questions
       - updated_at
       - vendor_pricing
+    SurveyIdModeEnum:
+      enum:
+      - project_id
+      - source_id
+      type: string
+      description: |-
+        * `project_id` - RM Wins project ID
+        * `source_id` - Client survey ID
     SurveyList:
       type: object
       properties:
@@ -10579,6 +10486,13 @@ components:
           readOnly: true
         local_id:
           type: string
+          readOnly: true
+        survey_id:
+          type: string
+          readOnly: true
+        supplier_id:
+          type: string
+          nullable: true
           readOnly: true
         client:
           type: integer
@@ -10732,6 +10646,10 @@ components:
           type: number
           format: double
           readOnly: true
+        supplier_entry_link:
+          type: string
+          nullable: true
+          readOnly: true
       required:
       - client_name
       - completes
@@ -10748,6 +10666,9 @@ components:
       - source_id
       - source_modified_display
       - start_link
+      - supplier_entry_link
+      - supplier_id
+      - survey_id
       - updated_at
       - vendor_pricing
     SurveyQuota:
@@ -11471,12 +11392,19 @@ components:
         id:
           type: integer
           readOnly: true
+        public_id:
+          type: string
+          format: uuid
+          readOnly: true
         vendor:
           type: integer
         vendor_name:
           type: string
           readOnly: true
         account_type:
+          type: string
+          readOnly: true
+        supplier_id:
           type: string
           readOnly: true
         name:
@@ -11546,7 +11474,9 @@ components:
       - masked_key
       - name
       - prefix
+      - public_id
       - revoked_at
+      - supplier_id
       - updated_at
       - vendor
       - vendor_name
@@ -11590,20 +11520,6 @@ components:
         client_name:
           type: string
           readOnly: true
-        quantity_limit:
-          type: integer
-          maximum: 9223372036854775807
-          minimum: 0
-          format: int64
-        reserved_quantity:
-          type: integer
-          readOnly: true
-        consumed_quantity:
-          type: integer
-          readOnly: true
-        remaining_quantity:
-          type: integer
-          readOnly: true
         cpi_cut_override_percent:
           type: string
           format: decimal
@@ -11642,6 +11558,26 @@ components:
           type: string
           format: date-time
           nullable: true
+        complete_redirect_url:
+          type: string
+          format: uri
+          maxLength: 2000
+        terminate_redirect_url:
+          type: string
+          format: uri
+          maxLength: 2000
+        over_quota_redirect_url:
+          type: string
+          format: uri
+          maxLength: 2000
+        quality_redirect_url:
+          type: string
+          format: uri
+          maxLength: 2000
+        invalid_redirect_url:
+          type: string
+          format: uri
+          maxLength: 2000
         is_active:
           type: boolean
         created_by:
@@ -11661,13 +11597,10 @@ components:
       - api_key_scopes
       - client
       - client_name
-      - consumed_quantity
       - created_at
       - created_by
       - effective_cpi_cut_percent
       - id
-      - remaining_quantity
-      - reserved_quantity
       - updated_at
       - vendor
       - vendor_name
@@ -11678,11 +11611,6 @@ components:
           type: integer
         client:
           type: integer
-        quantity_limit:
-          type: integer
-          maximum: 9223372036854775807
-          minimum: 0
-          format: int64
         cpi_cut_override_percent:
           type: string
           format: decimal
@@ -11710,6 +11638,26 @@ components:
           type: string
           format: date-time
           nullable: true
+        complete_redirect_url:
+          type: string
+          format: uri
+          maxLength: 2000
+        terminate_redirect_url:
+          type: string
+          format: uri
+          maxLength: 2000
+        over_quota_redirect_url:
+          type: string
+          format: uri
+          maxLength: 2000
+        quality_redirect_url:
+          type: string
+          format: uri
+          maxLength: 2000
+        invalid_redirect_url:
+          type: string
+          format: uri
+          maxLength: 2000
         is_active:
           type: boolean
       required:
@@ -11729,6 +11677,12 @@ components:
         account_type:
           type: string
           readOnly: true
+        supplier_code:
+          type: string
+          readOnly: true
+          nullable: true
+          description: Immutable RM Wins supplier ID shared across every assigned
+            client.
         default_cpi_cut_percent:
           type: string
           format: decimal
@@ -11745,6 +11699,24 @@ components:
             * `panel` - Panel only
             * `api` - API only
             * `both` - Panel and API
+        survey_id_mode:
+          allOf:
+          - $ref: '#/components/schemas/SurveyIdModeEnum'
+          description: |-
+            Identifier exposed as survey_id in this supplier's API and redirects.
+
+            * `project_id` - RM Wins project ID
+            * `source_id` - Client survey ID
+        callback_hash_enabled:
+          type: boolean
+          description: Add an HMAC-SHA256 hash to respondent outcome redirects for
+            this supplier.
+        callback_hash_secret:
+          type: string
+          readOnly: true
+        callback_hash_secret_masked:
+          type: string
+          readOnly: true
         is_active:
           type: boolean
         created_by:
@@ -11761,9 +11733,12 @@ components:
           readOnly: true
       required:
       - account_type
+      - callback_hash_secret
+      - callback_hash_secret_masked
       - created_at
       - created_by
       - id
+      - supplier_code
       - updated_at
       - vendor
       - vendor_name
@@ -11789,6 +11764,22 @@ components:
             * `panel` - Panel only
             * `api` - API only
             * `both` - Panel and API
+        survey_id_mode:
+          allOf:
+          - $ref: '#/components/schemas/SurveyIdModeEnum'
+          description: |-
+            Identifier exposed as survey_id in this supplier's API and redirects.
+
+            * `project_id` - RM Wins project ID
+            * `source_id` - Client survey ID
+        callback_hash_enabled:
+          type: boolean
+          description: Add an HMAC-SHA256 hash to respondent outcome redirects for
+            this supplier.
+        generate_callback_hash_secret:
+          type: boolean
+          writeOnly: true
+          default: false
         is_active:
           type: boolean
       required:
@@ -11961,20 +11952,10 @@ components:
         survey_name:
           type: string
           readOnly: true
-        quantity_limit:
-          type: integer
-          maximum: 9223372036854775807
-          minimum: 0
-          format: int64
-        reserved_quantity:
-          type: integer
-          readOnly: true
-        consumed_quantity:
-          type: integer
-          readOnly: true
-        remaining_quantity:
-          type: integer
-          readOnly: true
+        is_excluded:
+          type: boolean
+          description: Hide this project while leaving every other project in the
+            client grant visible.
         cpi_cut_override_percent:
           type: string
           format: decimal
@@ -12013,13 +11994,10 @@ components:
       - client
       - client_allocation
       - client_name
-      - consumed_quantity
       - created_at
       - created_by
       - effective_cpi_cut_percent
       - id
-      - remaining_quantity
-      - reserved_quantity
       - survey
       - survey_local_id
       - survey_name
@@ -12034,11 +12012,10 @@ components:
           type: integer
         survey:
           type: integer
-        quantity_limit:
-          type: integer
-          maximum: 9223372036854775807
-          minimum: 0
-          format: int64
+        is_excluded:
+          type: boolean
+          description: Hide this project while leaving every other project in the
+            client grant visible.
         cpi_cut_override_percent:
           type: string
           format: decimal
@@ -12087,8 +12064,7 @@ tags:
 - name: Access control
   description: Dynamic roles, function assignments and per-user access overrides.
 - name: Vendors & allocations
-  description: UAT client scope, vendor commercial policy and quantity allocation
-    APIs.
+  description: Supplier client scope, project exclusions, API keys and redirect policies.
 - name: Organization hierarchy
   description: Branch, Sub-branch, Shift, team assignment and unit-level client visibility
     APIs.

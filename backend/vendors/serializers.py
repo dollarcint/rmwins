@@ -3,6 +3,7 @@
 from decimal import Decimal, ROUND_HALF_UP
 import ipaddress
 import re
+import secrets
 from urllib.parse import urlsplit
 
 from django.contrib.auth import get_user_model
@@ -15,7 +16,6 @@ from accounts.models import EmployeeProfile
 from accounts.access import effective_permission_codes, has_function_access
 
 from .models import (
-    AllocationReservation,
     Client,
     ClientIntegration,
     PROFILE_REUSE_AGE_GROUPS,
@@ -26,7 +26,7 @@ from .models import (
     VendorAPIKey,
     VendorSurveyAllocation,
 )
-from .credentials import set_integration_env_key, set_integration_token
+from .credentials import encrypt_secret, set_integration_env_key, set_integration_token
 from .access import is_valid_supplier_profile
 
 
@@ -617,8 +617,6 @@ class OrganizationUnitSerializer(serializers.ModelSerializer):
         except DjangoValidationError as exc:
             raise serializers.ValidationError(exc.message_dict) from exc
         return attrs
-
-
 class OrganizationClientAccessSerializer(serializers.ModelSerializer):
     workspace_owner = serializers.IntegerField(source="organization_unit.workspace_owner_id", read_only=True)
     workspace_owner_name = serializers.SerializerMethodField()
@@ -676,17 +674,25 @@ class VendorCommercialProfileSerializer(serializers.ModelSerializer):
     vendor_name = serializers.SerializerMethodField()
     account_type = serializers.CharField(source="vendor.employee_profile.account_type", read_only=True)
     created_by = serializers.CharField(source="created_by.username", read_only=True, allow_null=True)
+    generate_callback_hash_secret = serializers.BooleanField(write_only=True, required=False, default=False)
+    callback_hash_secret = serializers.CharField(read_only=True, required=False)
+    callback_hash_secret_masked = serializers.SerializerMethodField()
 
     class Meta:
         model = VendorCommercialProfile
         fields = [
-            "id", "vendor", "vendor_name", "account_type", "default_cpi_cut_percent", "currency",
-            "delivery_mode", "is_active", "created_by", "created_at", "updated_at",
+            "id", "vendor", "vendor_name", "account_type", "supplier_code", "default_cpi_cut_percent", "currency",
+            "delivery_mode", "survey_id_mode", "callback_hash_enabled",
+            "generate_callback_hash_secret", "callback_hash_secret", "callback_hash_secret_masked",
+            "is_active", "created_by", "created_at", "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
 
     def get_vendor_name(self, obj) -> str:
         return obj.vendor.get_full_name() or obj.vendor.username
+
+    def get_callback_hash_secret_masked(self, obj) -> str:
+        return f"••••{obj.callback_hash_secret_last_four}" if obj.callback_hash_secret_last_four else ""
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
@@ -700,7 +706,56 @@ class VendorCommercialProfileSerializer(serializers.ModelSerializer):
         delivery_mode = attrs.get("delivery_mode", getattr(self.instance, "delivery_mode", VendorCommercialProfile.DeliveryMode.PANEL))
         if profile.account_type == EmployeeProfile.AccountType.INTERNAL_VENDOR and delivery_mode != VendorCommercialProfile.DeliveryMode.PANEL:
             raise serializers.ValidationError({"delivery_mode": "Internal suppliers use panel-only delivery."})
+        hash_enabled = attrs.get(
+            "callback_hash_enabled",
+            getattr(self.instance, "callback_hash_enabled", False),
+        )
+        generate_secret = attrs.get("generate_callback_hash_secret", False)
+        has_secret = bool(getattr(self.instance, "encrypted_callback_hash_secret", ""))
+        if hash_enabled and not (generate_secret or has_secret):
+            raise serializers.ValidationError({
+                "generate_callback_hash_secret": "Generate the redirect hash key before enabling verification."
+            })
         return attrs
+
+    def _save_secret(self, instance, generate_secret):
+        if not generate_secret:
+            return instance
+        raw_secret = secrets.token_hex(32)
+        instance.encrypted_callback_hash_secret = encrypt_secret(raw_secret)
+        instance.callback_hash_secret_last_four = raw_secret[-4:]
+        instance.callback_hash_secret_changed_at = timezone.now()
+        instance.save(update_fields=[
+            "encrypted_callback_hash_secret", "callback_hash_secret_last_four",
+            "callback_hash_secret_changed_at", "updated_at",
+        ])
+        instance.callback_hash_secret = raw_secret
+        return instance
+
+    def create(self, validated_data):
+        generate_secret = validated_data.pop("generate_callback_hash_secret", False)
+        instance = super().create(validated_data)
+        if not instance.supplier_code:
+            instance.supplier_code = str(500000 + instance.pk)
+            instance.save(update_fields=["supplier_code", "updated_at"])
+        return self._save_secret(instance, generate_secret)
+
+    def update(self, instance, validated_data):
+        generate_secret = validated_data.pop("generate_callback_hash_secret", False)
+        return self._save_secret(super().update(instance, validated_data), generate_secret)
+
+
+class SupplierClientCatalogItemSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    code = serializers.CharField()
+    name = serializers.CharField()
+    project_count = serializers.IntegerField()
+    projects_url = serializers.CharField()
+
+
+class SupplierClientCatalogResponseSerializer(serializers.Serializer):
+    supplier_id = serializers.CharField()
+    clients = SupplierClientCatalogItemSerializer(many=True)
 
 
 class VendorAPIKeySerializer(serializers.ModelSerializer):
@@ -714,17 +769,18 @@ class VendorAPIKeySerializer(serializers.ModelSerializer):
         queryset=VendorClientAllocation.objects.select_related("vendor", "client").all(),
     )
     client_names = serializers.SerializerMethodField()
+    supplier_id = serializers.CharField(source="vendor.vendor_commercial_profile.supplier_code", read_only=True)
 
     class Meta:
         model = VendorAPIKey
         fields = [
-            "id", "vendor", "vendor_name", "account_type", "name", "prefix", "last_four", "masked_key",
+            "id", "public_id", "vendor", "vendor_name", "account_type", "supplier_id", "name", "prefix", "last_four", "masked_key",
             "api_key", "client_allocations", "client_names", "is_active", "expires_at",
             "last_used_at", "revoked_at", "created_by",
             "created_at", "updated_at",
         ]
         read_only_fields = [
-            "prefix", "last_four", "is_active", "last_used_at", "revoked_at", "created_at", "updated_at",
+            "public_id", "prefix", "last_four", "is_active", "last_used_at", "revoked_at", "created_at", "updated_at",
         ]
 
     def get_vendor_name(self, obj) -> str:
@@ -786,7 +842,6 @@ class VendorClientAllocationSerializer(serializers.ModelSerializer):
     vendor_name = serializers.SerializerMethodField()
     client_name = serializers.CharField(source="client.name", read_only=True)
     account_type = serializers.CharField(source="vendor.employee_profile.account_type", read_only=True)
-    remaining_quantity = serializers.IntegerField(read_only=True)
     effective_cpi_cut_percent = serializers.DecimalField(max_digits=5, decimal_places=2, read_only=True)
     created_by = serializers.CharField(source="created_by.username", read_only=True, allow_null=True)
     api_key_scopes = serializers.SerializerMethodField()
@@ -794,13 +849,14 @@ class VendorClientAllocationSerializer(serializers.ModelSerializer):
     class Meta:
         model = VendorClientAllocation
         fields = [
-            "id", "vendor", "vendor_name", "account_type", "client", "client_name", "quantity_limit",
-            "reserved_quantity", "consumed_quantity", "remaining_quantity", "cpi_cut_override_percent",
+            "id", "vendor", "vendor_name", "account_type", "client", "client_name", "cpi_cut_override_percent",
             "effective_cpi_cut_percent", "min_cpi", "max_cpi", "api_key_scopes", "starts_at", "ends_at",
+            "complete_redirect_url", "terminate_redirect_url", "over_quota_redirect_url",
+            "quality_redirect_url", "invalid_redirect_url",
             "is_active", "created_by",
             "created_at", "updated_at",
         ]
-        read_only_fields = ["reserved_quantity", "consumed_quantity", "created_at", "updated_at"]
+        read_only_fields = ["supplier_code", "created_at", "updated_at"]
 
     def get_vendor_name(self, obj) -> str:
         return obj.vendor.get_full_name() or obj.vendor.username
@@ -819,7 +875,6 @@ class VendorClientAllocationSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         attrs = super().validate(attrs)
         vendor = attrs.get("vendor", getattr(self.instance, "vendor", None))
-        quantity_limit = attrs.get("quantity_limit", getattr(self.instance, "quantity_limit", 0))
         cut = attrs.get("cpi_cut_override_percent", getattr(self.instance, "cpi_cut_override_percent", None))
         profile = EmployeeProfile.objects.filter(user=vendor).first()
         if not profile or profile.account_type != EmployeeProfile.AccountType.EXTERNAL_VENDOR:
@@ -831,9 +886,6 @@ class VendorClientAllocationSerializer(serializers.ModelSerializer):
         if min_cpi is not None and max_cpi is not None and min_cpi > max_cpi:
             raise serializers.ValidationError({"max_cpi": "Maximum CPI must be greater than or equal to minimum CPI."})
         instance = self.instance
-        used = (instance.consumed_quantity + instance.reserved_quantity) if instance else 0
-        if quantity_limit < used:
-            raise serializers.ValidationError({"quantity_limit": "Limit cannot be below consumed plus reserved quantity."})
         starts_at = attrs.get("starts_at", getattr(instance, "starts_at", None))
         ends_at = attrs.get("ends_at", getattr(instance, "ends_at", None))
         if starts_at and ends_at and ends_at <= starts_at:
@@ -849,7 +901,6 @@ class VendorSurveyAllocationSerializer(serializers.ModelSerializer):
     survey_local_id = serializers.CharField(source="survey.local_id", read_only=True)
     survey_source_id = serializers.SerializerMethodField()
     survey_name = serializers.CharField(source="survey.name", read_only=True)
-    remaining_quantity = serializers.IntegerField(read_only=True)
     effective_cpi_cut_percent = serializers.DecimalField(max_digits=5, decimal_places=2, read_only=True)
     created_by = serializers.CharField(source="created_by.username", read_only=True, allow_null=True)
 
@@ -857,12 +908,11 @@ class VendorSurveyAllocationSerializer(serializers.ModelSerializer):
         model = VendorSurveyAllocation
         fields = [
             "id", "client_allocation", "vendor", "vendor_name", "client", "client_name", "survey",
-            "survey_local_id", "survey_source_id", "survey_name", "quantity_limit", "reserved_quantity",
-            "consumed_quantity", "remaining_quantity", "cpi_cut_override_percent",
+            "survey_local_id", "survey_source_id", "survey_name", "is_excluded", "cpi_cut_override_percent",
             "effective_cpi_cut_percent", "starts_at", "ends_at", "is_active", "created_by",
             "created_at", "updated_at",
         ]
-        read_only_fields = ["reserved_quantity", "consumed_quantity", "created_at", "updated_at"]
+        read_only_fields = ["created_at", "updated_at"]
 
     def get_vendor_name(self, obj) -> str:
         return obj.vendor.get_full_name() or obj.vendor.username
@@ -875,7 +925,6 @@ class VendorSurveyAllocationSerializer(serializers.ModelSerializer):
         attrs = super().validate(attrs)
         parent = attrs.get("client_allocation", getattr(self.instance, "client_allocation", None))
         survey = attrs.get("survey", getattr(self.instance, "survey", None))
-        quantity_limit = attrs.get("quantity_limit", getattr(self.instance, "quantity_limit", 0))
         cut = attrs.get("cpi_cut_override_percent", getattr(self.instance, "cpi_cut_override_percent", None))
         if parent and survey and survey.client_id != parent.client_id:
             raise serializers.ValidationError({"survey": "Survey must belong to the parent allocation's client."})
@@ -883,9 +932,6 @@ class VendorSurveyAllocationSerializer(serializers.ModelSerializer):
         if account_type == EmployeeProfile.AccountType.INTERNAL_VENDOR and cut not in {None, Decimal("0.00")}:
             raise serializers.ValidationError({"cpi_cut_override_percent": "Internal supplier cut must be zero."})
         instance = self.instance
-        used = (instance.consumed_quantity + instance.reserved_quantity) if instance else 0
-        if quantity_limit < used:
-            raise serializers.ValidationError({"quantity_limit": "Limit cannot be below consumed plus reserved quantity."})
         starts_at = attrs.get("starts_at", getattr(instance, "starts_at", None))
         ends_at = attrs.get("ends_at", getattr(instance, "ends_at", None))
         if starts_at and ends_at and ends_at <= starts_at:
@@ -893,15 +939,4 @@ class VendorSurveyAllocationSerializer(serializers.ModelSerializer):
         return attrs
 
 
-class AllocationReservationSerializer(serializers.ModelSerializer):
-    rid = serializers.CharField(source="attempt.rid", read_only=True)
-    vendor = serializers.IntegerField(source="client_allocation.vendor_id", read_only=True)
-    survey = serializers.IntegerField(source="survey_allocation.survey_id", read_only=True, allow_null=True)
-
-    class Meta:
-        model = AllocationReservation
-        fields = [
-            "id", "attempt", "rid", "vendor", "client_allocation", "survey_allocation", "survey",
-            "quantity", "status", "expires_at", "finalized_at", "reason", "created_at", "updated_at",
-        ]
-        read_only_fields = fields
+# Allocation reservations remain internal legacy records and have no public serializer.

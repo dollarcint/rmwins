@@ -147,14 +147,6 @@
     return `<span class="vendor-state${active ? '' : ' inactive'}">${active ? 'Active' : 'Inactive'}</span>`;
   }
 
-  function quantityMarkup(record) {
-    const limit = Number(record.quantity_limit || 0);
-    const used = Number(record.consumed_quantity || 0);
-    const reserved = Number(record.reserved_quantity || 0);
-    const percent = limit ? Math.min(100, ((used + reserved) / limit) * 100) : 0;
-    return `<div class="quantity-cell"><div class="quantity-line"><strong>${number(record.remaining_quantity)} left</strong><span>${number(used)} used · ${number(reserved)} held / ${number(limit)}</span></div><div class="quantity-bar"><i style="width:${percent}%"></i></div></div>`;
-  }
-
   function cutMarkup(record, inheritedLabel = 'effective') {
     const own = record.cpi_cut_override_percent;
     return `<div class="vendor-money"><strong>${escapeHtml(record.effective_cpi_cut_percent ?? 0)}%</strong><small>${own === null || own === undefined ? inheritedLabel : 'override'}</small></div>`;
@@ -177,8 +169,7 @@
   function renderOverview() {
     if ($('#vendorCount')) $('#vendorCount').textContent = number(state.vendors.length);
     if ($('#allocationCount')) $('#allocationCount').textContent = number(state.clientAllocations.filter((row) => row.is_active).length);
-    if ($('#remainingQuantity')) $('#remainingQuantity').textContent = number(state.clientAllocations.reduce((total, row) => total + Number(row.remaining_quantity || 0), 0));
-    if ($('#surveyRuleCount')) $('#surveyRuleCount').textContent = number(state.surveyAllocations.length);
+    if ($('#surveyRuleCount')) $('#surveyRuleCount').textContent = number(state.surveyAllocations.filter((row) => row.is_excluded && row.is_active).length);
   }
 
   function renderVendors() {
@@ -214,7 +205,6 @@
       const cells = [];
       if (clientColumns.has('vendor')) cells.push(`<td><strong>${escapeHtml(row.vendor_name)}</strong><br>${typeBadge(row.account_type)}</td>`);
       if (clientColumns.has('client')) cells.push(`<td><strong>${escapeHtml(row.client_name)}</strong><br><small>${stateBadge(row.is_active)}</small></td>`);
-      if (clientColumns.has('quantity')) cells.push(`<td>${quantityMarkup(row)}</td>`);
       if (clientColumns.has('cpi')) cells.push(`<td>${cutMarkup(row, 'supplier default')}${cpiRangeMarkup(row)}</td>`);
       if (clientColumns.has('window')) cells.push(`<td><div class="vendor-window"><span>${dateTime(row.starts_at)}</span><span>to ${dateTime(row.ends_at)}</span></div></td>`);
       if (clientColumns.has('actions')) cells.push(`<td>${actionButton('client', row.id, canAllocateClient, 'View')}</td>`);
@@ -222,8 +212,8 @@
     }).join('') || emptyRow(Math.max(1, clientColumns.size), 'No client allocations yet.');
     $('#clientAllocationCards').innerHTML = state.clientAllocations.map((row) => {
       const head = `${clientColumns.has('vendor') ? `<strong>${escapeHtml(row.vendor_name)}</strong>` : ''}${clientColumns.has('client') ? `<small>${escapeHtml(row.client_name)}</small>` : ''}`;
-      const details = `${clientColumns.has('quantity') ? `<span>Available<strong>${number(row.remaining_quantity)}</strong></span><span>Limit<strong>${number(row.quantity_limit)}</strong></span>` : ''}${clientColumns.has('cpi') ? `<span>CPI cut<strong>${escapeHtml(row.effective_cpi_cut_percent)}%</strong></span><span>Source CPI range<strong>${escapeHtml(row.min_cpi ?? 'Any')} – ${escapeHtml(row.max_cpi ?? 'Any')}</strong></span>` : ''}${clientColumns.has('vendor') ? `<span>Type<strong>${escapeHtml(accountLabel(row.account_type))}</strong></span>` : ''}${clientColumns.has('window') ? `<span>Window<strong>${dateTime(row.starts_at)} to ${dateTime(row.ends_at)}</strong></span>` : ''}`;
-      return `<article class="vendor-card">${head ? `<div class="vendor-card-head"><div>${head}</div>${clientColumns.has('client') ? stateBadge(row.is_active) : ''}</div>` : ''}${details ? `<div class="vendor-card-grid">${details}</div>` : ''}${clientColumns.has('quantity') ? quantityMarkup(row) : ''}${clientColumns.has('actions') ? actionButton('client', row.id, canAllocateClient, 'View') : ''}</article>`;
+      const details = `${clientColumns.has('cpi') ? `<span>CPI cut<strong>${escapeHtml(row.effective_cpi_cut_percent)}%</strong></span><span>Source CPI range<strong>${escapeHtml(row.min_cpi ?? 'Any')} – ${escapeHtml(row.max_cpi ?? 'Any')}</strong></span>` : ''}${clientColumns.has('vendor') ? `<span>Type<strong>${escapeHtml(accountLabel(row.account_type))}</strong></span>` : ''}${clientColumns.has('window') ? `<span>Window<strong>${dateTime(row.starts_at)} to ${dateTime(row.ends_at)}</strong></span>` : ''}`;
+      return `<article class="vendor-card">${head ? `<div class="vendor-card-head"><div>${head}</div>${clientColumns.has('client') ? stateBadge(row.is_active) : ''}</div>` : ''}${details ? `<div class="vendor-card-grid">${details}</div>` : ''}${clientColumns.has('actions') ? actionButton('client', row.id, canAllocateClient, 'View') : ''}</article>`;
     }).join('');
   }
 
@@ -234,14 +224,13 @@
       if (projectColumns.has('vendor')) cells.push(`<td><strong>${escapeHtml(row.vendor_name)}</strong></td>`);
       if (projectColumns.has('survey')) cells.push(`<td><strong>${escapeHtml(row.survey_local_id)}</strong><br><small>#${escapeHtml(row.survey_source_id)} · ${escapeHtml(row.survey_name || 'Survey')}</small></td>`);
       if (projectColumns.has('client')) cells.push(`<td>${escapeHtml(row.client_name)}</td>`);
-      if (projectColumns.has('quantity')) cells.push(`<td>${quantityMarkup(row)}</td>`);
-      if (projectColumns.has('cpi')) cells.push(`<td>${cutMarkup(row, 'client policy')}</td>`);
+      if (projectColumns.has('cpi')) cells.push(`<td><strong>${row.is_excluded ? 'Excluded' : 'Override'}</strong><br><small>${stateBadge(row.is_active)}</small></td>`);
       if (projectColumns.has('actions')) cells.push(`<td>${actionButton('survey', row.id, canAllocateProject)}</td>`);
       return `<tr>${cells.join('') || '<td><div class="vendor-empty">No project-allocation columns assigned.</div></td>'}</tr>`;
-    }).join('') || emptyRow(Math.max(1, projectColumns.size), 'No projects allocated. This supplier cannot see or start any client project yet.');
+    }).join('') || emptyRow(Math.max(1, projectColumns.size), 'No exclusions. Every project under each client grant is assigned.');
     $('#surveyAllocationCards').innerHTML = state.surveyAllocations.map((row) => {
       const head = `${projectColumns.has('survey') ? `<strong>${escapeHtml(row.survey_local_id)}</strong>` : ''}${projectColumns.has('vendor') || projectColumns.has('client') ? `<small>${projectColumns.has('vendor') ? escapeHtml(row.vendor_name) : ''}${projectColumns.has('vendor') && projectColumns.has('client') ? ' · ' : ''}${projectColumns.has('client') ? escapeHtml(row.client_name) : ''}</small>` : ''}`;
-      const details = `${projectColumns.has('survey') ? `<span>Survey ID<strong>${escapeHtml(row.survey_source_id)}</strong></span>` : ''}${projectColumns.has('cpi') ? `<span>CPI cut<strong>${escapeHtml(row.effective_cpi_cut_percent)}%</strong></span>` : ''}${projectColumns.has('quantity') ? `<span>Available<strong>${number(row.remaining_quantity)}</strong></span><span>Limit<strong>${number(row.quantity_limit)}</strong></span>` : ''}`;
+      const details = `${projectColumns.has('survey') ? `<span>Survey ID<strong>${escapeHtml(row.survey_source_id)}</strong></span>` : ''}${projectColumns.has('cpi') ? `<span>Rule<strong>${row.is_excluded ? 'Excluded' : 'Override'}</strong></span>` : ''}`;
       return `<article class="vendor-card">${head ? `<div class="vendor-card-head"><div>${head}</div>${stateBadge(row.is_active)}</div>` : ''}${details ? `<div class="vendor-card-grid">${details}</div>` : ''}${projectColumns.has('actions') ? actionButton('survey', row.id, canAllocateProject) : ''}</article>`;
     }).join('');
   }
@@ -251,7 +240,7 @@
     $('#apiKeyRows').innerHTML = state.apiKeys.map((key) => {
       const cells = [];
       if (apiColumns.has('vendor')) cells.push(`<td><strong>${escapeHtml(key.vendor_name)}</strong><br>${typeBadge(key.account_type)}</td>`);
-      if (apiColumns.has('key')) cells.push(`<td><div class="vendor-money"><strong>${escapeHtml(key.name)}</strong><small>${escapeHtml(key.masked_key)} · ${escapeHtml((key.client_names || []).join(', ') || 'No clients')}</small></div></td>`);
+      if (apiColumns.has('key')) cells.push(`<td><div class="vendor-money"><strong>${escapeHtml(key.name)}</strong><small>Supplier ${escapeHtml(key.supplier_id || '—')} · ${escapeHtml(key.masked_key)} · ${escapeHtml((key.client_names || []).join(', ') || 'No clients')}</small></div></td>`);
       if (apiColumns.has('created')) cells.push(`<td>${dateTime(key.created_at)}</td>`);
       if (apiColumns.has('last_used')) cells.push(`<td>${key.last_used_at ? dateTime(key.last_used_at) : 'Never'}</td>`);
       if (apiColumns.has('expires')) cells.push(`<td>${key.expires_at ? dateTime(key.expires_at) : 'No expiry'}</td>`);
@@ -289,7 +278,7 @@
       Number(row.vendor) === vendorId && row.is_active
     ));
     container.innerHTML = allocations.length ? allocations.map((row) => (
-      `<label><input type="checkbox" value="${row.id}"><span><strong>${escapeHtml(row.client_name)}</strong><small>${escapeHtml(row.effective_cpi_cut_percent)}% cut · ${number(row.remaining_quantity)} completes left</small></span></label>`
+      `<label><input type="checkbox" value="${row.id}"><span><strong>${escapeHtml(row.client_name)}</strong><small>${escapeHtml(row.effective_cpi_cut_percent)}% cut · all non-excluded projects</small></span></label>`
     )).join('') : '<div class="vendor-choice-empty">Select an external supplier with an active client allocation.</div>';
   }
 
@@ -352,12 +341,7 @@
     if (internal) field('client_cpi_cut', 'client').value = '';
   }
 
-  function updateSurveyRule() {
-    const parent = state.clientAllocations.find((item) => String(item.id) === field('client_allocation', 'survey').value);
-    const internal = parent?.account_type === 'internal_vendor';
-    field('survey_cpi_cut', 'survey').disabled = internal;
-    if (internal) field('survey_cpi_cut', 'survey').value = '';
-  }
+  function updateSurveyRule() {}
 
   function resetForm(mode) {
     activeMode = mode;
@@ -383,6 +367,10 @@
     if (issuedPanel) issuedPanel.hidden = true;
     const issuedValue = $('#issuedKeyValue');
     if (issuedValue) issuedValue.value = '';
+    const hashPanel = $('#callbackHashSecretPanel');
+    if (hashPanel) hashPanel.hidden = true;
+    const hashValue = $('#callbackHashSecretValue');
+    if (hashValue) hashValue.value = '';
     const submit = $('[data-vendor-submit]', form);
     submit.hidden = false;
     submit.disabled = false;
@@ -412,6 +400,9 @@
     field('default_cpi_cut_percent').value = profile?.default_cpi_cut_percent || '0.00';
     field('currency').value = profile?.currency || 'USD';
     field('delivery_mode').value = profile?.delivery_mode || vendor?.delivery_mode || 'panel';
+    field('survey_id_mode').value = profile?.survey_id_mode || 'project_id';
+    field('callback_hash_enabled').checked = profile?.callback_hash_enabled || false;
+    field('generate_callback_hash_secret').checked = false;
     field('is_active').checked = profile?.is_active ?? true;
     $('[data-modal-eyebrow]', modal).textContent = accountLabel(vendor?.account_type);
     $('[data-modal-title]', modal).textContent = profile ? 'Edit commercial policy' : 'Create commercial policy';
@@ -433,12 +424,13 @@
       field('client_vendor').value = record.vendor;
       setClientSelection([record.client], true);
       field('client_vendor').disabled = true;
-      field('client_quantity_limit').value = record.quantity_limit;
       field('client_cpi_cut').value = record.cpi_cut_override_percent ?? '';
       field('client_min_cpi').value = record.min_cpi ?? '';
       field('client_max_cpi').value = record.max_cpi ?? '';
       field('client_starts_at').value = toInputDateTime(record.starts_at);
       field('client_ends_at').value = toInputDateTime(record.ends_at);
+      ['complete_redirect_url', 'terminate_redirect_url', 'over_quota_redirect_url', 'quality_redirect_url', 'invalid_redirect_url']
+        .forEach((name) => { field(name).value = record[name] || ''; });
       field('is_active').checked = record.is_active;
       const apiScopes = (record.api_key_scopes || []).filter((item) => item.is_active);
       const summary = $('#clientAllocationSummary');
@@ -466,14 +458,10 @@
       field('survey_search').value = `${record.survey_local_id} · #${record.survey_source_id} · ${record.survey_name || 'Survey'}`;
       field('survey_search').disabled = true;
       state.selectedSurvey = { id: record.survey };
-      field('survey_quantity_limit').value = record.quantity_limit;
-      field('survey_cpi_cut').value = record.cpi_cut_override_percent ?? '';
-      field('survey_starts_at').value = toInputDateTime(record.starts_at);
-      field('survey_ends_at').value = toInputDateTime(record.ends_at);
       field('is_active').checked = record.is_active;
     }
-    $('[data-modal-title]', modal).textContent = record ? 'Edit project allocation' : 'Allocate a project';
-    $('[data-vendor-submit]', form).textContent = record ? 'Save project allocation' : 'Create project allocation';
+    $('[data-modal-title]', modal).textContent = record ? 'Edit project exclusion' : 'Exclude a project';
+    $('[data-vendor-submit]', form).textContent = record ? 'Save exclusion' : 'Exclude project';
     updateSurveyRule(); showModal();
   }
 
@@ -597,6 +585,10 @@
     await navigator.clipboard.writeText($('#issuedKeyValue').value);
     toast('API key copied. Store it securely.');
   });
+  $('#copyCallbackHashSecret').addEventListener('click', async () => {
+    await navigator.clipboard.writeText($('#callbackHashSecretValue').value);
+    toast('Redirect hash key copied. Share it securely.');
+  });
 
   async function submitVendorForm(event) {
     event.preventDefault();
@@ -613,6 +605,9 @@
         vendor: Number(field('policy_vendor').value),
         default_cpi_cut_percent: field('default_cpi_cut_percent').disabled ? '0.00' : field('default_cpi_cut_percent').value,
         currency: field('currency').value, delivery_mode: field('delivery_mode').value,
+        survey_id_mode: field('survey_id_mode').value,
+        callback_hash_enabled: field('callback_hash_enabled').checked,
+        generate_callback_hash_secret: field('generate_callback_hash_secret').checked,
         is_active: field('is_active').checked,
       };
     } else if (mode === 'client') {
@@ -623,11 +618,15 @@
       }
       payload = {
         vendor: Number(field('client_vendor').value), client: clientIds[0],
-        quantity_limit: Number(field('client_quantity_limit').value),
         cpi_cut_override_percent: field('client_cpi_cut').disabled ? null : nullableNumber(field('client_cpi_cut').value),
         min_cpi: nullableNumber(field('client_min_cpi').value),
         max_cpi: nullableNumber(field('client_max_cpi').value),
         starts_at: toApiDateTime(field('client_starts_at').value), ends_at: toApiDateTime(field('client_ends_at').value),
+        complete_redirect_url: field('complete_redirect_url').value.trim(),
+        terminate_redirect_url: field('terminate_redirect_url').value.trim(),
+        over_quota_redirect_url: field('over_quota_redirect_url').value.trim(),
+        quality_redirect_url: field('quality_redirect_url').value.trim(),
+        invalid_redirect_url: field('invalid_redirect_url').value.trim(),
         is_active: field('is_active').checked,
       };
     } else if (mode === 'survey') {
@@ -635,9 +634,7 @@
       url = `/api/v1/vendors/survey-allocations/${id ? `${id}/` : ''}`;
       payload = {
         client_allocation: Number(field('client_allocation').value), survey: Number(field('survey').value),
-        quantity_limit: Number(field('survey_quantity_limit').value),
-        cpi_cut_override_percent: field('survey_cpi_cut').disabled ? null : nullableNumber(field('survey_cpi_cut').value),
-        starts_at: toApiDateTime(field('survey_starts_at').value), ends_at: toApiDateTime(field('survey_ends_at').value),
+        is_excluded: true,
         is_active: field('is_active').checked,
       };
     } else {
@@ -672,6 +669,11 @@
         $$('input,select', form).forEach((control) => { control.disabled = true; });
         submit.hidden = true;
         toast('API key generated. Copy it now.');
+        await reloadData();
+      } else if (mode === 'policy' && result.callback_hash_secret) {
+        $('#callbackHashSecretValue').value = result.callback_hash_secret;
+        $('#callbackHashSecretPanel').hidden = false;
+        toast('Redirect hash key generated. Copy it now.');
         await reloadData();
       } else {
         const count = mode === 'client' && !id ? selectedClientIds().length : 1;

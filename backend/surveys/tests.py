@@ -446,6 +446,23 @@ class SurveyAPITests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["count"], 2)
 
+    def test_survey_type_filter_normalizes_b2b_and_b2c_from_both_source_fields(self):
+        self.survey.survey_type = "Business to Business"
+        self.survey.save(update_fields=["survey_type"])
+        consumer = Survey.objects.create(
+            source_id=9878,
+            name="Consumer survey",
+            country_code="US",
+            status=Survey.Status.LIVE,
+            group_type="Consumer",
+        )
+        b2b = self.api.get(reverse("survey-list"), {"survey_type": "B2B"})
+        b2c = self.api.get(reverse("survey-list"), {"survey_type": "B2C"})
+        both = self.api.get(reverse("survey-list"), {"survey_type": "B2B,B2C"})
+        self.assertEqual([row["id"] for row in b2b.data["results"]], [self.survey.pk])
+        self.assertEqual([row["id"] for row in b2c.data["results"]], [consumer.pk])
+        self.assertEqual({row["id"] for row in both.data["results"]}, {self.survey.pk, consumer.pk})
+
     def test_inactive_integration_inventory_is_hidden_when_replaced(self):
         client = Client.objects.create(
             code="replace-innovate", name="InnovateMR", provider_code="innovatemr"

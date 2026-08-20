@@ -1,6 +1,7 @@
 """Clients, integrations, suppliers, allocations, reservations and organization."""
 
 from decimal import Decimal
+import uuid
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
@@ -418,10 +419,22 @@ class VendorCommercialProfile(models.Model):
         API = "api", "API only"
         BOTH = "both", "Panel and API"
 
+    class SurveyIdMode(models.TextChoices):
+        PROJECT_ID = "project_id", "RM Wins project ID"
+        SOURCE_ID = "source_id", "Client survey ID"
+
     vendor = models.OneToOneField(
         settings.AUTH_USER_MODEL,
         on_delete=models.PROTECT,
         related_name="vendor_commercial_profile",
+    )
+    supplier_code = models.CharField(
+        max_length=40,
+        null=True,
+        blank=True,
+        unique=True,
+        editable=False,
+        help_text="Immutable RM Wins supplier ID shared across every assigned client.",
     )
     default_cpi_cut_percent = models.DecimalField(
         max_digits=5,
@@ -437,6 +450,19 @@ class VendorCommercialProfile(models.Model):
         db_index=True,
         help_text="Controls whether an external supplier can sign in to the panel, use API keys, or both.",
     )
+    survey_id_mode = models.CharField(
+        max_length=16,
+        choices=SurveyIdMode.choices,
+        default=SurveyIdMode.PROJECT_ID,
+        help_text="Identifier exposed as survey_id in this supplier's API and redirects.",
+    )
+    callback_hash_enabled = models.BooleanField(
+        default=False,
+        help_text="Add an HMAC-SHA256 hash to respondent outcome redirects for this supplier.",
+    )
+    encrypted_callback_hash_secret = models.TextField(blank=True, editable=False)
+    callback_hash_secret_last_four = models.CharField(max_length=4, blank=True, editable=False)
+    callback_hash_secret_changed_at = models.DateTimeField(null=True, blank=True, editable=False)
     is_active = models.BooleanField(default=True, db_index=True)
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -470,6 +496,14 @@ class VendorCommercialProfile(models.Model):
         if account_type == "internal_vendor" and self.delivery_mode != self.DeliveryMode.PANEL:
             raise ValidationError({"delivery_mode": "Internal suppliers use the panel delivery mode."})
 
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        if not self.supplier_code:
+            self.supplier_code = str(500000 + self.pk)
+            type(self).objects.filter(pk=self.pk, supplier_code__isnull=True).update(
+                supplier_code=self.supplier_code
+            )
+
     def __str__(self):
         return self.vendor.get_full_name() or self.vendor.username
 
@@ -486,9 +520,10 @@ class VendorAPIKey(models.Model):
         "VendorClientAllocation",
         blank=True,
         related_name="api_keys",
-        help_text="Client grants this key may expose. Project visibility and caps still follow the live allocation rules.",
+        help_text="Client grants this key may expose. Active project exclusions are applied automatically.",
     )
     name = models.CharField(max_length=120)
+    public_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
     prefix = models.CharField(max_length=16, db_index=True)
     last_four = models.CharField(max_length=4)
     key_hash = models.CharField(max_length=64, unique=True, editable=False)
@@ -528,7 +563,11 @@ class VendorAPIKey(models.Model):
 
 
 class VendorClientAllocation(models.Model):
-    """Client eligibility, shared complete ceiling and client-level CPI policy."""
+    """Client eligibility, redirect contract and client-level CPI policy.
+
+    The legacy quantity columns remain temporarily for migration compatibility,
+    but no request, API response or respondent journey reads or mutates them.
+    """
 
     vendor = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -563,6 +602,11 @@ class VendorClientAllocation(models.Model):
         validators=[MinValueValidator(Decimal("0.00"))],
         help_text="Optional source-CPI ceiling for this supplier/client grant.",
     )
+    complete_redirect_url = models.URLField(max_length=2000, blank=True)
+    terminate_redirect_url = models.URLField(max_length=2000, blank=True)
+    over_quota_redirect_url = models.URLField(max_length=2000, blank=True)
+    quality_redirect_url = models.URLField(max_length=2000, blank=True)
+    invalid_redirect_url = models.URLField(max_length=2000, blank=True)
     starts_at = models.DateTimeField(null=True, blank=True)
     ends_at = models.DateTimeField(null=True, blank=True)
     is_active = models.BooleanField(default=True, db_index=True)
@@ -626,7 +670,12 @@ class VendorClientAllocation(models.Model):
 
 
 class VendorSurveyAllocation(models.Model):
-    """Explicit project visibility and complete cap under a client allocation."""
+    """Optional per-project exclusion or CPI/window override.
+
+    Every project is visible from the parent client grant by default. An active
+    ``is_excluded`` row removes only that project from panel and API delivery.
+    Legacy quantity columns are inert and retained only for safe DB migration.
+    """
 
     client_allocation = models.ForeignKey(
         VendorClientAllocation,
@@ -637,6 +686,11 @@ class VendorSurveyAllocation(models.Model):
     quantity_limit = models.PositiveBigIntegerField(default=0)
     reserved_quantity = models.PositiveBigIntegerField(default=0, editable=False)
     consumed_quantity = models.PositiveBigIntegerField(default=0, editable=False)
+    is_excluded = models.BooleanField(
+        default=False,
+        db_index=True,
+        help_text="Hide this project while leaving every other project in the client grant visible.",
+    )
     cpi_cut_override_percent = models.DecimalField(
         max_digits=5,
         decimal_places=2,

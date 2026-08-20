@@ -389,7 +389,7 @@ SPECTACULAR_SETTINGS = {
         {"name": "User hits", "description": "Date-wise user hits and completes aggregated by respondent device."},
         {"name": "Synchronization", "description": "Trigger and audit upstream inventory synchronization."},
         {"name": "Access control", "description": "Dynamic roles, function assignments and per-user access overrides."},
-        {"name": "Vendors & allocations", "description": "UAT client scope, vendor commercial policy and quantity allocation APIs."},
+        {"name": "Vendors & allocations", "description": "Supplier client scope, project exclusions, API keys and redirect policies."},
         {"name": "Organization hierarchy", "description": "Branch, Sub-branch, Shift, team assignment and unit-level client visibility APIs."},
         {"name": "Client API catalog", "description": "Search configured clients by stable name/code and inspect their available provider operations without database IDs."},
         {"name": "InnovateMR APIs", "description": "Every documented InnovateMR Supplier API, grouped for direct testing with server-side credentials and guarded live mutations."},
@@ -474,8 +474,6 @@ INNOVATEMR_DETAIL_SYNC_INTERVAL_SECONDS = int(os.getenv("INNOVATEMR_DETAIL_SYNC_
 INNOVATEMR_ATTEMPT_RECONCILE_INTERVAL_SECONDS = int(os.getenv("INNOVATEMR_ATTEMPT_RECONCILE_INTERVAL_SECONDS", "60"))
 INNOVATEMR_ATTEMPT_RECONCILE_BATCH = int(os.getenv("INNOVATEMR_ATTEMPT_RECONCILE_BATCH", "20"))
 INNOVATEMR_ATTEMPT_RECONCILE_LOOKBACK_HOURS = int(os.getenv("INNOVATEMR_ATTEMPT_RECONCILE_LOOKBACK_HOURS", "168"))
-VENDOR_RESERVATION_TTL_MINUTES = int(os.getenv("VENDOR_RESERVATION_TTL_MINUTES", "180"))
-VENDOR_RESERVATION_CLEANUP_INTERVAL_SECONDS = int(os.getenv("VENDOR_RESERVATION_CLEANUP_INTERVAL_SECONDS", "60"))
 CELERY_BEAT_SCHEDULE = {
     "dispatch-client-integration-syncs": {
         "task": "surveys.dispatch_due_integrations",
@@ -484,9 +482,5 @@ CELERY_BEAT_SCHEDULE = {
     "reconcile-legacy-redirect-attempts": {
         "task": "surveys.reconcile_pending_attempts",
         "schedule": float(INNOVATEMR_ATTEMPT_RECONCILE_INTERVAL_SECONDS),
-    },
-    "expire-vendor-allocation-reservations": {
-        "task": "vendors.expire_allocation_reservations",
-        "schedule": float(VENDOR_RESERVATION_CLEANUP_INTERVAL_SECONDS),
     },
 } if ENABLE_SCHEDULED_JOBS else {}

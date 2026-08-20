@@ -74,7 +74,7 @@
     <label id="surveyTypeLabel">Survey type</label>
     <div class="multi-select" data-multi-filter="survey_type" data-default-label="All survey types">
       <button class="multi-trigger" type="button" aria-labelledby="surveyTypeLabel" aria-expanded="false"><span>All survey types</span><i>⌄</i></button>
-      <div class="multi-menu" hidden><div class="multi-options">{% for survey_type in survey_types %}<label><input type="checkbox" value="{{ survey_type }}"><span>{{ survey_type }}</span></label>{% empty %}<label><input type="checkbox" value="B2B"><span>B2B</span></label><label><input type="checkbox" value="B2C"><span>B2C</span></label>{% endfor %}</div></div>
+      <div class="multi-menu" hidden><div class="multi-menu-search"><span aria-hidden="true">⌕</span><input type="search" data-multi-search placeholder="Search survey type…" aria-label="Search survey types" autocomplete="off"></div><div class="multi-options">{% for survey_type in survey_types %}<label><input type="checkbox" value="{{ survey_type }}"><span>{{ survey_type }}</span></label>{% empty %}<label><input type="checkbox" value="B2B"><span>B2B</span></label><label><input type="checkbox" value="B2C"><span>B2C</span></label>{% endfor %}</div><p class="multi-no-results" hidden>No matching survey type</p></div>
     </div>
   </div>
   {% endif %}

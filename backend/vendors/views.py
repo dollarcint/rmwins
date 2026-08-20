@@ -8,7 +8,7 @@ from django.shortcuts import render
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import extend_schema, extend_schema_view
-from rest_framework import filters, status, viewsets
+from rest_framework import filters, permissions, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
@@ -29,7 +29,6 @@ from .access import (
 )
 
 from .models import (
-    AllocationReservation,
     Client,
     ClientIntegration,
     OrganizationClientAccess,
@@ -40,7 +39,6 @@ from .models import (
     VendorSurveyAllocation,
 )
 from .serializers import (
-    AllocationReservationSerializer,
     ClientIntegrationSerializer,
     IntegrationActionResponseSerializer,
     IntegrationPreviewSerializer,
@@ -55,8 +53,52 @@ from .serializers import (
     VendorSurveyAllocationSerializer,
     VendorDirectorySerializer,
     VendorManagementOptionsSerializer,
+    SupplierClientCatalogResponseSerializer,
 )
 from .services import organization_unit_rollup_counts
+
+
+class SupplierClientCatalogAPIView(APIView):
+    """List API-key-scoped clients without exposing owner allocation internals."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    @extend_schema(
+        tags=["Suppliers & allocations"],
+        summary="List clients assigned to a supplier API key",
+        responses={200: SupplierClientCatalogResponseSerializer},
+    )
+    def get(self, request):
+        if not isinstance(getattr(request, "auth", None), VendorAPIKey):
+            raise PermissionDenied("A supplier API key is required.")
+        from surveys.models import Survey
+        from .services import scope_surveys_for_user
+
+        allocations = list(
+            request.auth.client_allocations.filter(
+                vendor=request.user, is_active=True, client__is_active=True
+            ).select_related("client").order_by("client__name")
+        )
+        client_ids = [allocation.client_id for allocation in allocations]
+        counts = {
+            row["client_id"]: row["total"]
+            for row in scope_surveys_for_user(
+                Survey.objects.filter(client_id__in=client_ids), request.user
+            ).values("client_id").annotate(total=Count("pk"))
+        }
+        return Response({
+            "supplier_id": request.user.vendor_commercial_profile.supplier_code,
+            "clients": [
+                {
+                    "id": allocation.client_id,
+                    "code": allocation.client.code,
+                    "name": allocation.client.name,
+                    "project_count": counts.get(allocation.client_id, 0),
+                    "projects_url": f"/api/v1/surveys/?client={allocation.client_id}",
+                }
+                for allocation in allocations
+            ],
+        })
 
 
 @any_function_permission_required("vendors.view", "vendors.manage", "allocations.view", "allocations.manage")
@@ -68,11 +110,11 @@ def vendor_management_page(request):
         if f"vendors.column.vendor.{name}" in codes
     ]
     client_columns = [
-        name for name in ("vendor", "client", "quantity", "cpi", "window", "actions")
+        name for name in ("vendor", "client", "cpi", "window", "actions")
         if f"vendors.column.client.{name}" in codes
     ]
     project_columns = [
-        name for name in ("vendor", "survey", "client", "quantity", "cpi", "actions")
+        name for name in ("vendor", "survey", "client", "cpi", "actions")
         if f"vendors.column.project.{name}" in codes
     ]
     api_columns = [
@@ -86,7 +128,7 @@ def vendor_management_page(request):
     return render(request, "vendors/management.html", {
         "active_page": "vendors",
         "vendor_cards": [
-            name for name in ("vendors", "client_grants", "quantity", "projects")
+            name for name in ("vendors", "client_grants", "projects")
             if f"vendors.card.{name}" in codes
         ],
         "can_view_vendors": "vendors.tab.policies" in codes,
@@ -671,8 +713,8 @@ class VendorAPIKeyViewSet(viewsets.ModelViewSet):
 
 
 @extend_schema_view(
-    list=extend_schema(tags=["Suppliers & allocations"], summary="List supplier client grants and quantities"),
-    create=extend_schema(tags=["Suppliers & allocations"], summary="Allocate a client and quantity to a supplier"),
+    list=extend_schema(tags=["Suppliers & allocations"], summary="List supplier client grants and redirects"),
+    create=extend_schema(tags=["Suppliers & allocations"], summary="Allocate a client to a supplier"),
     retrieve=extend_schema(tags=["Suppliers & allocations"], summary="Get a supplier client allocation"),
     update=extend_schema(tags=["Suppliers & allocations"], summary="Replace a supplier client allocation"),
     partial_update=extend_schema(tags=["Suppliers & allocations"], summary="Update a supplier client allocation"),
@@ -691,14 +733,14 @@ class VendorClientAllocationViewSet(PermissionByActionMixin, viewsets.ModelViewS
     filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
     filterset_fields = ["vendor", "client", "vendor__employee_profile__account_type", "is_active"]
     search_fields = ["vendor__username", "vendor__first_name", "vendor__last_name", "client__name", "client__code"]
-    ordering_fields = ["created_at", "updated_at", "quantity_limit", "consumed_quantity"]
+    ordering_fields = ["created_at", "updated_at", "client__name"]
     ordering = ["client__name", "vendor__username"]
     vendor_scope_filter = "vendor_id"
 
 
 @extend_schema_view(
-    list=extend_schema(tags=["Suppliers & allocations"], summary="List supplier project allocations and complete caps"),
-    create=extend_schema(tags=["Vendors & allocations"], summary="Allocate a visible project with a complete cap"),
+    list=extend_schema(tags=["Suppliers & allocations"], summary="List supplier project exclusions"),
+    create=extend_schema(tags=["Vendors & allocations"], summary="Exclude one project from a supplier"),
     retrieve=extend_schema(tags=["Vendors & allocations"], summary="Get a project allocation"),
     update=extend_schema(tags=["Vendors & allocations"], summary="Replace a project allocation"),
     partial_update=extend_schema(tags=["Vendors & allocations"], summary="Update a project allocation or cap"),
@@ -721,25 +763,6 @@ class VendorSurveyAllocationViewSet(PermissionByActionMixin, viewsets.ModelViewS
         "client_allocation__vendor__username", "client_allocation__vendor__first_name",
         "client_allocation__vendor__last_name", "survey__local_id", "survey__source_id", "survey__name",
     ]
-    ordering_fields = ["created_at", "updated_at", "quantity_limit", "consumed_quantity"]
+    ordering_fields = ["created_at", "updated_at", "survey__source_id", "is_excluded"]
     ordering = ["survey__source_id", "client_allocation__vendor__username"]
-    vendor_scope_filter = "client_allocation__vendor_id"
-
-
-@extend_schema_view(
-    list=extend_schema(tags=["Suppliers & allocations"], summary="List allocation reservation audit records"),
-    retrieve=extend_schema(tags=["Suppliers & allocations"], summary="Get an allocation reservation audit record"),
-)
-class AllocationReservationViewSet(VendorScopedQuerysetMixin, viewsets.ReadOnlyModelViewSet):
-    queryset = AllocationReservation.objects.select_related(
-        "attempt", "client_allocation", "client_allocation__vendor", "survey_allocation", "survey_allocation__survey",
-    ).all()
-    serializer_class = AllocationReservationSerializer
-    permission_classes = [HasFunctionPermission]
-    required_function_permission = ("allocations.view", "allocations.manage")
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
-    filterset_fields = ["status", "client_allocation", "client_allocation__vendor", "survey_allocation"]
-    search_fields = ["attempt__rid", "client_allocation__vendor__username", "survey_allocation__survey__local_id"]
-    ordering_fields = ["created_at", "expires_at", "finalized_at", "status"]
-    ordering = ["-created_at"]
     vendor_scope_filter = "client_allocation__vendor_id"

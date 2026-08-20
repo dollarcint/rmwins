@@ -60,11 +60,10 @@ celery -A config worker --loglevel=info --pool=solo
 celery -A config beat --loglevel=info
 ```
 
-Beat schedules three independent dispatch/check jobs every minute by default:
+Beat schedules two independent dispatch/check jobs every minute by default:
 
 1. `surveys.dispatch_due_integrations` queues each active scheduled client integration only when its own interval is due. The worker synchronizes inventory and a bounded detail batch; RFG has a hard 600-second minimum.
 2. `surveys.reconcile_pending_attempts` checks redirected attempts whose legacy client return URL has not called this application.
-3. `vendors.expire_allocation_reservations` releases capacity held by abandoned vendor attempts after the configured TTL.
 
 Opening Quota or Pre-screening in the UI also refreshes that survey immediately when its cached details are older than its source `modifiedDate`. Cached details remain available during a temporary upstream outage.
 

@@ -2,6 +2,7 @@ from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlsplit
 
 from django.contrib.auth import get_user_model
 from django.conf import settings
@@ -38,6 +39,7 @@ from .services import (
 from .serializers import OrganizationUnitSerializer
 from .tasks import expire_allocation_reservations_task
 from .views import OrganizationUnitViewSet
+from .supplier_delivery import supplier_outcome_redirect, supplier_outcome_signature
 
 
 class VendorFoundationTests(TestCase):
@@ -168,10 +170,10 @@ class VendorFoundationTests(TestCase):
         self.assertEqual(visible_cpi, Decimal("2.55"))
         self.assertEqual(applied_cut, Decimal("40.00"))
 
-    def test_reservation_freezes_cpi_and_completion_consumes_both_limits(self):
+    def test_attempt_freezes_cpi_without_quantity_reservations(self):
         attempt = self.attempt("Ua1Bb2Cc3D")
-        reservation = reserve_attempt_capacity(attempt, self.external_survey_allocation)
-        self.assertEqual(reservation.status, AllocationReservation.Status.RESERVED)
+        attributed = reserve_attempt_capacity(attempt, self.external_survey_allocation)
+        self.assertEqual(attributed.pk, attempt.pk)
         attempt.refresh_from_db()
         self.assertEqual(attempt.vendor, self.external)
         self.assertEqual(attempt.client, self.client_record)
@@ -183,15 +185,14 @@ class VendorFoundationTests(TestCase):
         self.survey.save(update_fields=["cpi"])
         attempt.status = SurveyAttempt.Status.COMPLETED
         attempt.save(update_fields=["status"])
-        finalized = finalize_attempt_capacity(attempt)
-        self.assertEqual(finalized.status, AllocationReservation.Status.CONSUMED)
+        self.assertIsNone(finalize_attempt_capacity(attempt))
         attempt.refresh_from_db()
         self.assertEqual(attempt.payable_cpi_snapshot, Decimal("7.00"))
         self.external_client_allocation.refresh_from_db()
         self.external_survey_allocation.refresh_from_db()
-        self.assertEqual(self.external_client_allocation.consumed_quantity, 1)
-        self.assertEqual(self.external_survey_allocation.consumed_quantity, 1)
-        self.assertEqual(finalize_attempt_capacity(attempt).status, AllocationReservation.Status.CONSUMED)
+        self.assertEqual(self.external_client_allocation.consumed_quantity, 0)
+        self.assertEqual(self.external_survey_allocation.consumed_quantity, 0)
+        self.assertIsNone(finalize_attempt_capacity(attempt))
 
         new_attempt = self.attempt("Ua9Mm8Nn7P")
         reserve_attempt_capacity(new_attempt, self.external_survey_allocation)
@@ -201,19 +202,21 @@ class VendorFoundationTests(TestCase):
         self.assertEqual(new_attempt.source_cpi_snapshot, Decimal("6.00"))
         self.assertEqual(new_attempt.payable_cpi_snapshot, Decimal("4.20"))
 
-    def test_non_complete_releases_and_exhausted_survey_rejects(self):
+    def test_supplier_quantity_fields_do_not_limit_delivery(self):
         attempt = self.attempt("Ua4Ee5Ff6G")
         reserve_attempt_capacity(attempt, self.external_survey_allocation)
         attempt.status = SurveyAttempt.Status.TERMINATED
         attempt.save(update_fields=["status"])
-        self.assertEqual(finalize_attempt_capacity(attempt).status, AllocationReservation.Status.RELEASED)
+        self.assertIsNone(finalize_attempt_capacity(attempt))
         self.external_survey_allocation.refresh_from_db()
-        self.assertEqual(self.external_survey_allocation.remaining_quantity, 2)
+        self.assertEqual(self.external_survey_allocation.reserved_quantity, 0)
 
         self.external_survey_allocation.quantity_limit = 0
         self.external_survey_allocation.save(update_fields=["quantity_limit"])
-        with self.assertRaisesMessage(AllocationUnavailable, "Project complete cap is exhausted"):
-            reserve_attempt_capacity(self.attempt("Ua7Hh8Ii9J"), self.external_survey_allocation)
+        self.assertEqual(
+            reserve_attempt_capacity(self.attempt("Ua7Hh8Ii9J"), self.external_survey_allocation).status,
+            SurveyAttempt.Status.INITIATED,
+        )
 
     def test_client_grant_exposes_all_projects_and_uses_shared_capacity(self):
         unallocated_survey = Survey.objects.create(
@@ -260,15 +263,14 @@ class VendorFoundationTests(TestCase):
         )
         self.assertEqual(start.status_code, 302)
         created_attempt = SurveyAttempt.objects.get(survey=unallocated_survey)
-        reservation = created_attempt.allocation_reservation
-        self.assertEqual(reservation.client_allocation, self.external_client_allocation)
-        self.assertIsNone(reservation.survey_allocation)
+        self.assertEqual(created_attempt.client_allocation, self.external_client_allocation)
+        self.assertIsNone(created_attempt.survey_allocation)
 
         created_attempt.status = SurveyAttempt.Status.COMPLETED
         created_attempt.save(update_fields=["status"])
         finalize_attempt_capacity(created_attempt)
         self.external_client_allocation.refresh_from_db()
-        self.assertEqual(self.external_client_allocation.consumed_quantity, 1)
+        self.assertEqual(self.external_client_allocation.consumed_quantity, 0)
 
     def test_superuser_can_manage_foundation_api_and_employee_cannot(self):
         owner_api = APIClient()
@@ -324,26 +326,11 @@ class VendorFoundationTests(TestCase):
             403,
         )
 
-    def test_expiry_boundary_is_recorded_for_future_cleanup_job(self):
-        attempt = self.attempt("Ua0Kk1Ll2M")
-        reservation = reserve_attempt_capacity(
-            attempt,
-            self.external_survey_allocation,
-            expires_at=timezone.now() + timedelta(minutes=15),
-        )
-        self.assertGreater(reservation.expires_at, timezone.now())
-
-        AllocationReservation.objects.filter(pk=reservation.pk).update(expires_at=timezone.now() - timedelta(seconds=1))
+    def test_legacy_reservation_cleanup_task_is_disabled(self):
         result = expire_allocation_reservations_task.run()
-        reservation.refresh_from_db()
-        self.external_client_allocation.refresh_from_db()
-        self.external_survey_allocation.refresh_from_db()
-        self.assertEqual(result["expired"], 1)
-        self.assertEqual(reservation.status, AllocationReservation.Status.EXPIRED)
-        self.assertEqual(self.external_client_allocation.reserved_quantity, 0)
-        self.assertEqual(self.external_survey_allocation.reserved_quantity, 0)
+        self.assertEqual(result, {"expired": 0, "examined": 0, "disabled": True})
 
-    def test_inactive_project_override_hides_only_that_project(self):
+    def test_active_project_exclusion_hides_only_that_project(self):
         second = Survey.objects.create(
             client=self.client_record,
             source_id=88004,
@@ -352,8 +339,9 @@ class VendorFoundationTests(TestCase):
             remaining=4,
             cpi=Decimal("4.00"),
         )
-        self.external_survey_allocation.is_active = False
-        self.external_survey_allocation.save(update_fields=["is_active"])
+        self.external_survey_allocation.is_excluded = True
+        self.external_survey_allocation.is_active = True
+        self.external_survey_allocation.save(update_fields=["is_excluded", "is_active"])
         UserFunctionOverride.objects.create(
             user=self.external,
             function=AccessFunction.objects.get(code="projects.view"),
@@ -540,6 +528,24 @@ class VendorFoundationTests(TestCase):
         self.assertEqual(Decimal(rows[second_survey.source_id]["cpi"]), Decimal("5.00"))
         self.assertEqual(Decimal(rows[second_survey.source_id]["cpi_cut_percent"]), Decimal("50.00"))
         self.assertEqual(rows[second_survey.source_id]["display_company_name"], second_client.name)
+        client_catalog = vendor_api.get(reverse("supplier-client-catalog"), HTTP_X_API_KEY=raw_key)
+        self.assertEqual(client_catalog.status_code, 200)
+        self.assertEqual(client_catalog.data["supplier_id"], self.external_policy.supplier_code)
+        self.assertEqual(
+            {row["name"] for row in client_catalog.data["clients"]},
+            {self.client_record.name, second_client.name},
+        )
+        self.assertEqual(rows[self.survey.source_id]["survey_id"], self.survey.local_id)
+        self.assertEqual(rows[self.survey.source_id]["supplier_id"], self.external_policy.supplier_code)
+        self.assertEqual(rows[second_survey.source_id]["supplier_id"], self.external_policy.supplier_code)
+        self.assertIn("/supplier/start?", rows[self.survey.source_id]["entry_link"])
+        self.assertNotIn("edgeapi.innovatemr.net", rows[self.survey.source_id]["entry_link"])
+
+        self.external_policy.survey_id_mode = VendorCommercialProfile.SurveyIdMode.SOURCE_ID
+        self.external_policy.save(update_fields=["survey_id_mode", "updated_at"])
+        source_mode = vendor_api.get(reverse("survey-list"), HTTP_X_API_KEY=raw_key)
+        source_rows = {item["source_id"]: item for item in source_mode.data["results"]}
+        self.assertEqual(source_rows[self.survey.source_id]["survey_id"], str(self.survey.source_identifier))
 
         filtered = vendor_api.get(reverse("survey-list"), {"client_name": second_client.name}, HTTP_X_API_KEY=raw_key)
         self.assertEqual([row["source_id"] for row in filtered.data["results"]], [second_survey.source_id])
@@ -572,6 +578,58 @@ class VendorFoundationTests(TestCase):
             vendor_api.get(reverse("survey-list"), HTTP_X_API_KEY=raw_key).status_code,
             {401, 403},
         )
+
+    def test_supplier_entry_and_signed_outcome_redirect_forward_term_reason(self):
+        self.external_policy.delivery_mode = VendorCommercialProfile.DeliveryMode.BOTH
+        self.external_policy.save(update_fields=["delivery_mode", "updated_at"])
+        self.survey.entry_link = "https://edgeapi.innovatemr.net/startSurvey?PID=[%%pid%%]"
+        self.survey.save(update_fields=["entry_link"])
+        self.external_client_allocation.complete_redirect_url = "https://supplier.example/complete?campaign=alpha"
+        self.external_client_allocation.terminate_redirect_url = "https://supplier.example/terminate"
+        self.external_client_allocation.save(update_fields=["complete_redirect_url", "terminate_redirect_url"])
+
+        owner_api = APIClient()
+        owner_api.force_authenticate(self.owner)
+        policy = owner_api.patch(
+            reverse("vendor-commercial-profile-detail", kwargs={"pk": self.external_policy.pk}),
+            {"callback_hash_enabled": True, "generate_callback_hash_secret": True},
+            format="json",
+        )
+        self.assertEqual(policy.status_code, 200)
+        raw_hash_key = policy.data["callback_hash_secret"]
+        issued = owner_api.post(reverse("vendor-api-key-list"), {
+            "vendor": self.external.pk,
+            "name": "Supplier delivery",
+            "client_allocations": [self.external_client_allocation.pk],
+        }, format="json")
+        self.assertEqual(issued.status_code, 201)
+        catalog = APIClient().get(reverse("survey-list"), HTTP_X_API_KEY=issued.data["api_key"])
+        entry_link = catalog.data["results"][0]["supplier_entry_link"]
+        parts = urlsplit(entry_link.replace("[%%pid%%]", "SUPPLIER-RID-42"))
+        started = self.client.get(f"{parts.path}?{parts.query}")
+        self.assertEqual(started.status_code, 302)
+        attempt = SurveyAttempt.objects.get(supplier_respondent_id="SUPPLIER-RID-42")
+        self.assertEqual(attempt.vendor, self.external)
+        self.assertEqual(attempt.client_allocation, self.external_client_allocation)
+
+        attempt.status = SurveyAttempt.Status.TERMINATED
+        attempt.status_source = "innovatemr_redirect_hash"
+        attempt.is_verified = True
+        attempt.upstream_transaction_data = {"transaction": {"termReason": "Age quota closed"}}
+        attempt.save(update_fields=["status", "status_source", "is_verified", "upstream_transaction_data"])
+        redirect_url = supplier_outcome_redirect(attempt)
+        query = parse_qs(urlsplit(redirect_url).query)
+        self.assertEqual(query["pid"], ["SUPPLIER-RID-42"])
+        self.assertEqual(query["status"], [SurveyAttempt.Status.TERMINATED])
+        self.assertEqual(query["survey_id"], [self.survey.local_id])
+        self.assertEqual(query["term_reason"], ["Age quota closed"])
+        self.assertEqual(query["hash"], [supplier_outcome_signature(
+            raw_hash_key,
+            pid="SUPPLIER-RID-42",
+            status=SurveyAttempt.Status.TERMINATED,
+            survey_id=self.survey.local_id,
+            term_reason="Age quota closed",
+        )])
 
     def test_delivery_mode_blocks_wrong_channel(self):
         owner_api = APIClient()
