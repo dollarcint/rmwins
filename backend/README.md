@@ -110,16 +110,13 @@ The Projects table's **Copy link** button returns this platform pre-screener URL
 
 On submit it stores question answers, takes the exact InnovateMR `entryLink`, replaces its PID with RID, adds `trackId=RID` and available `QuestionKey=OptionId` values, marks the attempt redirected, and sends the browser to InnovateMR.
 
-Configure these four return outcomes with InnovateMR (use the deployed HTTPS hostname in production):
+Configure every InnovateMR account/survey redirect with the same signed URL:
 
 ```text
-/survey?status=1&rid=%%pid%%   # Completed
-/survey?status=2&rid=%%pid%%   # Terminated
-/survey?status=3&rid=%%pid%%   # Over quota
-/survey?status=4&rid=%%pid%%   # Quality terminated
+https://api.rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]
 ```
 
-Each callback captures its first arrival time, callback IP, callback count and LOI in seconds from `initiated_at`. Browser callbacks remain `is_verified=false`; a trusted InnovateMR S2S notification or redirect hash must verify them before financial reconciliation.
+The callback verifies HMAC-SHA1 lowercase hex over the complete hydrated URL with an empty `hash=` value. Only verified status 1 consumes/credits a completion. Invalid hashes become quality/security terminations and cannot later be upgraded by replay. Callback hashes and the shared secret are never persisted.
 
 ## Multi-client API integrations
 

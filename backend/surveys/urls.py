@@ -22,6 +22,7 @@ from .views import (
     user_hits_page,
     biobrain_survey_return,
     enligne_survey_postback,
+    innovatemr_callback,
     survey_start,
     RFGCallbackAPIView,
     rfg_result,
@@ -38,6 +39,7 @@ router.register("sync-runs", SyncRunViewSet, basename="sync-run")
 router.register("survey-attempts", SurveyAttemptViewSet, basename="survey-attempt")
 
 urlpatterns = [
+    path("imr_callback", innovatemr_callback, name="innovatemr-callback"),
     path("api/cint/webhook/surveys", cint_opportunities_webhook, name="cint-opportunities-webhook"),
     path("survey/start", survey_start, name="survey-start"),
     path("survey/return/s<int:status_code>/", biobrain_survey_return, name="biobrain-survey-return"),

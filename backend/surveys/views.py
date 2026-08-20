@@ -66,6 +66,11 @@ from .dashboard import (
 )
 from .excel import ExcelSheet, build_excel_response
 from .integrations import InnovateMRAPIError, InnovateMRClient
+from .innovatemr_callbacks import (
+    CallbackConfigurationError,
+    UPSTREAM_STATUS_MAP as INNOVATEMR_STATUS_MAP,
+    verify_callback_hash,
+)
 from .models import CanonicalQuestion, ProviderQuestionMapping, Survey, SurveyAttempt, SyncRun
 from .outcomes import provider_outcome
 from .report_pricing import (
@@ -2233,6 +2238,167 @@ def _record_enligne_s2s_result(attempt, status_code, request, payload):
     return attempt, first_verified_result
 
 
+INNOVATEMR_FINAL_SOURCES = {
+    "innovatemr_redirect_hash",
+    "innovatemr_hash_rejected",
+    "innovatemr_status_rejected",
+}
+
+
+def _attempt_provider_code(attempt):
+    if attempt.survey.integration_id:
+        return attempt.survey.integration.provider_code
+    if attempt.survey.client_id:
+        return attempt.survey.client.provider_code
+    return ""
+
+
+def _record_innovatemr_result(
+    attempt,
+    upstream_status,
+    request,
+    *,
+    hash_valid,
+    rejection_reason="",
+):
+    """Persist the first authoritative InnovateMR decision and finalize capacity.
+
+    An invalid first callback is terminal and cannot later be upgraded. Likewise,
+    an invalid replay cannot downgrade an already verified completion.
+    """
+
+    with transaction.atomic():
+        locked = SurveyAttempt.objects.select_for_update().get(pk=attempt.pk)
+        now = timezone.now()
+        already_final = locked.is_verified or locked.status_source in INNOVATEMR_FINAL_SOURCES
+        first_authoritative_result = not already_final
+        mapped_status = INNOVATEMR_STATUS_MAP.get(str(upstream_status or ""))
+        if first_authoritative_result:
+            if hash_valid and mapped_status:
+                locked.status = mapped_status
+                locked.status_source = "innovatemr_redirect_hash"
+                locked.is_verified = True
+            elif hash_valid:
+                locked.status = SurveyAttempt.Status.QUALITY_TERMINATED
+                locked.status_source = "innovatemr_status_rejected"
+                locked.is_verified = True
+                rejection_reason = rejection_reason or "unsupported_status"
+            else:
+                locked.status = SurveyAttempt.Status.QUALITY_TERMINATED
+                locked.status_source = "innovatemr_hash_rejected"
+                locked.is_verified = False
+                rejection_reason = rejection_reason or "hash_mismatch"
+
+            exit_client_data = get_request_client_data(request)
+            if locked.callback_at is None:
+                locked.callback_at = now
+                locked.loi_seconds = locked.calculate_loi_seconds(now)
+            locked.callback_ip = get_request_ip(request)
+            locked.exit_user_agent = exit_client_data.get("user_agent", "")
+            locked.exit_browser = exit_client_data.get("browser", "")
+            locked.exit_device = exit_client_data.get("device", "")
+            locked.exit_os = exit_client_data.get("os", "")
+            locked.exit_client_data = exit_client_data
+
+        locked.last_callback_at = now
+        locked.callback_count += 1
+        audit = dict(locked.upstream_transaction_data or {})
+        audit["innovatemr_redirect"] = {
+            "upstream_status": str(upstream_status or ""),
+            "hash_valid": bool(hash_valid),
+            "algorithm": "hmac-sha1-hex",
+            "rejection_reason": rejection_reason,
+            "duplicate": not first_authoritative_result,
+        }
+        locked.upstream_transaction_data = audit
+        locked.save(update_fields=[
+            "status", "callback_at", "last_callback_at", "callback_ip", "callback_count",
+            "status_source", "is_verified", "loi_seconds", "exit_user_agent", "exit_browser",
+            "exit_device", "exit_os", "exit_client_data", "upstream_transaction_data", "updated_at",
+        ])
+        finalize_attempt_capacity(locked)
+    return locked, first_authoritative_result
+
+
+def _respondent_result_redirect(attempt):
+    result_base_url = settings.PUBLIC_RESULT_BASE_URL or settings.PUBLIC_APP_BASE_URL
+    if not result_base_url:
+        result_base_url = "https://www.rmwinsights.com"
+    response = HttpResponseRedirect(
+        f"{result_base_url}/survey?{urlencode({'status': attempt.status, 'rid': attempt.rid})}"
+    )
+    response["Cache-Control"] = "no-store"
+    return response
+
+
+@require_http_methods(["GET"])
+def innovatemr_callback(request):
+    """Verify InnovateMR's signed redirect before recording any completion."""
+
+    secret = settings.INNOVATEMR_CALLBACK_HASH_SECRET
+    public_url = settings.INNOVATEMR_CALLBACK_PUBLIC_URL
+    if not secret or not public_url:
+        return render(request, "surveys/flow_error.html", {
+            "title": "Callback temporarily unavailable",
+            "message": "The secure survey callback is not configured.",
+        }, status=503)
+
+    pid_values = request.GET.getlist("pid")
+    status_values = request.GET.getlist("status")
+    hash_values = request.GET.getlist("hash")
+    pid = pid_values[0].strip() if len(pid_values) == 1 else ""
+    upstream_status = status_values[0].strip() if len(status_values) == 1 else ""
+    received_hash = hash_values[0].strip() if len(hash_values) == 1 else ""
+
+    if len(pid) != 10 or not pid.isalnum():
+        return render(request, "surveys/flow_error.html", {
+            "title": "Survey attempt not found",
+            "message": "This callback could not be attached to a survey attempt.",
+        }, status=404)
+
+    attempt = SurveyAttempt.objects.select_related(
+        "survey__integration", "survey__client"
+    ).filter(rid=pid).filter(
+        Q(survey__integration__provider_code="innovatemr")
+        | Q(survey__integration__isnull=True, survey__client__provider_code="innovatemr")
+    ).first()
+    if attempt is None:
+        return render(request, "surveys/flow_error.html", {
+            "title": "Survey attempt not found",
+            "message": "This callback could not be attached to an InnovateMR survey attempt.",
+        }, status=404)
+
+    valid_shape = (
+        len(pid_values) == 1
+        and len(status_values) == 1
+        and len(hash_values) == 1
+    )
+    hash_valid = False
+    rejection_reason = "invalid_parameters" if not valid_shape else ""
+    if valid_shape:
+        try:
+            hash_valid = verify_callback_hash(
+                secret=secret,
+                public_url=public_url,
+                raw_query=request.META.get("QUERY_STRING", ""),
+                received_hash=received_hash,
+            )
+        except (CallbackConfigurationError, ValueError):
+            hash_valid = False
+            rejection_reason = "invalid_hash_contract"
+    if not hash_valid and not rejection_reason:
+        rejection_reason = "hash_mismatch"
+
+    attempt, _ = _record_innovatemr_result(
+        attempt,
+        upstream_status,
+        request,
+        hash_valid=hash_valid,
+        rejection_reason=rejection_reason,
+    )
+    return _respondent_result_redirect(attempt)
+
+
 @require_http_methods(["GET"])
 def survey_status(request):
     status_code = request.GET.get("status", "").strip()
@@ -2253,7 +2419,7 @@ def survey_status(request):
             "message": "A valid status (1–4) and tracking ID are required.",
         }, status=400)
 
-    attempts = SurveyAttempt.objects.select_related("survey__integration")
+    attempts = SurveyAttempt.objects.select_related("survey__integration", "survey__client")
     if enligne_identifier:
         attempt = attempts.filter(
             rid=callback_identifier,
@@ -2270,12 +2436,17 @@ def survey_status(request):
                 provider_profile_uid__in=callback_identifiers
             ).order_by("-initiated_at").first()
     canonical_rid = attempt.rid if attempt else callback_identifier
-    provider_code = (
-        attempt.survey.integration.provider_code
-        if attempt and attempt.survey.integration_id
-        else ""
-    )
+    provider_code = _attempt_provider_code(attempt) if attempt else ""
     ip_address = get_request_ip(request)
+    if attempt and provider_code == "innovatemr":
+        attempt, _ = _record_innovatemr_result(
+            attempt,
+            status_code,
+            request,
+            hash_valid=False,
+            rejection_reason="unsigned_callback_endpoint",
+        )
+        return _respondent_result_redirect(attempt)
     if attempt and enligne_identifier:
         attempt, _ = _record_enligne_s2s_result(
             attempt,

@@ -120,11 +120,11 @@ MUTATION_EXAMPLES = {
     "set_global_redirects": {
         "confirm_upstream_mutation": True,
         "payload": {
-            "sUrl": "https://panel.example/survey?status=1&rid=[%%pid%%]",
-            "fUrl": "https://panel.example/survey?status=2&rid=[%%pid%%]",
-            "oUrl": "https://panel.example/survey?status=3&rid=[%%pid%%]",
-            "qTUrl": "https://panel.example/survey?status=3&rid=[%%pid%%]",
-            "tUrl": "https://panel.example/survey?status=4&rid=[%%pid%%]",
+            "sUrl": "https://api.rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]",
+            "fUrl": "https://api.rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]",
+            "oUrl": "https://api.rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]",
+            "qTUrl": "https://api.rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]",
+            "tUrl": "https://api.rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]",
         },
     },
     "delete_global_redirects": {
@@ -135,10 +135,10 @@ MUTATION_EXAMPLES = {
         "confirm_upstream_mutation": True,
         "survey_id": "16003381",
         "payload": {
-            "sUrl": "https://panel.example/survey?status=1&rid=[%%pid%%]",
-            "fUrl": "https://panel.example/survey?status=2&rid=[%%pid%%]",
-            "oUrl": "https://panel.example/survey?status=3&rid=[%%pid%%]",
-            "tUrl": "https://panel.example/survey?status=4&rid=[%%pid%%]",
+            "sUrl": "https://api.rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]",
+            "fUrl": "https://api.rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]",
+            "oUrl": "https://api.rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]",
+            "tUrl": "https://api.rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]",
         },
     },
     "delete_survey_redirects": {

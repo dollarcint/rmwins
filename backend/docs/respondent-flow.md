@@ -38,17 +38,19 @@ then always update the matched attempt under its canonical platform RID.
 
 The public copied link always uses the platform-facing supplier code, so an upstream/vendor supplier code is not exposed there. The exact stored `entryLink` is parsed only after validation. Its PID is replaced with RID, `trackId=RID` is added, and captured `QuestionKey=OptionId` pairs are appended. `survNum` and the real upstream `supCode` are preserved from the allocated link; they are never reconstructed from client parameters. This keeps InnovateMR routing intact while allowing the same public code to be used for future providers.
 
-InnovateMR owns the browser redirect after the respondent leaves this application. Configure the account-level or survey-level return URLs in InnovateMR to point to the public deployment, using `%%trackId%%` as the RID, for example:
+InnovateMR owns the browser redirect after the respondent leaves this application. Configure every account-level or survey-level return URL to the same secure callback:
 
-`https://survey.example.com/survey?status=1&rid=%%trackId%%`
+`https://api.rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]`
 
-Use status 1, 2, 3 and 4 for complete, terminate, over-quota and quality-terminate destinations respectively. A redirect to another domain such as `api.quantichamps.com` and a `code=null` value are produced by that upstream redirect configuration, not by the local Django callback route.
+The callback uses InnovateMR's hydrated `pid`, `status` and `hashdata` merge fields. The upstream PID is our 10-character attempt RID. A redirect to another domain and a `code=null` value are produced by that upstream redirect configuration, not by the local Django callback route.
 
 ## Callback contract
 
-`GET /survey?status={1|2|3|4}&rid={RID}`
+`GET /imr_callback?pid={RID}&status={1|2|3|4|5|7|8}&hash={SHA1_HEX}`
 
-The first callback sets the terminal status, callback time/exit IP, exit browser/device/OS/user-agent and `loi_seconds = callback_at - initiated_at`. Later requests only update `last_callback_at` and `callback_count`, protecting the original outcome, exit audit and LOI from refreshes.
+The server reconstructs the complete hydrated HTTPS callback URL with an empty `hash=` value, calculates its HMAC-SHA1 lowercase hexadecimal digest using `INNOVATEMR_CALLBACK_HASH_SECRET`, and compares it in constant time. The first verified callback sets the terminal status, callback time/exit IP, exit browser/device/OS/user-agent and `loi_seconds = callback_at - initiated_at`. Later requests only update `last_callback_at` and `callback_count`, protecting the original outcome, exit audit and LOI from refreshes.
+
+Only a verified status 1 is eligible to consume/credit a reserved completion. A missing, malformed or mismatched hash is recorded as `innovatemr_hash_rejected`, immediately mapped to quality/security termination, and releases rather than consumes capacity. That security decision cannot later be upgraded by a replay; an invalid replay also cannot downgrade a previously verified result. The hash and shared secret are never stored in the callback audit.
 
 The same transaction finalizes the vendor reservation: complete consumes the frozen quantity, while terminate, over-quota and quality-terminate release it. Reconciled upstream terminal statuses use the identical finalization service.
 
@@ -69,6 +71,6 @@ For Cint, the copied platform URL still opens the local pre-screener. On submit 
 
 ## Trust and verification
 
-Browser redirects can be forged. Every callback starts as `is_verified=false`. Add InnovateMR server-to-server notification or redirect-hash validation before using a completion for rewards, invoices or financial reporting. The staff-only `/studies/` page, `/api/v1/survey-attempts/` endpoint and Django Admin expose the audit trail.
+InnovateMR completions are trusted only after the signed `/imr_callback` route verifies the complete URL. The legacy unsigned `/survey` endpoint cannot credit an InnovateMR attempt and security-terminates its first unsigned callback. The staff-only `/studies/` page, `/api/v1/survey-attempts/` endpoint and Django Admin expose the redacted audit trail.
 
 The Studies page applies user, status, text and entry/exit date-time filters server-side. `/api/v1/survey-attempts/export/` applies the identical filter contract but exports the complete related audit dataset rather than only the compact UI columns. Viewing requires `attempts.view`; downloading requires the independently assignable `attempts.export` function permission.
