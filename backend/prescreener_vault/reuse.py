@@ -301,7 +301,10 @@ def _reserve_vault_profile(attempt, signature, excluded_uids=None):
         if excluded_uids:
             candidates = candidates.exclude(uid__in=excluded_uids)
         rows = list(candidates.order_by(
-            "usage_count", "last_reused_at", "submitted_at", "uid"
+            "usage_count",
+            F("last_reused_at").asc(nulls_first=True),
+            "submitted_at",
+            "uid",
         )[:MAX_CANDIDATE_SCAN])
         if not rows:
             return None

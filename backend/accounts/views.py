@@ -1,16 +1,22 @@
 """Authentication, first-admin setup and Access Control HTTP endpoints."""
 
+import json
 import re
 
-from django.contrib.auth import get_user_model, login
+from django.conf import settings
+from django.contrib import admin
+from django.contrib.auth import get_user_model, login as django_login
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.views import LoginView, LogoutView
 from django.db import transaction
 from django.db.models import Count
-from django.http import Http404
 from django.core.exceptions import PermissionDenied
+from django.http import Http404, HttpResponse, JsonResponse
+from django.middleware.csrf import get_token
 from django.shortcuts import redirect, render
 from django.urls import reverse, reverse_lazy
+from django.views.decorators.cache import never_cache
+from django.views.decorators.http import require_GET
 from django.views.decorators.http import require_POST
 from drf_spectacular.utils import extend_schema, extend_schema_view
 from rest_framework import filters, viewsets
@@ -22,6 +28,12 @@ from .access import (
 from .forms import FirstAdminSetupForm, WorkspaceAuthenticationForm
 from .models import AccessFunction, EmployeeProfile, Role
 from .serializers import AccessFunctionSerializer, RoleSerializer, UserAccessSerializer
+from .throttling import (
+    consume_login_attempt,
+    login_request_body_too_large,
+    normalize_login_username,
+    reset_login_account_attempts,
+)
 from vendors.access import organization_workspace_owner_ids
 from vendors.models import OrganizationUnit
 from prescreener_vault.cint_email_pool import add_real_email, email_pool_status
@@ -33,8 +45,20 @@ class WorkspaceLoginView(LoginView):
     authentication_form = WorkspaceAuthenticationForm
     redirect_authenticated_user = True
 
+    def post(self, request, *args, **kwargs):
+        if login_request_body_too_large(request):
+            return HttpResponse("Login request is too large.", status=413)
+        if not consume_login_attempt(request, request.POST.get("username", "")):
+            response = HttpResponse(
+                "Too many login attempts. Please try again later.", status=429
+            )
+            response["Retry-After"] = str(settings.AUTH_LOGIN_WINDOW_SECONDS)
+            return response
+        return super().post(request, *args, **kwargs)
+
     def form_valid(self, form):
         response = super().form_valid(form)
+        reset_login_account_attempts(form.cleaned_data.get("username", ""))
         if not form.cleaned_data.get("remember_me"):
             self.request.session.set_expiry(0)
         return response
@@ -45,8 +69,133 @@ class WorkspaceLogoutView(LogoutView):
     http_method_names = ["post", "options"]
 
 
+def _workspace_redirect_url(request):
+    """Return an absolute API-host URL so the separate frontend origin navigates correctly."""
+
+    return request.build_absolute_uri(reverse("home"))
+
+
+@never_cache
+@require_GET
+def auth_session(request):
+    """Start the CSRF-protected browser session used by the React login page."""
+
+    payload = {
+        "authenticated": request.user.is_authenticated,
+    }
+    if request.user.is_authenticated:
+        payload["redirect_url"] = _workspace_redirect_url(request)
+    else:
+        payload["csrf_token"] = get_token(request)
+    return JsonResponse(payload)
+
+
+@never_cache
+@require_POST
+def auth_login(request):
+    """Authenticate JSON credentials and establish a standard Django session."""
+
+    if login_request_body_too_large(request):
+        return JsonResponse(
+            {"authenticated": False, "error": "The login request is too large."},
+            status=413,
+        )
+
+    if request.content_type != "application/json":
+        return JsonResponse(
+            {"authenticated": False, "error": "A JSON request body is required."},
+            status=415,
+        )
+
+    raw_body = request.body
+    try:
+        payload = json.loads(raw_body)
+    except (TypeError, ValueError, UnicodeDecodeError):
+        return JsonResponse(
+            {"authenticated": False, "error": "The login request is not valid JSON."},
+            status=400,
+        )
+
+    if not isinstance(payload, dict):
+        return JsonResponse(
+            {"authenticated": False, "error": "The login request must be a JSON object."},
+            status=400,
+        )
+
+    username = payload.get("username")
+    password = payload.get("password")
+    remember_me = payload.get("remember_me", True)
+    if not isinstance(username, str) or not isinstance(password, str) or not isinstance(remember_me, bool):
+        return JsonResponse(
+            {"authenticated": False, "error": "Username, password and remember_me are required."},
+            status=400,
+        )
+    if len(username) > 150 or len(password) > 1024:
+        return JsonResponse(
+            {"authenticated": False, "error": "Username or password is not valid."},
+            status=400,
+        )
+
+    if not consume_login_attempt(request, username):
+        response = JsonResponse(
+            {
+                "authenticated": False,
+                "error": "Too many login attempts. Please try again later.",
+            },
+            status=429,
+        )
+        response["Retry-After"] = str(settings.AUTH_LOGIN_WINDOW_SECONDS)
+        return response
+    form = WorkspaceAuthenticationForm(
+        request=request,
+        data={"username": username, "password": password, "remember_me": remember_me},
+    )
+    if not form.is_valid():
+        # Keep failures generic so the endpoint does not disclose whether an account exists,
+        # is disabled, or has a particular supplier access configuration.
+        return JsonResponse(
+            {"authenticated": False, "error": "Username or password is incorrect."},
+            status=401,
+        )
+
+    django_login(request, form.get_user())
+    reset_login_account_attempts(username)
+    if not remember_me:
+        request.session.set_expiry(0)
+    return JsonResponse({
+        "authenticated": True,
+        "redirect_url": _workspace_redirect_url(request),
+    })
+
+
+def throttled_admin_login(request):
+    """Protect Django admin's password hashing with the shared login limiter."""
+
+    if request.method == "POST":
+        if login_request_body_too_large(request):
+            return HttpResponse("Login request is too large.", status=413)
+        username = request.POST.get("username", "")
+        if not consume_login_attempt(request, username):
+            response = HttpResponse(
+                "Too many login attempts. Please try again later.", status=429
+            )
+            response["Retry-After"] = str(settings.AUTH_LOGIN_WINDOW_SECONDS)
+            return response
+    response = admin.site.login(request)
+    if request.method == "POST" and 300 <= response.status_code < 400:
+        authenticated_username = get_user_model().objects.filter(
+            pk=request.session.get("_auth_user_id")
+        ).values_list("username", flat=True).first()
+        submitted_username = request.POST.get("username", "")
+        if authenticated_username and normalize_login_username(
+            authenticated_username
+        ) == normalize_login_username(submitted_username):
+            reset_login_account_attempts(submitted_username)
+    return response
+
+
 def first_admin_setup(request):
-    if get_user_model().objects.exists():
+    if not settings.FIRST_ADMIN_SETUP_ENABLED or get_user_model().objects.exists():
         raise Http404
     form = FirstAdminSetupForm(request.POST or None)
     if request.method == "POST" and form.is_valid():
@@ -61,7 +210,7 @@ def first_admin_setup(request):
             profile, _ = EmployeeProfile.objects.get_or_create(user=user)
             profile.role = Role.objects.filter(slug="super-admin").first()
             profile.save(update_fields=["role", "updated_at"])
-        login(request, user, backend="django.contrib.auth.backends.ModelBackend")
+        django_login(request, user, backend="django.contrib.auth.backends.ModelBackend")
         return redirect("home")
     return render(request, "accounts/setup.html", {"form": form})
 
@@ -256,7 +405,12 @@ class RoleViewSet(viewsets.ModelViewSet):
     destroy=extend_schema(tags=["Access control"], summary="Delete an employee account"),
 )
 class UserAccessViewSet(viewsets.ModelViewSet):
-    queryset = get_user_model().objects.select_related("employee_profile__role").prefetch_related("function_overrides__function")
+    queryset = get_user_model().objects.select_related(
+        "employee_profile__role"
+    ).prefetch_related(
+        "function_overrides__function",
+        "employee_profile__role__function_assignments__function",
+    )
     serializer_class = UserAccessSerializer
     permission_classes = [HasFunctionPermission]
     def get_required_function_permission(self):
@@ -277,7 +431,10 @@ class UserAccessViewSet(viewsets.ModelViewSet):
             "employee_profile__role", "employee_profile__created_by",
             "employee_profile__organization_unit__workspace_owner",
             "employee_profile__organization_unit__parent__parent",
-        ).prefetch_related("function_overrides__function")
+        ).prefetch_related(
+            "function_overrides__function",
+            "employee_profile__role__function_assignments__function",
+        )
         if self.request.user.is_superuser:
             return queryset
         return queryset.filter(id__in=manageable_user_ids(self.request.user), is_superuser=False)

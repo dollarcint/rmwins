@@ -51,7 +51,7 @@ class ResearchForGoodProvider(SurveyProvider):
     def __init__(self, integration, *, session=None, clock=None):
         """Resolve integration settings and injectable HTTP/time dependencies."""
 
-        super().__init__(integration, session=session or requests.Session())
+        super().__init__(integration, session=session)
         refs = integration.credential_env_keys or {}
         self.apid = environment_value(refs.get("apid"), "RFG apid")
         self.secret = environment_value(refs.get("secret"), "RFG secret")

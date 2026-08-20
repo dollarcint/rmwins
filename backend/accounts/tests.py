@@ -1,11 +1,15 @@
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.core.management import call_command
 from django.core.management.base import CommandError
-from django.test import TestCase
+from django.db import connection
+from django.test import Client, TestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from rest_framework.test import APIClient
 
@@ -15,6 +19,7 @@ from prescreener_vault.models import CintRespondentEmail
 from .access import has_function_access
 from .function_catalog import sync_access_function_catalog
 from .models import AccessFunction, EmployeeProfile, Role, RoleFunctionPermission, UserFunctionOverride
+from .serializers import RoleSerializer, UserAccessSerializer
 
 
 class RoleConfigurationCommandTests(TestCase):
@@ -147,6 +152,137 @@ class RoleConfigurationCommandTests(TestCase):
 
 
 class LoginAndSetupTests(TestCase):
+    def setUp(self):
+        cache.clear()
+
+    @override_settings(FIRST_ADMIN_SETUP_ENABLED=False)
+    def test_production_can_disable_public_first_admin_bootstrap(self):
+        self.assertEqual(self.client.get(reverse("first-admin-setup")).status_code, 404)
+
+    @override_settings(AUTH_LOGIN_MAX_ATTEMPTS=2, AUTH_LOGIN_WINDOW_SECONDS=60)
+    def test_legacy_form_login_cannot_bypass_password_rate_limit(self):
+        get_user_model().objects.create_user(
+            username="workspace-user",
+            password="safe-password-123",
+        )
+        credentials = {"username": "workspace-user", "password": "wrong-password"}
+
+        self.assertEqual(self.client.post(reverse("login"), credentials).status_code, 200)
+        self.assertEqual(self.client.post(reverse("login"), credentials).status_code, 200)
+        with patch("accounts.views.LoginView.post") as login_post:
+            blocked = self.client.post(reverse("login"), credentials)
+
+        self.assertEqual(blocked.status_code, 429)
+        self.assertEqual(blocked["Retry-After"], "60")
+        login_post.assert_not_called()
+
+    @override_settings(AUTH_LOGIN_MAX_ATTEMPTS=2, AUTH_LOGIN_WINDOW_SECONDS=60)
+    def test_admin_login_cannot_bypass_password_rate_limit(self):
+        admin_user = get_user_model().objects.create_superuser(
+            username="admin-user",
+            email="admin@example.test",
+            password="safe-password-123",
+        )
+        credentials = {
+            "username": admin_user.username,
+            "password": "wrong-password",
+            "next": "/admin/",
+        }
+
+        self.assertEqual(self.client.post("/admin/login/", credentials).status_code, 200)
+        self.assertEqual(self.client.post("/admin/login/", credentials).status_code, 200)
+        with patch("accounts.views.admin.site.login") as admin_login:
+            blocked = self.client.post("/admin/login/", credentials)
+
+        self.assertEqual(blocked.status_code, 429)
+        self.assertEqual(blocked["Retry-After"], "60")
+        admin_login.assert_not_called()
+
+    @override_settings(
+        AUTH_LOGIN_MAX_ATTEMPTS=2,
+        AUTH_LOGIN_MAX_IP_ATTEMPTS=100,
+        AUTH_LOGIN_WINDOW_SECONDS=60,
+    )
+    def test_logged_in_nonstaff_cannot_reset_admin_target_attempts(self):
+        low_user = get_user_model().objects.create_user(
+            username="known-low-user",
+            password="known-password-123",
+        )
+        get_user_model().objects.create_superuser(
+            username="admin-target",
+            email="target@example.test",
+            password="target-password-123",
+        )
+        self.client.force_login(low_user)
+        credentials = {
+            "username": "admin-target",
+            "password": "wrong-password",
+            "next": "/admin/",
+        }
+
+        self.assertEqual(self.client.post("/admin/login/", credentials).status_code, 200)
+        self.assertEqual(self.client.post("/admin/login/", credentials).status_code, 200)
+        with patch("accounts.views.admin.site.login") as admin_login:
+            blocked = self.client.post("/admin/login/", credentials)
+
+        self.assertEqual(blocked.status_code, 429)
+        admin_login.assert_not_called()
+
+    @override_settings(
+        AUTH_LOGIN_MAX_ATTEMPTS=1,
+        AUTH_LOGIN_MAX_IP_ATTEMPTS=100,
+        AUTH_LOGIN_WINDOW_SECONDS=60,
+    )
+    def test_admin_account_limit_uses_django_nfkc_username_normalization(self):
+        fullwidth_username = "Ａｄｍｉｎ"
+        first = self.client.post(
+            "/admin/login/",
+            {"username": fullwidth_username, "password": "wrong-password"},
+        )
+        with patch("accounts.views.admin.site.login") as admin_login:
+            blocked = self.client.post(
+                "/admin/login/",
+                {"username": "Admin", "password": "another-guess"},
+            )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(blocked.status_code, 429)
+        admin_login.assert_not_called()
+
+    @override_settings(AUTH_LOGIN_MAX_ATTEMPTS=2, AUTH_LOGIN_WINDOW_SECONDS=60)
+    def test_successful_login_does_not_reset_prior_ip_attempts(self):
+        get_user_model().objects.create_user(
+            username="privileged-target",
+            password="target-password-123",
+        )
+        get_user_model().objects.create_user(
+            username="known-account",
+            password="known-password-123",
+        )
+
+        first = self.client.post(
+            reverse("login"),
+            {"username": "privileged-target", "password": "wrong-password"},
+        )
+        successful = self.client.post(
+            reverse("login"),
+            {"username": "known-account", "password": "known-password-123"},
+        )
+        self.client.post(reverse("logout"))
+        second_target_attempt = self.client.post(
+            reverse("login"),
+            {"username": "privileged-target", "password": "another-guess"},
+        )
+        blocked = self.client.post(
+            reverse("login"),
+            {"username": "privileged-target", "password": "third-guess"},
+        )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(successful.status_code, 302)
+        self.assertEqual(second_target_attempt.status_code, 200)
+        self.assertEqual(blocked.status_code, 429)
+
     def test_anonymous_internal_page_redirects_to_login(self):
         response = self.client.get(reverse("projects"))
         self.assertEqual(response.status_code, 302)
@@ -162,6 +298,216 @@ class LoginAndSetupTests(TestCase):
         self.assertTrue(user.is_superuser)
         self.assertEqual(user.employee_profile.role.slug, "super-admin")
         self.assertEqual(self.client.get(reverse("first-admin-setup")).status_code, 404)
+
+
+@override_settings(
+    ALLOWED_HOSTS=["testserver", "api.rmwinsights.com"],
+    CSRF_TRUSTED_ORIGINS=["https://www.rmwinsights.com"],
+    CORS_ALLOWED_ORIGINS=["https://www.rmwinsights.com"],
+    CORS_ALLOW_CREDENTIALS=True,
+)
+class JsonAuthenticationTests(TestCase):
+    frontend_origin = "https://www.rmwinsights.com"
+    api_host = "api.rmwinsights.com"
+
+    def setUp(self):
+        cache.clear()
+        self.user = get_user_model().objects.create_user(
+            username="workspace-user",
+            password="safe-password-123",
+        )
+        self.client = Client(enforce_csrf_checks=True)
+
+    def session_request(self):
+        return self.client.get(
+            reverse("auth-session"),
+            secure=True,
+            HTTP_HOST=self.api_host,
+            HTTP_ORIGIN=self.frontend_origin,
+        )
+
+    def login_request(self, csrf_token, **overrides):
+        payload = {
+            "username": self.user.username,
+            "password": "safe-password-123",
+            "remember_me": True,
+            **overrides,
+        }
+        return self.client.post(
+            reverse("auth-login"),
+            data=json.dumps(payload),
+            content_type="application/json",
+            secure=True,
+            HTTP_HOST=self.api_host,
+            HTTP_ORIGIN=self.frontend_origin,
+            HTTP_X_CSRFTOKEN=csrf_token,
+        )
+
+    def test_session_issues_csrf_cookie_and_credentialed_cors_headers(self):
+        response = self.session_request()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["authenticated"], False)
+        self.assertTrue(response.json()["csrf_token"])
+        self.assertIn("csrftoken", response.cookies)
+        self.assertEqual(response["Access-Control-Allow-Origin"], self.frontend_origin)
+        self.assertEqual(response["Access-Control-Allow-Credentials"], "true")
+        self.assertIn("no-cache", response["Cache-Control"])
+
+    def test_authenticated_session_redirect_omits_csrf_token(self):
+        self.client.force_login(self.user)
+
+        response = self.session_request()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["authenticated"], True)
+        self.assertNotIn("csrf_token", response.json())
+        self.assertNotIn("csrftoken", response.cookies)
+
+    def test_credentialed_cors_is_not_enabled_for_other_workspace_apis(self):
+        self.client.force_login(self.user)
+
+        response = self.client.get(
+            reverse("access-function-list"),
+            secure=True,
+            HTTP_HOST=self.api_host,
+            HTTP_ORIGIN=self.frontend_origin,
+        )
+
+        self.assertNotIn("Access-Control-Allow-Origin", response)
+        self.assertNotIn("Access-Control-Allow-Credentials", response)
+
+    def test_login_requires_csrf_and_returns_absolute_api_redirect(self):
+        session_response = self.session_request()
+        csrf_token = session_response.json()["csrf_token"]
+
+        rejected = self.client.post(
+            reverse("auth-login"),
+            data=json.dumps({
+                "username": self.user.username,
+                "password": "safe-password-123",
+                "remember_me": True,
+            }),
+            content_type="application/json",
+            secure=True,
+            HTTP_HOST=self.api_host,
+            HTTP_ORIGIN=self.frontend_origin,
+        )
+        self.assertEqual(rejected.status_code, 403)
+
+        response = self.login_request(csrf_token)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {
+            "authenticated": True,
+            "redirect_url": "https://api.rmwinsights.com/",
+        })
+        self.assertEqual(int(self.client.session["_auth_user_id"]), self.user.pk)
+        self.assertFalse(self.client.session.get_expire_at_browser_close())
+
+        authenticated_session = self.session_request().json()
+        self.assertEqual(authenticated_session["authenticated"], True)
+        self.assertEqual(authenticated_session["redirect_url"], "https://api.rmwinsights.com/")
+
+    def test_login_failure_is_generic_and_remember_me_false_expires_on_close(self):
+        csrf_token = self.session_request().json()["csrf_token"]
+
+        failed = self.login_request(csrf_token, password="not-the-password")
+        self.assertEqual(failed.status_code, 401)
+        self.assertEqual(failed.json(), {
+            "authenticated": False,
+            "error": "Username or password is incorrect.",
+        })
+        self.assertNotIn("_auth_user_id", self.client.session)
+
+        response = self.login_request(csrf_token, remember_me=False)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(self.client.session.get_expire_at_browser_close())
+
+    def test_cors_preflight_allows_json_csrf_login_request(self):
+        response = self.client.options(
+            reverse("auth-login"),
+            secure=True,
+            HTTP_HOST=self.api_host,
+            HTTP_ORIGIN=self.frontend_origin,
+            HTTP_ACCESS_CONTROL_REQUEST_METHOD="POST",
+            HTTP_ACCESS_CONTROL_REQUEST_HEADERS="content-type,x-csrftoken",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Access-Control-Allow-Origin"], self.frontend_origin)
+        self.assertEqual(response["Access-Control-Allow-Credentials"], "true")
+        self.assertIn("x-csrftoken", response["Access-Control-Allow-Headers"].lower())
+
+    @override_settings(AUTH_LOGIN_MAX_BODY_BYTES=1024)
+    def test_login_rejects_oversized_body_before_json_or_password_work(self):
+        csrf_token = self.session_request().json()["csrf_token"]
+
+        with patch("accounts.views.WorkspaceAuthenticationForm") as form_class:
+            response = self.client.post(
+                reverse("auth-login"),
+                data=b"x" * 1025,
+                content_type="application/json",
+                secure=True,
+                HTTP_HOST=self.api_host,
+                HTTP_ORIGIN=self.frontend_origin,
+                HTTP_X_CSRFTOKEN=csrf_token,
+            )
+
+        self.assertEqual(response.status_code, 413)
+        form_class.assert_not_called()
+
+    def test_login_rejects_unbounded_credentials_before_password_work(self):
+        csrf_token = self.session_request().json()["csrf_token"]
+
+        for field, value in (("username", "u" * 151), ("password", "p" * 1025)):
+            with self.subTest(field=field), patch(
+                "accounts.views.WorkspaceAuthenticationForm"
+            ) as form_class:
+                response = self.login_request(csrf_token, **{field: value})
+                self.assertEqual(response.status_code, 400)
+                form_class.assert_not_called()
+
+    @override_settings(AUTH_LOGIN_MAX_ATTEMPTS=2, AUTH_LOGIN_WINDOW_SECONDS=60)
+    def test_login_rate_limit_stops_password_hash_work_and_sets_retry_after(self):
+        csrf_token = self.session_request().json()["csrf_token"]
+
+        self.assertEqual(
+            self.login_request(csrf_token, password="wrong-one").status_code,
+            401,
+        )
+        self.assertEqual(
+            self.login_request(csrf_token, password="wrong-two").status_code,
+            401,
+        )
+        with patch("accounts.views.WorkspaceAuthenticationForm") as form_class:
+            blocked = self.login_request(csrf_token, password="wrong-three")
+
+        self.assertEqual(blocked.status_code, 429)
+        self.assertEqual(blocked["Retry-After"], "60")
+        form_class.assert_not_called()
+
+    @override_settings(
+        AUTH_LOGIN_MAX_ATTEMPTS=100,
+        AUTH_LOGIN_MAX_IP_ATTEMPTS=2,
+        AUTH_LOGIN_WINDOW_SECONDS=60,
+    )
+    def test_ip_rate_limit_cannot_be_bypassed_with_rotating_usernames(self):
+        csrf_token = self.session_request().json()["csrf_token"]
+
+        self.assertEqual(
+            self.login_request(csrf_token, username="unknown-one").status_code,
+            401,
+        )
+        self.assertEqual(
+            self.login_request(csrf_token, username="unknown-two").status_code,
+            401,
+        )
+        with patch("accounts.views.WorkspaceAuthenticationForm") as form_class:
+            blocked = self.login_request(csrf_token, username="unknown-three")
+
+        self.assertEqual(blocked.status_code, 429)
+        form_class.assert_not_called()
 
 
 class FunctionAccessTests(TestCase):
@@ -321,6 +667,63 @@ class FunctionAccessTests(TestCase):
         self.assertContains(page, "user_hits.column.completes")
         self.assertContains(page, "Select entire group")
         self.assertContains(page, "assigned functions")
+
+    def test_role_patch_response_uses_updated_prefetched_permissions(self):
+        owner = get_user_model().objects.create_superuser(
+            username="role-patch-owner", password="password-123"
+        )
+        role = Role.objects.create(
+            name="Patch response role", slug="patch-response-role", rank=14
+        )
+        RoleFunctionPermission.objects.create(
+            role=role,
+            function=AccessFunction.objects.get(code="projects.view"),
+            allowed=True,
+        )
+        api = APIClient()
+        api.force_authenticate(owner)
+
+        response = api.patch(
+            reverse("access-role-detail", args=[role.slug]),
+            {"permission_codes": ["survey_details.view"]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data["effective_permission_codes"],
+            ["survey_details.view"],
+        )
+
+    def test_user_patch_response_uses_updated_prefetched_overrides(self):
+        owner = get_user_model().objects.create_superuser(
+            username="user-patch-owner", password="password-123"
+        )
+        target = get_user_model().objects.create_user(
+            username="user-patch-target", password="password-123"
+        )
+        UserFunctionOverride.objects.create(
+            user=target,
+            function=AccessFunction.objects.get(code="projects.view"),
+            effect=UserFunctionOverride.Effect.ALLOW,
+        )
+        api = APIClient()
+        api.force_authenticate(owner)
+
+        response = api.patch(
+            reverse("access-user-detail", args=[target.pk]),
+            {
+                "allow_codes": ["attempts.view"],
+                "deny_codes": ["projects.view"],
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["allowed_overrides"], ["attempts.view"])
+        self.assertEqual(response.data["denied_overrides"], ["projects.view"])
+        self.assertIn("attempts.view", response.data["effective_permissions"])
+        self.assertNotIn("projects.view", response.data["effective_permissions"])
 
 
 class CintEmailPoolAccessTests(TestCase):
@@ -494,3 +897,57 @@ class DelegatedVendorTests(TestCase):
         }, format="json")
         self.assertEqual(response.status_code, 400)
         self.assertIn("external suppliers cannot receive", str(response.data).lower())
+
+
+class AccessSerializerQueryTests(TestCase):
+    def test_prefetched_role_permissions_serialize_without_per_role_queries(self):
+        roles = list(
+            Role.objects.select_related("created_by")
+            .prefetch_related("function_assignments__function")
+            .order_by("pk")
+        )
+
+        with CaptureQueriesContext(connection) as queries:
+            data = RoleSerializer(roles, many=True).data
+
+        self.assertEqual(len(data), len(roles))
+        self.assertEqual(len(queries), 0)
+
+    def test_prefetched_user_access_serializes_without_per_user_queries(self):
+        permission = AccessFunction.objects.get(code="projects.view")
+        users = []
+        for index in range(5):
+            user = get_user_model().objects.create_user(
+                username=f"query-user-{index}"
+            )
+            users.append(user)
+            UserFunctionOverride.objects.create(
+                user=user,
+                function=permission,
+                effect=(
+                    UserFunctionOverride.Effect.ALLOW
+                    if index % 2 == 0
+                    else UserFunctionOverride.Effect.DENY
+                ),
+            )
+        queryset = (
+            get_user_model().objects.filter(pk__in=[user.pk for user in users])
+            .select_related(
+                "employee_profile__role",
+                "employee_profile__created_by",
+                "employee_profile__organization_unit__workspace_owner",
+                "employee_profile__organization_unit__parent__parent",
+            )
+            .prefetch_related(
+                "function_overrides__function",
+                "employee_profile__role__function_assignments__function",
+            )
+            .order_by("pk")
+        )
+        prefetched_users = list(queryset)
+
+        with CaptureQueriesContext(connection) as queries:
+            data = UserAccessSerializer(prefetched_users, many=True).data
+
+        self.assertEqual(len(data), len(users))
+        self.assertEqual(len(queries), 0)

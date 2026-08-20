@@ -11,12 +11,16 @@ from xml.etree import ElementTree
 
 from django.test import TestCase, override_settings
 from django.contrib.auth import get_user_model
+from django.db import connection
+from django.test import RequestFactory
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APIClient
 
 from accounts.models import AccessFunction, EmployeeProfile, Role, UserFunctionOverride
 from vendors.models import Client, ClientIntegration, OrganizationUnit
+from vendors.services import survey_pricing_for_user
 
 from .integrations import InnovateMRClient, InnovateMRNotFound, PagedSurveyResult
 from .models import Survey, SurveyAttempt, SurveyQuota, SyncLease, SyncRun, TargetingQuestion
@@ -27,6 +31,7 @@ from .services import (
     replace_survey_details,
     sync_surveys,
 )
+from .serializers import SurveyListSerializer
 from .survey_flow import build_outbound_url, create_attempt
 
 
@@ -236,7 +241,7 @@ class SurveySyncTests(TestCase):
         result = dispatch_due_integrations_task()
 
         self.assertIn(integration.pk, result["queued"])
-        delay.assert_called_once_with(integration.pk)
+        delay.assert_called_once_with(integration.pk, dispatch_claim=True)
 
 
     @patch("surveys.tasks.sync_client_integration_task.delay")
@@ -360,6 +365,69 @@ class SurveyAPITests(TestCase):
             response.data["results"][0]["start_link"],
             f"http://testserver/survey/start?surveyId=9876&supplierCode=1000&userId={self.user.pk}&code={self.survey.local_id}",
         )
+
+    def test_list_serializer_queries_are_constant_for_20_distinct_surveys(self):
+        client = Client.objects.create(
+            code="query-client", name="Query Client", provider_code="query"
+        )
+        self.survey.client = client
+        self.survey.save(update_fields=["client"])
+        survey_ids = [self.survey.pk]
+        for index in range(19):
+            survey_ids.append(
+                Survey.objects.create(
+                    client=client,
+                    source_id=9900 + index,
+                    name=f"Query survey {index}",
+                    status=Survey.Status.LIVE,
+                    cpi=Decimal("2.50"),
+                ).pk
+            )
+
+        def serialization_query_count(ids):
+            # Reload both users and surveys outside capture so the assertion
+            # covers serializer behavior, not fixture retrieval.
+            viewer = get_user_model().objects.get(pk=self.user.pk)
+            request = RequestFactory().get("/api/v1/surveys/")
+            request.user = viewer
+            surveys = list(
+                Survey.objects.filter(pk__in=ids)
+                .select_related("client", "integration")
+                .order_by("pk")
+            )
+            with CaptureQueriesContext(connection) as queries:
+                data = SurveyListSerializer(
+                    surveys, many=True, context={"request": request}
+                ).data
+                self.assertEqual(len(data), len(ids))
+            return len(queries)
+
+        one_row_queries = serialization_query_count(survey_ids[:1])
+        page_queries = serialization_query_count(survey_ids)
+        self.assertEqual(page_queries, one_row_queries)
+        # This 20-row fixture issued 124 queries before page-scoped permission,
+        # organization, supplier, and pricing caches were introduced.
+        self.assertEqual(page_queries, 7)
+
+    def test_list_serializer_computes_pricing_once_per_object(self):
+        viewer = get_user_model().objects.get(pk=self.user.pk)
+        request = RequestFactory().get("/api/v1/surveys/")
+        request.user = viewer
+        survey = Survey.objects.select_related("client", "integration").get(
+            pk=self.survey.pk
+        )
+
+        with patch(
+            "surveys.serializers.survey_pricing_for_user",
+            wraps=survey_pricing_for_user,
+        ) as pricing:
+            data = SurveyListSerializer(
+                survey, context={"request": request}
+            ).data
+
+        self.assertIn("cpi", data)
+        self.assertIn("cpi_cut_percent", data)
+        self.assertEqual(pricing.call_count, 1)
 
     def test_multi_value_filters_use_or_within_each_filter(self):
         Survey.objects.create(

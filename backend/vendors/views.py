@@ -263,7 +263,8 @@ class OrganizationUnitViewSet(OrganizationScopedMixin, viewsets.ModelViewSet):
         return OrganizationUnit.objects.filter(
             workspace_owner_id__in=self.organization_owner_ids()
         ).select_related(
-            "workspace_owner", "workspace_owner__employee_profile", "parent", "created_by"
+            "workspace_owner", "workspace_owner__employee_profile",
+            "parent__parent", "created_by",
         )
 
     def get_serializer_context(self):
@@ -534,7 +535,8 @@ class ClientIntegrationViewSet(PermissionByActionMixin, viewsets.ModelViewSet):
 
         from surveys.integrations import InnovateMRClient
         try:
-            result = InnovateMRClient(integration=integration).test_connection()
+            with InnovateMRClient(integration=integration) as client:
+                result = client.test_connection()
             integration.last_test_status = "success"
             integration.last_test_error = ""
             integration.scheduled_sync_enabled = True

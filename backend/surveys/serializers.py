@@ -6,7 +6,7 @@ from django.urls import reverse
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
-from accounts.access import has_function_access
+from accounts.access import effective_permission_codes
 from vendors.access import vendor_scope_user_id
 from vendors.services import organization_client_ids_for_user, survey_pricing_for_user
 
@@ -319,10 +319,40 @@ class SurveyListSerializer(serializers.ModelSerializer):
             "progress_percent",
         ]
 
+    def _has_permission(self, code: str) -> bool:
+        """Resolve access once for the whole serialized page, not once per row."""
+
+        request = self.context.get("request")
+        if (
+            not request
+            or not request.user.is_authenticated
+            or not request.user.is_active
+        ):
+            return False
+        if request.user.is_superuser:
+            return True
+        if not hasattr(self, "_permission_codes_cache"):
+            self._permission_codes_cache = effective_permission_codes(request.user)
+        return code in self._permission_codes_cache
+
+    def _uses_scoped_client_name(self) -> bool:
+        """Cache organization/supplier scope once for all rows on this page."""
+
+        if not hasattr(self, "_scoped_client_name_cache"):
+            request = self.context.get("request")
+            self._scoped_client_name_cache = bool(
+                request
+                and request.user.is_authenticated
+                and (
+                    vendor_scope_user_id(request.user)
+                    or organization_client_ids_for_user(request.user) is not None
+                )
+            )
+        return self._scoped_client_name_cache
+
     def to_representation(self, instance):
         data = super().to_representation(instance)
-        request = self.context.get("request")
-        if request and not has_function_access(request.user, "projects.column.client_name"):
+        if not self._has_permission("projects.column.client_name"):
             data["client_name"] = ""
             data["display_company_name"] = ""
             data["company_name"] = ""
@@ -339,10 +369,7 @@ class SurveyListSerializer(serializers.ModelSerializer):
         return obj.integration.provider_code if obj.integration_id else getattr(obj.client, "provider_code", "innovatemr")
 
     def get_display_company_name(self, obj) -> str:
-        request = self.context.get("request")
-        if request and (
-            vendor_scope_user_id(request.user) or organization_client_ids_for_user(request.user) is not None
-        ) and obj.client:
+        if obj.client and self._uses_scoped_client_name():
             return obj.client.name
         return obj.company_name
 
@@ -384,8 +411,18 @@ class SurveyListSerializer(serializers.ModelSerializer):
             return str(value)
 
     def _pricing(self, obj):
-        request = self.context.get("request")
-        return survey_pricing_for_user(request.user, obj) if request and request.user.is_authenticated else (obj.cpi, None)
+        cache = getattr(self, "_pricing_cache", None)
+        if cache is None:
+            cache = self._pricing_cache = {}
+        key = obj.pk if obj.pk is not None else id(obj)
+        if key not in cache:
+            request = self.context.get("request")
+            cache[key] = (
+                survey_pricing_for_user(request.user, obj)
+                if request and request.user.is_authenticated
+                else (obj.cpi, None)
+            )
+        return cache[key]
 
     @extend_schema_field(serializers.DecimalField(max_digits=12, decimal_places=2, allow_null=True))
     def get_cpi(self, obj):
@@ -402,7 +439,7 @@ class SurveyListSerializer(serializers.ModelSerializer):
     def get_start_link(self, obj) -> str | None:
         """Return the shareable platform pre-screener URL, never the supplier entry URL."""
         request = self.context.get("request")
-        if not request or not request.user.is_authenticated or not has_function_access(request.user, "survey_links.copy"):
+        if not request or not self._has_permission("survey_links.copy"):
             return None
         supports_lazy_entry_link = bool(
             obj.integration_id and obj.integration.provider_code in {"rfg", "cint"}

@@ -4,7 +4,7 @@ export default {
   theme: {
     extend: {
       fontFamily: {
-        sans: ['"DM Sans"', 'system-ui', 'sans-serif'],
+        sans: ['"DM Sans Variable"', 'system-ui', 'sans-serif'],
       },
       colors: {
         brand: {

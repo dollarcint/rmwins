@@ -9,8 +9,15 @@ from .models import EmployeeProfile
 
 
 class WorkspaceAuthenticationForm(AuthenticationForm):
-    username = forms.CharField(widget=forms.TextInput(attrs={"autofocus": True, "placeholder": "Username"}))
-    password = forms.CharField(strip=False, widget=forms.PasswordInput(attrs={"placeholder": "Password"}))
+    username = forms.CharField(
+        max_length=150,
+        widget=forms.TextInput(attrs={"autofocus": True, "placeholder": "Username"}),
+    )
+    password = forms.CharField(
+        max_length=1024,
+        strip=False,
+        widget=forms.PasswordInput(attrs={"placeholder": "Password"}),
+    )
     remember_me = forms.BooleanField(required=False, initial=True)
 
     def confirm_login_allowed(self, user):

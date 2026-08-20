@@ -81,11 +81,11 @@ def get_request_ip(request) -> str | None:
     """Return the original client IP, trusting proxy headers only when configured."""
     if settings.TRUST_X_FORWARDED_FOR:
         forwarded = request.META.get("HTTP_X_FORWARDED_FOR", "")
-        candidates = [
-            request.META.get("HTTP_CF_CONNECTING_IP"),
-            *(part.strip() for part in forwarded.split(",") if part.strip()),
-            request.META.get("HTTP_X_REAL_IP"),
-        ]
+        candidates = []
+        if settings.TRUST_CLOUDFLARE_HEADERS:
+            candidates.append(request.META.get("HTTP_CF_CONNECTING_IP"))
+        candidates.extend(part.strip() for part in forwarded.split(",") if part.strip())
+        candidates.append(request.META.get("HTTP_X_REAL_IP"))
         for candidate in candidates:
             normalized = normalize_client_ip(candidate)
             if normalized:

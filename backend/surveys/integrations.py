@@ -65,7 +65,38 @@ class InnovateMRClient:
         self.timeout = settings.INNOVATEMR_TIMEOUT_SECONDS
         self.page_size = settings.INNOVATEMR_PAGE_SIZE
         self.max_pages = settings.INNOVATEMR_MAX_PAGES
-        self.session = session or requests.Session()
+        self._session = session
+        self._owns_session = session is None
+        self._session_closed = False
+
+    @property
+    def session(self) -> requests.Session:
+        """Create the owned connection pool only when a request is made."""
+
+        if self._owns_session and self._session_closed:
+            raise InnovateMRAPIError("This upstream client is already closed.")
+        if self._session is None:
+            self._session = requests.Session()
+        return self._session
+
+    def close(self) -> None:
+        """Release an internally-created pool without closing caller-owned sessions."""
+
+        if not self._owns_session or self._session_closed:
+            return
+        self._session_closed = True
+        if self._session is None:
+            return
+        try:
+            self._session.close()
+        except Exception:
+            logger.warning("Could not close an InnovateMR HTTP session", exc_info=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
 
     def _config(self, name: str, default=""):
         return getattr(self.integration, name, default) if self.integration is not None else default

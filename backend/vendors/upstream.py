@@ -11,6 +11,7 @@ from urllib.parse import quote, urlsplit
 
 from surveys.integrations import InnovateMRAPIError, InnovateMRClient
 from surveys.providers import ProviderError, get_provider
+from surveys.providers.base import managed_provider
 
 from .credentials import resolve_integration_token
 
@@ -541,7 +542,9 @@ def _effective_url(integration, spec: OperationSpec) -> str:
         return "Not configured"
     if _provider_key(integration) == "cint":
         endpoint = endpoint.replace("{supplier_code}", quote(str(integration.supplier_code), safe=""))
-    return InnovateMRClient(integration=integration).endpoint_url(endpoint)
+    if urlsplit(endpoint).scheme in {"http", "https"}:
+        return endpoint
+    return f"{integration.base_url.rstrip('/')}/{endpoint.lstrip('/')}"
 
 
 def integration_metadata(integration) -> dict[str, Any]:
@@ -644,7 +647,18 @@ def _credential_values(integration) -> set[str]:
 
 
 def _execute_rfg(integration, spec: OperationSpec, parameters: dict[str, Any]) -> Any:
-    provider = get_provider(integration)
+    with managed_provider(get_provider(integration)) as provider:
+        return _execute_rfg_with_provider(integration, provider, spec, parameters)
+
+
+def _execute_rfg_with_provider(
+    integration,
+    provider,
+    spec: OperationSpec,
+    parameters: dict[str, Any],
+) -> Any:
+    """Execute one RFG explorer operation with an operation-owned provider."""
+
     required = _required_values(spec, parameters)
     if spec.code == "test":
         return provider.test_connection()
@@ -718,65 +732,79 @@ def _execute_rfg(integration, spec: OperationSpec, parameters: dict[str, Any]) -
 
 def _execute_rest(integration, spec: OperationSpec, parameters: dict[str, Any]) -> Any:
     client = InnovateMRClient(integration=integration)
-    required = _required_values(spec, parameters)
-    endpoint = _configured_endpoint(integration, spec)
-    if not endpoint:
-        raise UpstreamExplorerError(f"Operation '{spec.code}' is not configured for this integration.")
-    for name, value in required.items():
-        endpoint = endpoint.replace("{" + name + "}", quote(value, safe=""))
-    unresolved = re.findall(r"\{([^{}]+)\}", endpoint)
-    if unresolved:
-        raise UpstreamExplorerError(f"Missing endpoint value(s): {', '.join(unresolved)}.")
-    query = {
-        name: str(parameters[name]).strip()
-        for name in spec.query_parameters
-        if parameters.get(name) not in {None, ""}
-    }
-    if spec.code == "paged_inventory":
-        if "page_size" in query:
-            query["limit"] = query.pop("page_size")
-        if "cursor" in query:
-            query["next"] = query.pop("cursor")
-    if spec.mutating:
-        confirmed = parameters.get("confirm_upstream_mutation") is True
-        if not confirmed:
-            raise UpstreamExplorerError(
-                "This changes live provider data. Set confirm_upstream_mutation=true in the request body."
-            )
-        body = parameters.get("payload") or {}
-        if not isinstance(body, dict):
-            raise UpstreamExplorerError("payload must be a JSON object.")
-        return client.write_json(spec.upstream_method, endpoint, body)
-    if spec.upstream_method == "POST":
-        if spec.code == "unique_ip_check":
-            body = {"ip": required["ip"], "survNum": required["survey_id"]}
-        elif spec.code == "unique_pid_ip_check":
-            body = {
-                "id": required["external_id"], "pid": required["pid"],
-                "survNum": required["survey_id"],
-            }
-        elif spec.code == "respondent_precheck":
-            body = {
-                "pid": required["pid"], "ip": required["ip"],
-                "survNum": required["survey_id"], "deviceType": required["device_type"],
-            }
-        elif spec.code == "respondent_surveys":
-            try:
-                num_surveys = int(parameters.get("num_surveys") or 10)
-            except (TypeError, ValueError) as exc:
-                raise UpstreamExplorerError("num_surveys must be a whole number.") from exc
-            body = {
-                "ip": required["ip"], "numSurveys": max(1, min(num_surveys, 100)),
-                "deviceType": required["device_type"],
-            }
-        else:
-            raise UpstreamExplorerError("This configured POST operation is not allow-listed.")
-        return client.post_json(endpoint, body)
-    return client.request_json(endpoint, params=query or None)
+    try:
+        required = _required_values(spec, parameters)
+        endpoint = _configured_endpoint(integration, spec)
+        if not endpoint:
+            raise UpstreamExplorerError(f"Operation '{spec.code}' is not configured for this integration.")
+        for name, value in required.items():
+            endpoint = endpoint.replace("{" + name + "}", quote(value, safe=""))
+        unresolved = re.findall(r"\{([^{}]+)\}", endpoint)
+        if unresolved:
+            raise UpstreamExplorerError(f"Missing endpoint value(s): {', '.join(unresolved)}.")
+        query = {
+            name: str(parameters[name]).strip()
+            for name in spec.query_parameters
+            if parameters.get(name) not in {None, ""}
+        }
+        if spec.code == "paged_inventory":
+            if "page_size" in query:
+                query["limit"] = query.pop("page_size")
+            if "cursor" in query:
+                query["next"] = query.pop("cursor")
+        if spec.mutating:
+            confirmed = parameters.get("confirm_upstream_mutation") is True
+            if not confirmed:
+                raise UpstreamExplorerError(
+                    "This changes live provider data. Set confirm_upstream_mutation=true in the request body."
+                )
+            body = parameters.get("payload") or {}
+            if not isinstance(body, dict):
+                raise UpstreamExplorerError("payload must be a JSON object.")
+            return client.write_json(spec.upstream_method, endpoint, body)
+        if spec.upstream_method == "POST":
+            if spec.code == "unique_ip_check":
+                body = {"ip": required["ip"], "survNum": required["survey_id"]}
+            elif spec.code == "unique_pid_ip_check":
+                body = {
+                    "id": required["external_id"], "pid": required["pid"],
+                    "survNum": required["survey_id"],
+                }
+            elif spec.code == "respondent_precheck":
+                body = {
+                    "pid": required["pid"], "ip": required["ip"],
+                    "survNum": required["survey_id"], "deviceType": required["device_type"],
+                }
+            elif spec.code == "respondent_surveys":
+                try:
+                    num_surveys = int(parameters.get("num_surveys") or 10)
+                except (TypeError, ValueError) as exc:
+                    raise UpstreamExplorerError("num_surveys must be a whole number.") from exc
+                body = {
+                    "ip": required["ip"], "numSurveys": max(1, min(num_surveys, 100)),
+                    "deviceType": required["device_type"],
+                }
+            else:
+                raise UpstreamExplorerError("This configured POST operation is not allow-listed.")
+            return client.post_json(endpoint, body)
+        return client.request_json(endpoint, params=query or None)
+    finally:
+        client.close()
 
 
 def _execute_cint(integration, spec: OperationSpec, parameters: dict[str, Any]) -> Any:
-    provider = get_provider(integration)
+    with managed_provider(get_provider(integration)) as provider:
+        return _execute_cint_with_provider(integration, provider, spec, parameters)
+
+
+def _execute_cint_with_provider(
+    integration,
+    provider,
+    spec: OperationSpec,
+    parameters: dict[str, Any],
+) -> Any:
+    """Execute one Cint explorer operation with an operation-owned provider."""
+
     required = _required_values(spec, parameters)
     endpoint = spec.endpoint.replace(
         "{supplier_code}", quote(str(integration.supplier_code), safe="")

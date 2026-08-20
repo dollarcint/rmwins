@@ -4,6 +4,8 @@ from django.contrib import admin
 from django.urls import include, path
 from drf_spectacular.views import SpectacularAPIView, SpectacularRedocView, SpectacularSwaggerView
 
+from accounts.views import throttled_admin_login
+
 from .api_docs import DocumentationProtectionMixin, IsDocumentationAdmin
 
 
@@ -20,6 +22,7 @@ class ProtectedRedocView(DocumentationProtectionMixin, SpectacularRedocView):
 
 
 urlpatterns = [
+    path("admin/login/", throttled_admin_login, name="throttled-admin-login"),
     path("admin/", admin.site.urls),
     path("api/schema/", ProtectedSchemaView.as_view(), name="api-schema"),
     path("api/docs/", ProtectedSwaggerView.as_view(url_name="api-schema"), name="swagger-ui"),

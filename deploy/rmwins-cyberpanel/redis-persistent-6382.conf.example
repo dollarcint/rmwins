@@ -1,0 +1,29 @@
+# Copy to /home/www.rmwinsights.com/.config/rmwins/redis-6382.conf, replace the
+# password. The deploy wrapper stores it as root:wwwrm1759 mode 0640. Use a URL-safe random password so it can also be
+# placed in backend.env Redis URLs without ambiguous URL encoding.
+bind 127.0.0.1
+protected-mode yes
+requirepass replace-with-persistent-redis-password
+port 6382
+daemonize no
+supervised no
+pidfile /home/www.rmwinsights.com/app/run/supervisor/rmwins-redis-6382.pid
+loglevel notice
+logfile ""
+databases 2
+maxmemory 1gb
+maxmemory-policy noeviction
+dir /home/www.rmwinsights.com/app/data/redis-persistent
+dbfilename dump.rdb
+appendonly yes
+appendfilename "appendonly.aof"
+appendfsync everysec
+no-appendfsync-on-rewrite yes
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+save 900 1
+save 300 10
+save 60 10000
+stop-writes-on-bgsave-error yes
+rdbcompression yes
+rdbchecksum yes

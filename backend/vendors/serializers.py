@@ -12,7 +12,7 @@ from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from accounts.models import EmployeeProfile
-from accounts.access import has_function_access
+from accounts.access import effective_permission_codes, has_function_access
 
 from .models import (
     AllocationReservation,
@@ -528,7 +528,19 @@ class ClientSerializer(serializers.ModelSerializer):
 
     def get_integrations(self, obj) -> list[dict]:
         request = self.context.get("request")
-        if not request or not has_function_access(request.user, "clients.integration.view"):
+        if (
+            not request
+            or not request.user.is_authenticated
+            or not request.user.is_active
+        ):
+            return []
+        if request.user.is_superuser:
+            return ClientIntegrationSerializer(
+                obj.integrations.all(), many=True, context=self.context
+            ).data
+        if not hasattr(self, "_permission_codes_cache"):
+            self._permission_codes_cache = effective_permission_codes(request.user)
+        if "clients.integration.view" not in self._permission_codes_cache:
             return []
         return ClientIntegrationSerializer(obj.integrations.all(), many=True, context=self.context).data
 

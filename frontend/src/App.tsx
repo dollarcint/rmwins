@@ -1,30 +1,23 @@
-import Hero from './components/Hero';
-import Services from './components/Services';
-import About from './components/About';
-import Contact from './components/Contact';
-import Footer from './components/Footer';
-import Navbar from './components/Navbar';
-import LoginPage from './components/LoginPage';
-import SurveyStatusPage from './components/SurveyStatusPage';
+import { lazy, Suspense, type ComponentType } from 'react';
+import LandingPage from './components/LandingPage';
+
+const LoginPage = lazy(() => import('./components/LoginPage'));
+const SurveyStatusPage = lazy(() => import('./components/SurveyStatusPage'));
 
 function App() {
-  if (window.location.pathname.replace(/\/$/, '') === '/login') {
-    return <LoginPage />;
-  }
+  const pathname = window.location.pathname.replace(/\/$/, '');
+  let Page: ComponentType = LandingPage;
 
-  if (window.location.pathname.replace(/\/$/, '') === '/survey') {
-    return <SurveyStatusPage />;
+  if (pathname === '/login') {
+    Page = LoginPage;
+  } else if (pathname === '/survey') {
+    Page = SurveyStatusPage;
   }
 
   return (
-    <div className="min-h-screen bg-white text-slate-900">
-      <Navbar />
-      <Hero />
-      <Services />
-      <About />
-      <Contact />
-      <Footer />
-    </div>
+    <Suspense fallback={<div className="min-h-screen bg-slate-50" />}>
+      <Page />
+    </Suspense>
   );
 }
 

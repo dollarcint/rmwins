@@ -129,10 +129,20 @@ class Survey(models.Model):
     updated_at = models.DateTimeField(auto_now=True, db_index=True)
 
     class Meta:
-        ordering = ["-source_modified_at", "-created_at"]
+        ordering = [
+            models.F("source_modified_at").desc(nulls_last=True),
+            models.F("created_at").desc(),
+        ]
         indexes = [
             models.Index(fields=["status", "country_code"]),
             models.Index(fields=["client", "cpi"]),
+            models.Index(
+                "integration",
+                "status",
+                models.F("detail_synced_at").asc(nulls_first=True),
+                models.F("source_modified_at").desc(nulls_last=True),
+                name="survey_sync_detail_idx",
+            ),
         ]
         constraints = [
             models.UniqueConstraint(fields=["integration", "source_id"], name="unique_integration_survey_source"),
@@ -488,7 +498,26 @@ class SurveyAttempt(models.Model):
 
     class Meta:
         ordering = ["-initiated_at"]
-        indexes = [models.Index(fields=["survey", "user_id", "-initiated_at"])]
+        indexes = [
+            models.Index(fields=["survey", "user_id", "-initiated_at"]),
+            models.Index(
+                fields=["platform_user", "-initiated_at"],
+                name="attempt_user_date_idx",
+            ),
+            models.Index(
+                fields=["survey", "status"],
+                name="attempt_survey_status_idx",
+            ),
+            models.Index(
+                models.F("upstream_checked_at").asc(nulls_first=True),
+                models.F("initiated_at").desc(),
+                name="attempt_reconcile_idx",
+                condition=models.Q(
+                    status="redirected",
+                    callback_at__isnull=True,
+                ),
+            ),
+        ]
 
     def __str__(self):
         return f"{self.rid} · {self.survey.source_id} · {self.user_id}"

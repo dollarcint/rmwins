@@ -1,0 +1,21 @@
+[Unit]
+Description=RMWins React frontend on private port 8094
+After=network.target
+
+[Service]
+Type=simple
+User=wwwrm1759
+Group=wwwrm1759
+WorkingDirectory=/home/www.rmwinsights.com
+ExecStartPre=/usr/sbin/nginx -t -e stderr -c /home/www.rmwinsights.com/rmwins/deploy/rmwins-cyberpanel/frontend-nginx.conf
+ExecStart=/usr/sbin/nginx -e stderr -c /home/www.rmwinsights.com/rmwins/deploy/rmwins-cyberpanel/frontend-nginx.conf -g "daemon off;"
+Restart=always
+RestartSec=3
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+
+[Install]
+WantedBy=multi-user.target

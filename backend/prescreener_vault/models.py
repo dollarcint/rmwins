@@ -51,6 +51,19 @@ class PrescreenerSubmission(models.Model):
                 fields=["source_client_code", "country_code", "respondent_gender", "respondent_age"],
                 name="vault_reuse_age_idx",
             ),
+            # Candidate selection always filters the first three columns and
+            # requests the final four as its fairness/tie-break order. Keep the
+            # age-group index above as the alternative for selective age scans.
+            models.Index(
+                "source_client_code",
+                "country_code",
+                "respondent_gender",
+                "usage_count",
+                models.F("last_reused_at").asc(nulls_first=True),
+                "submitted_at",
+                "uid",
+                name="vault_candidate_queue_idx",
+            ),
         ]
 
 

@@ -51,28 +51,80 @@ def is_super_admin_account(user) -> bool:
     return bool(profile and profile.role and profile.role.is_active and profile.role.slug in {"super-admin", "superadmin"})
 
 
-def effective_permission_codes(user) -> set[str]:
+def resolve_effective_permission_codes(
+    user,
+    *,
+    profile,
+    role_assignments,
+    overrides,
+    active_function_codes=(),
+) -> set[str]:
+    """Apply permission precedence to explicitly loaded access-control rows."""
+
     if not user or not user.is_authenticated or not user.is_active:
         return set()
     if user.is_superuser:
-        return set(AccessFunction.objects.filter(is_active=True).values_list("code", flat=True))
+        return set(active_function_codes)
 
-    profile = EmployeeProfile.objects.select_related("role").filter(user=user).first()
     codes: set[str] = set()
     if profile and profile.role and profile.role.is_active:
         codes.update(
-            profile.role.function_assignments.filter(allowed=True, function__is_active=True)
-            .values_list("function__code", flat=True)
+            assignment.function.code
+            for assignment in role_assignments
+            if assignment.allowed and assignment.function.is_active
         )
-    for code, effect in user.function_overrides.filter(function__is_active=True).values_list("function__code", "effect"):
-        if effect == UserFunctionOverride.Effect.ALLOW:
-            codes.add(code)
+
+    for override in overrides:
+        if not override.function.is_active:
+            continue
+        if override.effect == UserFunctionOverride.Effect.ALLOW:
+            codes.add(override.function.code)
         else:
-            codes.discard(code)
+            codes.discard(override.function.code)
     if profile and profile.account_type == EmployeeProfile.AccountType.EXTERNAL_VENDOR:
         codes.difference_update(EXTERNAL_VENDOR_FORBIDDEN_CODES)
         codes = {code for code in codes if not code.startswith("organization.")}
     return codes
+
+
+def effective_permission_codes(user) -> set[str]:
+    """Resolve permissions from authoritative database state.
+
+    Do not trust relationship caches here: callers may update a profile or an
+    override through queryset ``update()`` while retaining the same user
+    instance. The serializer fast path passes its request-scoped prefetched
+    rows to ``resolve_effective_permission_codes`` explicitly instead.
+    """
+
+    if not user or not user.is_authenticated or not user.is_active:
+        return set()
+    if user.is_superuser:
+        active_function_codes = AccessFunction.objects.filter(
+            is_active=True
+        ).values_list("code", flat=True)
+        return resolve_effective_permission_codes(
+            user,
+            profile=None,
+            role_assignments=(),
+            overrides=(),
+            active_function_codes=active_function_codes,
+        )
+
+    profile = EmployeeProfile.objects.select_related("role").filter(
+        user=user
+    ).first()
+    role_assignments = (
+        profile.role.function_assignments.select_related("function").all()
+        if profile and profile.role and profile.role.is_active
+        else ()
+    )
+    overrides = user.function_overrides.select_related("function").all()
+    return resolve_effective_permission_codes(
+        user,
+        profile=profile,
+        role_assignments=role_assignments,
+        overrides=overrides,
+    )
 
 
 def has_function_access(user, code: str) -> bool:

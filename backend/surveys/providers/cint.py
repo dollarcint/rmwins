@@ -65,7 +65,7 @@ class CintProvider(SurveyProvider):
     def __init__(self, integration, *, session=None):
         """Resolve Cint credentials, supplier identity and polling/link policy."""
 
-        super().__init__(integration, session=session or requests.Session())
+        super().__init__(integration, session=session)
         self.api_key = resolve_integration_token(integration)
         if not self.api_key:
             raise ProviderConfigurationError(

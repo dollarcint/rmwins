@@ -2,7 +2,7 @@
 
 import logging
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import F, Q
 from django.utils import timezone
 
 from vendors.models import ClientIntegration
@@ -10,6 +10,7 @@ from vendors.models import ClientIntegration
 from .models import Survey, SyncRun
 from .project_cache import invalidate_project_cache
 from .providers import ProviderError, get_provider
+from .providers.base import managed_provider
 
 
 logger = logging.getLogger(__name__)
@@ -43,29 +44,30 @@ def _preserve_provider_local_state(integration, survey, normalized):
 
 def provider_preview(integration: ClientIntegration, limit: int = 10) -> dict:
     """Fetch a bounded, read-only inventory preview without changing local surveys."""
-    provider = get_provider(integration)
-    seen_at = timezone.now()
-    rows = []
-    inventory = provider.inventory()
-    for payload in inventory[: max(1, min(int(limit), 25))]:
-        normalized = provider.normalize_inventory_item(payload, seen_at)
-        rows.append({
-            "source_id": normalized.source_key,
-            "name": normalized.values.get("name", ""),
-            "country": normalized.values.get("country_code", ""),
-            "cpi": normalized.values.get("cpi"),
-            "loi": normalized.values.get("loi"),
-            "status": normalized.values.get("status"),
-            "modified_at": normalized.modified_at,
-        })
+    with managed_provider(get_provider(integration)) as provider:
+        seen_at = timezone.now()
+        rows = []
+        inventory = provider.inventory()
+        for payload in inventory[: max(1, min(int(limit), 25))]:
+            normalized = provider.normalize_inventory_item(payload, seen_at)
+            rows.append({
+                "source_id": normalized.source_key,
+                "name": normalized.values.get("name", ""),
+                "country": normalized.values.get("country_code", ""),
+                "cpi": normalized.values.get("cpi"),
+                "loi": normalized.values.get("loi"),
+                "status": normalized.values.get("status"),
+                "modified_at": normalized.modified_at,
+            })
     return {"total_received": len(inventory), "results": rows}
 
 
 def test_provider_connection(integration: ClientIntegration) -> dict:
     now = timezone.now()
     try:
-        provider = get_provider(integration)
-        result = provider.test_connection()
+        with managed_provider(get_provider(integration)) as provider:
+            result = provider.test_connection()
+            minimum_sync_interval_seconds = provider.minimum_sync_interval_seconds
     except Exception as exc:
         ClientIntegration.objects.filter(pk=integration.pk).update(
             last_tested_at=now,
@@ -79,7 +81,7 @@ def test_provider_connection(integration: ClientIntegration) -> dict:
         last_test_status="success",
         last_test_error="",
         scheduled_sync_enabled=True,
-        sync_interval_seconds=provider.minimum_sync_interval_seconds,
+        sync_interval_seconds=minimum_sync_interval_seconds,
     )
     return result
 
@@ -98,7 +100,22 @@ def sync_client_integration(integration: ClientIntegration, *, refresh_details=F
     """Synchronize one verified provider connection into its owning client."""
     if not integration.is_active:
         raise ProviderError("This client integration is inactive.")
-    provider = get_provider(integration)
+    with managed_provider(get_provider(integration)) as provider:
+        return _sync_client_integration_with_provider(
+            integration,
+            provider,
+            refresh_details=refresh_details,
+        )
+
+
+def _sync_client_integration_with_provider(
+    integration: ClientIntegration,
+    provider,
+    *,
+    refresh_details=False,
+) -> SyncRun:
+    """Run one inventory sync while the caller owns the provider lifecycle."""
+
     now = timezone.now()
     run = SyncRun.objects.create(integration=integration)
     touched = []
@@ -248,7 +265,22 @@ def refresh_client_integration_details(integration: ClientIntegration, *, limit=
     """Refresh changed provider targeting/link data outside the inventory transaction."""
     if not integration.is_active:
         raise ProviderError("This client integration is inactive.")
-    provider = get_provider(integration)
+    with managed_provider(get_provider(integration)) as provider:
+        return _refresh_client_integration_details_with_provider(
+            integration,
+            provider,
+            limit=limit,
+        )
+
+
+def _refresh_client_integration_details_with_provider(
+    integration: ClientIntegration,
+    provider,
+    *,
+    limit=None,
+) -> dict:
+    """Refresh details while the caller owns the provider lifecycle."""
+
     requested = limit if limit is not None else (integration.config or {}).get(
         "detail_refresh_batch", integration.detail_refresh_batch
     )
@@ -261,11 +293,17 @@ def refresh_client_integration_details(integration: ClientIntegration, *, limit=
         # These inventory feeds do not carry complete targeting/quota detail.
         # Rotate through the oldest snapshots so detail hydration continues
         # after the initial backfill without creating an API request burst.
-        candidates = candidates.order_by("detail_synced_at", "pk")[:batch]
+        candidates = candidates.order_by(
+            F("detail_synced_at").asc(nulls_first=True),
+            "pk",
+        )[:batch]
     else:
         candidates = candidates.filter(
             detail_synced_at__isnull=True
-        ).order_by("-source_modified_at", "pk")[:batch]
+        ).order_by(
+            F("source_modified_at").desc(nulls_last=True),
+            "pk",
+        )[:batch]
     refreshed = failures = 0
     for survey in candidates:
         try:
@@ -292,7 +330,26 @@ def sync_cint_redirect_contracts(
         raise ProviderError("Redirect contract synchronization is only available for Cint.")
     if not integration.is_active:
         raise ProviderError("This Cint integration is inactive.")
-    provider = get_provider(integration)
+    with managed_provider(get_provider(integration)) as provider:
+        return _sync_cint_redirect_contracts_with_provider(
+            integration,
+            provider,
+            batch_size=batch_size,
+            force=force,
+            after_id=after_id,
+        )
+
+
+def _sync_cint_redirect_contracts_with_provider(
+    integration: ClientIntegration,
+    provider,
+    *,
+    batch_size=25,
+    force=False,
+    after_id=0,
+) -> dict:
+    """Update a redirect batch while the caller owns the provider lifecycle."""
+
     fingerprint = provider.redirect_contract_fingerprint()
     # Closed/deactivated opportunities cannot accept respondents and Cint may
     # return 404 when their supplier links are no longer available. Keeping

@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 
+from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -55,6 +56,25 @@ CINT_PROJECT_CACHE_INVALIDATION_SECONDS = max(
     0,
     int(os.getenv("CINT_PROJECT_CACHE_INVALIDATION_SECONDS", "30")),
 )
+AUTH_LOGIN_MAX_BODY_BYTES = max(
+    1024,
+    int(os.getenv("AUTH_LOGIN_MAX_BODY_BYTES", "16384")),
+)
+AUTH_LOGIN_MAX_ATTEMPTS = max(
+    1,
+    int(os.getenv("AUTH_LOGIN_MAX_ATTEMPTS", "10")),
+)
+AUTH_LOGIN_MAX_IP_ATTEMPTS = max(
+    AUTH_LOGIN_MAX_ATTEMPTS,
+    int(os.getenv("AUTH_LOGIN_MAX_IP_ATTEMPTS", "30")),
+)
+AUTH_LOGIN_WINDOW_SECONDS = max(
+    1,
+    int(os.getenv("AUTH_LOGIN_WINDOW_SECONDS", "300")),
+)
+# Local development may use the one-time setup form. Production bootstraps the
+# first administrator privately through the management command instead.
+FIRST_ADMIN_SETUP_ENABLED = env_bool("FIRST_ADMIN_SETUP_ENABLED", DEBUG)
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -63,6 +83,7 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
+    "corsheaders",
     "rest_framework",
     "drf_spectacular",
     "django_filters",
@@ -74,6 +95,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "corsheaders.middleware.CorsMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -101,10 +123,29 @@ TEMPLATES = [
 WSGI_APPLICATION = "config.wsgi.application"
 ASGI_APPLICATION = "config.asgi.application"
 
-DB_ENGINE = os.getenv("DB_ENGINE", "sqlite").lower()
-if DB_ENGINE == "mysql":
-    DATABASES = {
-        "default": {
+
+def _operational_database_from_env():
+    db_engine = os.getenv("DB_ENGINE", "sqlite").strip().lower()
+    if db_engine in {"postgres", "postgresql"}:
+        options = {
+            "connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", "10")),
+        }
+        sslmode = os.getenv("DB_SSLMODE", "").strip()
+        if sslmode:
+            options["sslmode"] = sslmode
+        return db_engine, {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": os.getenv("DB_NAME", "api-tool"),
+            "USER": os.getenv("DB_USER", "api-tool"),
+            "PASSWORD": os.getenv("DB_PASSWORD", ""),
+            "HOST": os.getenv("DB_HOST", "127.0.0.1"),
+            "PORT": os.getenv("DB_PORT", "5432"),
+            "CONN_MAX_AGE": int(os.getenv("DB_CONN_MAX_AGE", "60")),
+            "CONN_HEALTH_CHECKS": env_bool("DB_CONN_HEALTH_CHECKS", True),
+            "OPTIONS": options,
+        }
+    if db_engine == "mysql":
+        return db_engine, {
             "ENGINE": "django.db.backends.mysql",
             "NAME": os.getenv("DB_NAME", "api-tool"),
             "USER": os.getenv("DB_USER", "api-tool"),
@@ -119,41 +160,117 @@ if DB_ENGINE == "mysql":
                 "connect_timeout": int(os.getenv("DB_CONNECT_TIMEOUT", "10")),
             },
         }
-    }
-else:
-    DATABASES = {
-        "default": {
+    if db_engine == "sqlite":
+        return db_engine, {
             "ENGINE": "django.db.backends.sqlite3",
             "NAME": os.getenv("SQLITE_PATH", BASE_DIR / "db.sqlite3"),
         }
-    }
+    raise ImproperlyConfigured(
+        f"Unsupported DB_ENGINE={db_engine!r}; use sqlite, postgresql/postgres, or mysql."
+    )
+
+
+DB_ENGINE, DEFAULT_DATABASE = _operational_database_from_env()
+DATABASES = {"default": DEFAULT_DATABASE}
+
+
+def _prescreener_database_from_env():
+    """Build the isolated vault connection without falling back to the main DB."""
+
+    db_engine = os.getenv("PRESCREENER_DB_ENGINE", "sqlite").strip().lower()
+    if db_engine in {"postgres", "postgresql"}:
+        options = {
+            "connect_timeout": int(os.getenv("PRESCREENER_DB_CONNECT_TIMEOUT", "10")),
+        }
+        sslmode = os.getenv("PRESCREENER_DB_SSLMODE", "").strip()
+        if sslmode:
+            options["sslmode"] = sslmode
+        return db_engine, {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": os.getenv("PRESCREENER_DB_NAME", "prescreener-vault"),
+            "USER": os.getenv("PRESCREENER_DB_USER", ""),
+            "PASSWORD": os.getenv("PRESCREENER_DB_PASSWORD", ""),
+            "HOST": os.getenv("PRESCREENER_DB_HOST", "127.0.0.1"),
+            "PORT": os.getenv("PRESCREENER_DB_PORT", "5432"),
+            "CONN_MAX_AGE": int(os.getenv("PRESCREENER_DB_CONN_MAX_AGE", "60")),
+            "CONN_HEALTH_CHECKS": env_bool(
+                "PRESCREENER_DB_CONN_HEALTH_CHECKS", True
+            ),
+            "OPTIONS": options,
+        }
+    if db_engine == "mysql":
+        return db_engine, {
+            "ENGINE": "django.db.backends.mysql",
+            "NAME": os.getenv("PRESCREENER_DB_NAME", "prescreener-vault"),
+            "USER": os.getenv("PRESCREENER_DB_USER", ""),
+            "PASSWORD": os.getenv("PRESCREENER_DB_PASSWORD", ""),
+            "HOST": os.getenv("PRESCREENER_DB_HOST", "127.0.0.1"),
+            "PORT": os.getenv("PRESCREENER_DB_PORT", "3306"),
+            "CONN_MAX_AGE": int(os.getenv("PRESCREENER_DB_CONN_MAX_AGE", "60")),
+            "OPTIONS": {
+                "charset": "utf8mb4",
+                "init_command": "SET sql_mode='STRICT_TRANS_TABLES'",
+                "isolation_level": "read committed",
+                "connect_timeout": int(os.getenv("PRESCREENER_DB_CONNECT_TIMEOUT", "10")),
+            },
+        }
+    if db_engine == "sqlite":
+        return db_engine, {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": os.getenv("PRESCREENER_SQLITE_PATH", BASE_DIR / "prescreener_vault.sqlite3"),
+        }
+    raise ImproperlyConfigured(
+        "Unsupported PRESCREENER_DB_ENGINE="
+        f"{db_engine!r}; use sqlite, postgresql/postgres, or mysql."
+    )
+
+
+def _validate_prescreener_database_isolation(enabled, operational, vault):
+    """Fail startup when an enabled vault resolves to the operational DB/user."""
+
+    if not enabled:
+        return
+    operational_engine = operational.get("ENGINE")
+    vault_engine = vault.get("ENGINE")
+    if operational_engine != vault_engine:
+        return
+
+    if operational_engine == "django.db.backends.sqlite3":
+        if Path(operational["NAME"]).resolve() == Path(vault["NAME"]).resolve():
+            raise ImproperlyConfigured(
+                "The prescreener vault must use a different SQLite file."
+            )
+        return
+
+    operational_server = (
+        str(operational.get("HOST", "")),
+        str(operational.get("PORT", "")),
+    )
+    vault_server = (
+        str(vault.get("HOST", "")),
+        str(vault.get("PORT", "")),
+    )
+    if operational_server != vault_server:
+        return
+    if str(operational.get("NAME", "")) == str(vault.get("NAME", "")):
+        raise ImproperlyConfigured(
+            "The prescreener vault must use a different database name."
+        )
+    if str(operational.get("USER", "")) == str(vault.get("USER", "")):
+        raise ImproperlyConfigured(
+            "The prescreener vault must use a different database user."
+        )
+
 
 # Prescreener profile data is deliberately isolated from the operational database.
-# The SQLite fallback keeps local development and tests self-contained; production
-# must enable the vault and provide the dedicated MySQL credentials below.
+# SQLite keeps local development/tests self-contained. Production must enable the
+# vault and supply a different PostgreSQL database and user from the operational DB.
 PRESCREENER_VAULT_ENABLED = env_bool("PRESCREENER_VAULT_ENABLED", False)
-PRESCREENER_DB_ENGINE = os.getenv("PRESCREENER_DB_ENGINE", "sqlite").lower()
-if PRESCREENER_DB_ENGINE == "mysql":
-    DATABASES["prescreener_vault"] = {
-        "ENGINE": "django.db.backends.mysql",
-        "NAME": os.getenv("PRESCREENER_DB_NAME", "prescreener-vault"),
-        "USER": os.getenv("PRESCREENER_DB_USER", ""),
-        "PASSWORD": os.getenv("PRESCREENER_DB_PASSWORD", ""),
-        "HOST": os.getenv("PRESCREENER_DB_HOST", "127.0.0.1"),
-        "PORT": os.getenv("PRESCREENER_DB_PORT", "3306"),
-        "CONN_MAX_AGE": int(os.getenv("PRESCREENER_DB_CONN_MAX_AGE", "60")),
-        "OPTIONS": {
-            "charset": "utf8mb4",
-            "init_command": "SET sql_mode='STRICT_TRANS_TABLES'",
-            "isolation_level": "read committed",
-            "connect_timeout": int(os.getenv("PRESCREENER_DB_CONNECT_TIMEOUT", "10")),
-        },
-    }
-else:
-    DATABASES["prescreener_vault"] = {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": os.getenv("PRESCREENER_SQLITE_PATH", BASE_DIR / "prescreener_vault.sqlite3"),
-    }
+PRESCREENER_DB_ENGINE, PRESCREENER_DATABASE = _prescreener_database_from_env()
+_validate_prescreener_database_isolation(
+    PRESCREENER_VAULT_ENABLED, DEFAULT_DATABASE, PRESCREENER_DATABASE
+)
+DATABASES["prescreener_vault"] = PRESCREENER_DATABASE
 
 DATABASE_ROUTERS = ["prescreener_vault.router.PrescreenerVaultRouter"]
 
@@ -308,6 +425,9 @@ INNOVATEMR_MAX_PAGES = int(os.getenv("INNOVATEMR_MAX_PAGES", "1000"))
 INNOVATEMR_DETAIL_REFRESH_BATCH = int(os.getenv("INNOVATEMR_DETAIL_REFRESH_BATCH", "20"))
 DJANGO_BEHIND_HTTPS_PROXY = env_bool("DJANGO_BEHIND_HTTPS_PROXY", False)
 TRUST_X_FORWARDED_FOR = env_bool("TRUST_X_FORWARDED_FOR", DJANGO_BEHIND_HTTPS_PROXY)
+# Enable only when the front proxy accepts traffic exclusively from verified
+# Cloudflare address ranges and normalizes Cloudflare's headers itself.
+TRUST_CLOUDFLARE_HEADERS = env_bool("TRUST_CLOUDFLARE_HEADERS", False)
 ENFORCE_SURVEY_TARGET_COUNTRY = env_bool("ENFORCE_SURVEY_TARGET_COUNTRY", True)
 GEOIP_CITY_DB_PATH = os.getenv("GEOIP_CITY_DB_PATH", "").strip()
 GEOIP_LOOKUP_URL = os.getenv("GEOIP_LOOKUP_URL", "").strip()
@@ -321,21 +441,34 @@ GEOIP_CACHE_TTL_SECONDS = max(
 CSRF_TRUSTED_ORIGINS = [
     value.strip() for value in os.getenv("DJANGO_CSRF_TRUSTED_ORIGINS", "").split(",") if value.strip()
 ]
+CORS_ALLOWED_ORIGINS = [
+    value.strip() for value in os.getenv("DJANGO_CORS_ALLOWED_ORIGINS", "").split(",") if value.strip()
+]
+CORS_ALLOW_CREDENTIALS = True
+# The marketing frontend only needs cross-origin access to bootstrap and submit
+# login. Keep credentialed CORS away from the rest of the authenticated API.
+CORS_URLS_REGEX = r"^/api/v1/auth/(?:session|login)/$"
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https") if DJANGO_BEHIND_HTTPS_PROXY else None
 USE_X_FORWARDED_HOST = DJANGO_BEHIND_HTTPS_PROXY
 SESSION_COOKIE_SECURE = env_bool("DJANGO_SESSION_COOKIE_SECURE", not DEBUG)
 CSRF_COOKIE_SECURE = env_bool("DJANGO_CSRF_COOKIE_SECURE", not DEBUG)
+SECURE_SSL_REDIRECT = env_bool("DJANGO_SECURE_SSL_REDIRECT", False)
 SECURE_HSTS_SECONDS = int(os.getenv("DJANGO_SECURE_HSTS_SECONDS", "0"))
 SECURE_HSTS_INCLUDE_SUBDOMAINS = SECURE_HSTS_SECONDS > 0
 SECURE_HSTS_PRELOAD = SECURE_HSTS_SECONDS > 0
 
 CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
 CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/1")
+CELERY_RESULT_EXPIRES = max(60, int(os.getenv("CELERY_RESULT_EXPIRES", "3600")))
 CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_TIME_LIMIT = 300
 ENABLE_SCHEDULED_JOBS = env_bool("ENABLE_SCHEDULED_JOBS", True)
 INNOVATEMR_INVENTORY_SYNC_INTERVAL_SECONDS = int(os.getenv("INNOVATEMR_INVENTORY_SYNC_INTERVAL_SECONDS", "60"))
 CLIENT_INTEGRATION_DISPATCH_INTERVAL_SECONDS = int(os.getenv("CLIENT_INTEGRATION_DISPATCH_INTERVAL_SECONDS", "30"))
+CLIENT_INTEGRATION_DISPATCH_CLAIM_TIMEOUT_SECONDS = max(
+    300,
+    int(os.getenv("CLIENT_INTEGRATION_DISPATCH_CLAIM_TIMEOUT_SECONDS", "900")),
+)
 CLIENT_INTEGRATION_INNOVATEMR_SYNC_INTERVAL_SECONDS = int(os.getenv("CLIENT_INTEGRATION_INNOVATEMR_SYNC_INTERVAL_SECONDS", "150"))
 CLIENT_INTEGRATION_RFG_SYNC_INTERVAL_SECONDS = int(os.getenv("CLIENT_INTEGRATION_RFG_SYNC_INTERVAL_SECONDS", "60"))
 CLIENT_INTEGRATION_CINT_SYNC_INTERVAL_SECONDS = int(os.getenv("CLIENT_INTEGRATION_CINT_SYNC_INTERVAL_SECONDS", "60"))

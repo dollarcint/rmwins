@@ -1,11 +1,14 @@
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 from django.contrib.auth import get_user_model
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from django.db import connection
 from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APIClient
@@ -32,7 +35,9 @@ from .services import (
     resolve_vendor_survey_context,
     survey_pricing_for_user,
 )
+from .serializers import OrganizationUnitSerializer
 from .tasks import expire_allocation_reservations_task
+from .views import OrganizationUnitViewSet
 
 
 class VendorFoundationTests(TestCase):
@@ -657,6 +662,22 @@ class OrganizationHierarchyTests(TestCase):
             name="Morning", code="morning", created_by=self.owner,
         )
         return branch, sub_branch, shift
+
+    def test_view_queryset_prefetches_complete_unit_paths(self):
+        self.create_tree(self.owner, "query-path")
+        view = OrganizationUnitViewSet()
+        view.request = SimpleNamespace(user=self.owner)
+        units = list(view.get_queryset().order_by("pk"))
+
+        with CaptureQueriesContext(connection) as queries:
+            data = OrganizationUnitSerializer(
+                units,
+                many=True,
+                context={"organization_rollup_counts": {}},
+            ).data
+
+        self.assertEqual(len(data), 3)
+        self.assertEqual(len(queries), 0)
 
     def test_owner_can_build_strict_tree_and_internal_vendor_is_scoped(self):
         branch = self.owner_api.post(reverse("organization-unit-list"), {

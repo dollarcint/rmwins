@@ -182,6 +182,27 @@ class ReusableProfileQueueTests(TestCase):
         event = maybe_assign_reusable_profile(returning_attempt, self.answers())
         self.assertEqual((event.reuse_pool, event.reused_uid), ("returning", lower.uid))
 
+    def test_never_reused_profile_wins_last_reused_at_tie_break(self):
+        previously_reused = self.candidate(
+            "Nu11-Ll22-Fi33-Rs44",
+            "OldRid0011",
+            submitted_days=120,
+            usage_count=1,
+            last_reused_days=60,
+        )
+        never_reused = self.candidate(
+            "Nu55-Ll66-Fi77-Rs88",
+            "OldRid0012",
+            submitted_days=90,
+            usage_count=1,
+        )
+
+        attempt = create_attempt(self.survey, self.user, "8.8.8.8")
+        event = maybe_assign_reusable_profile(attempt, self.answers())
+
+        self.assertNotEqual(previously_reused.uid, never_reused.uid)
+        self.assertEqual(event.reused_uid, never_reused.uid)
+
     def test_profile_never_crosses_client_boundary(self):
         other_client = Client.objects.create(code="other-client", name="Other client")
         self.candidate(

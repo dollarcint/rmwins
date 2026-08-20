@@ -18,7 +18,7 @@ from urllib.parse import quote, urlencode
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import DatabaseError, transaction
-from django.db.models import Count, IntegerField, Max, OuterRef, Q, Subquery, Sum, Value
+from django.db.models import Count, F, IntegerField, Max, OuterRef, Q, Subquery, Sum, Value
 from django.db.models.functions import Coalesce
 from django.http import HttpResponse, HttpResponseRedirect, JsonResponse, StreamingHttpResponse
 from django.core.paginator import Paginator
@@ -109,6 +109,7 @@ from prescreener_vault.cache import (
     vault_filtered_summary,
 )
 from .providers import ProviderError, get_provider, has_provider
+from .providers.base import close_provider, managed_provider
 from .geolocation import (
     geolocation_client_data,
     is_wrong_target_country,
@@ -314,10 +315,43 @@ def _permitted_columns(codes, permissions):
 
 
 def _enforce_query_permissions(request, permission_parameters):
+    permission_codes = None
     for code, parameters in permission_parameters.items():
         if any(request.query_params.get(parameter) not in {None, ""} for parameter in parameters):
-            if not has_function_access(request.user, code):
+            if permission_codes is None:
+                permission_codes = effective_permission_codes(request.user)
+            if not (
+                request.user.is_active and request.user.is_superuser
+            ) and code not in permission_codes:
                 raise PermissionDenied(f"Your account cannot use the {code} filter.")
+
+
+class NullsLastOrderingFilter(filters.OrderingFilter):
+    """Translate selected nullable API sorts into cross-database expressions."""
+
+    def filter_queryset(self, request, queryset, view):
+        ordering = self.get_ordering(request, queryset, view)
+        if not ordering:
+            return queryset
+
+        nullable_fields = set(getattr(view, "nulls_last_ordering_fields", ()))
+        expressions = []
+        for term in ordering:
+            if not isinstance(term, str):
+                expressions.append(term)
+                continue
+            descending = term.startswith("-")
+            field_name = term[1:] if descending else term
+            if field_name not in nullable_fields:
+                expressions.append(term)
+                continue
+            expression = F(field_name)
+            expressions.append(
+                expression.desc(nulls_last=True)
+                if descending
+                else expression.asc(nulls_last=True)
+            )
+        return queryset.order_by(*expressions)
 
 
 @function_permission_required("dashboard.view")
@@ -575,30 +609,30 @@ def _refresh_provider_outcome(attempt, integration):
     """Fetch one provider transaction without coupling custom clients to Innovate status rules."""
 
     provider_code = (integration.provider_code if integration else "innovatemr").lower()
-    client = InnovateMRClient(integration=integration)
-    if provider_code == "innovatemr":
-        reconcile_attempt_status(client, attempt)
-        attempt.refresh_from_db()
-        return
+    with managed_provider(InnovateMRClient(integration=integration)) as client:
+        if provider_code == "innovatemr":
+            reconcile_attempt_status(client, attempt)
+            attempt.refresh_from_db()
+            return
 
-    survey_identifier = attempt.survey.source_id or attempt.survey.source_key
-    transactions = client.get_survey_transactions_by_pid(survey_identifier, attempt.rid)
-    if not transactions:
+        survey_identifier = attempt.survey.source_id or attempt.survey.source_key
+        transactions = client.get_survey_transactions_by_pid(survey_identifier, attempt.rid)
+        if not transactions:
+            attempt.upstream_checked_at = timezone.now()
+            attempt.save(update_fields=["upstream_checked_at", "updated_at"])
+            return
+
+        respondent_keys = ("PID", "pid", "trackId", "rid", "RID", "respondentId")
+        transaction_row = next(
+            (
+                row for row in transactions
+                if any(str(row.get(key) or "") == attempt.rid for key in respondent_keys)
+            ),
+            transactions[0],
+        )
+        attempt.upstream_transaction_data = transaction_row
         attempt.upstream_checked_at = timezone.now()
-        attempt.save(update_fields=["upstream_checked_at", "updated_at"])
-        return
-
-    respondent_keys = ("PID", "pid", "trackId", "rid", "RID", "respondentId")
-    transaction_row = next(
-        (
-            row for row in transactions
-            if any(str(row.get(key) or "") == attempt.rid for key in respondent_keys)
-        ),
-        transactions[0],
-    )
-    attempt.upstream_transaction_data = transaction_row
-    attempt.upstream_checked_at = timezone.now()
-    attempt.save(update_fields=["upstream_transaction_data", "upstream_checked_at", "updated_at"])
+        attempt.save(update_fields=["upstream_transaction_data", "upstream_checked_at", "updated_at"])
 
 
 def _term_report_values(request, name):
@@ -731,6 +765,15 @@ def _term_report_options(base_queryset, user):
     }
 
 
+def _latest_callback_first(queryset):
+    """Apply the same null-safe PostgreSQL ordering to report pages and exports."""
+
+    return queryset.order_by(
+        F("callback_at").desc(nulls_last=True),
+        F("initiated_at").desc(),
+    )
+
+
 @function_permission_required("termination_reasons.view")
 def termination_reasons_page(request):
     codes = effective_permission_codes(request.user)
@@ -754,7 +797,7 @@ def termination_reasons_page(request):
         quota=Count("id", filter=Q(status=SurveyAttempt.Status.OVER_QUOTA)),
         quality=Count("id", filter=Q(status=SurveyAttempt.Status.QUALITY_TERMINATED)),
     )
-    page_obj = Paginator(queryset.order_by("-callback_at", "-initiated_at"), 20).get_page(
+    page_obj = Paginator(_latest_callback_first(queryset), 20).get_page(
         request.GET.get("page", 1)
     )
     for row in page_obj.object_list:
@@ -849,7 +892,7 @@ def termination_reasons_export(request):
     codes = effective_permission_codes(request.user)
     filters_access = _component_access(codes, TERM_REASON_FILTER_PERMISSIONS)
     queryset, _selected = _filtered_term_report_queryset(request, filters_access)
-    queryset = queryset.order_by("-callback_at", "-initiated_at")
+    queryset = _latest_callback_first(queryset)
 
     headers = [
         "RID", "PID", "UID", "Project ID", "Client survey ID", "Client", "Provider",
@@ -909,21 +952,28 @@ def workspace_home(request):
     if not request.user.is_authenticated:
         from django.contrib.auth.views import redirect_to_login
         return redirect_to_login(request.get_full_path())
-    if has_function_access(request.user, "projects.view"):
+    codes = effective_permission_codes(request.user)
+
+    def allowed(code):
+        return (
+            request.user.is_active and request.user.is_superuser
+        ) or code in codes
+
+    if allowed("projects.view"):
         return HttpResponseRedirect(reverse("projects"))
-    if has_function_access(request.user, "dashboard.view"):
+    if allowed("dashboard.view"):
         return HttpResponseRedirect(reverse("dashboard"))
-    if has_function_access(request.user, "attempts.view"):
+    if allowed("attempts.view"):
         return HttpResponseRedirect(reverse("traffic-reports"))
-    if has_function_access(request.user, "termination_reasons.view"):
+    if allowed("termination_reasons.view"):
         return HttpResponseRedirect(reverse("termination-reasons"))
-    if has_function_access(request.user, "user_hits.view"):
+    if allowed("user_hits.view"):
         return HttpResponseRedirect(reverse("user-hits"))
-    if has_function_access(request.user, "prescreener_data.view"):
+    if allowed("prescreener_data.view"):
         return HttpResponseRedirect(reverse("prescreened-data"))
-    if any(has_function_access(request.user, code) for code in ("vendors.view", "vendors.manage", "allocations.view", "allocations.manage")):
+    if any(allowed(code) for code in ("vendors.view", "vendors.manage", "allocations.view", "allocations.manage")):
         return HttpResponseRedirect(reverse("vendor-management"))
-    if any(has_function_access(request.user, code) for code in ("access.manage", "users.view", "users.create", "roles.view", "roles.create")):
+    if any(allowed(code) for code in ("access.manage", "users.view", "users.create", "roles.view", "roles.create")):
         return HttpResponseRedirect(reverse("access-control"))
     from django.core.exceptions import PermissionDenied
     raise PermissionDenied("No workspace page is assigned to this account.")
@@ -1587,64 +1637,73 @@ def survey_start(request):
             return _invalid_survey_link(request)
 
         detail_provider = None
-        if provider_code == "cint":
-            try:
-                detail_provider = get_provider(survey.integration)
-                redirect_ready = detail_provider.redirect_contract_is_current(survey)
-            except Exception:
-                logger.exception(
-                    "Could not validate Cint supplier-link state survey=%s", survey.pk
-                )
-                redirect_ready = False
-            if not redirect_ready:
+        try:
+            if provider_code == "cint":
                 try:
-                    from .tasks import sync_cint_redirects_task
-
-                    sync_cint_redirects_task.delay(survey.integration_id, batch_size=25)
+                    detail_provider = get_provider(survey.integration)
+                    redirect_ready = detail_provider.redirect_contract_is_current(survey)
                 except Exception:
                     logger.exception(
-                        "Could not queue Cint supplier-link repair survey=%s", survey.pk
+                        "Could not validate Cint supplier-link state survey=%s", survey.pk
                     )
-                return _invalid_survey_link(
-                    request,
-                    "This survey link is still being secured. Please try again shortly.",
-                    status_code=503,
-                )
+                    redirect_ready = False
+                if not redirect_ready:
+                    try:
+                        from .tasks import sync_cint_redirects_task
 
-        stale = survey.targeting_synced_at is None or (
-            survey.source_modified_at and survey.targeting_synced_at < survey.source_modified_at
-        )
-        if provider_code in {"biobrain", "voqall"} and survey.targeting_questions.filter(
-            Q(text="") | Q(key__regex=r"^\d+$")
-        ).exists():
-            stale = True
-        if supports_lazy_entry_link:
-            stale = stale or not survey.entry_link
-        if is_rfg:
-            stale = stale or not survey.entry_link or not survey.targeting_questions.filter(
-                raw_data__adapter_version__in=[2, 3]
-            ).exists()
-        targeting_warning = ""
-        if stale:
-            try:
-                if survey.integration_id and has_provider(survey.integration.provider_code):
-                    (detail_provider or get_provider(survey.integration)).refresh_details(survey)
-                else:
-                    replace_survey_targeting(InnovateMRClient(integration=survey.integration), survey)
-            except Exception:
-                logger.exception(
-                    "Provider detail hydration failed for survey=%s integration=%s",
-                    survey.pk,
-                    survey.integration_id,
-                )
-                if not survey.entry_link:
+                        sync_cint_redirects_task.delay(survey.integration_id, batch_size=25)
+                    except Exception:
+                        logger.exception(
+                            "Could not queue Cint supplier-link repair survey=%s", survey.pk
+                        )
                     return _invalid_survey_link(
                         request,
-                        "The provider entry link is temporarily unavailable. Please try again shortly.",
+                        "This survey link is still being secured. Please try again shortly.",
                         status_code=503,
                     )
-                if not survey.targeting_questions.exists():
-                    targeting_warning = "Pre-screening criteria are temporarily unavailable. You can still continue."
+
+            stale = survey.targeting_synced_at is None or (
+                survey.source_modified_at and survey.targeting_synced_at < survey.source_modified_at
+            )
+            if provider_code in {"biobrain", "voqall"} and survey.targeting_questions.filter(
+                Q(text="") | Q(key__regex=r"^\d+$")
+            ).exists():
+                stale = True
+            if supports_lazy_entry_link:
+                stale = stale or not survey.entry_link
+            if is_rfg:
+                stale = stale or not survey.entry_link or not survey.targeting_questions.filter(
+                    raw_data__adapter_version__in=[2, 3]
+                ).exists()
+            targeting_warning = ""
+            if stale:
+                try:
+                    if detail_provider is not None:
+                        detail_provider.refresh_details(survey)
+                    elif survey.integration_id and has_provider(survey.integration.provider_code):
+                        with managed_provider(get_provider(survey.integration)) as provider:
+                            provider.refresh_details(survey)
+                    else:
+                        with managed_provider(
+                            InnovateMRClient(integration=survey.integration)
+                        ) as client:
+                            replace_survey_targeting(client, survey)
+                except Exception:
+                    logger.exception(
+                        "Provider detail hydration failed for survey=%s integration=%s",
+                        survey.pk,
+                        survey.integration_id,
+                    )
+                    if not survey.entry_link:
+                        return _invalid_survey_link(
+                            request,
+                            "The provider entry link is temporarily unavailable. Please try again shortly.",
+                            status_code=503,
+                        )
+                    if not survey.targeting_questions.exists():
+                        targeting_warning = "Pre-screening criteria are temporarily unavailable. You can still continue."
+        finally:
+            close_provider(detail_provider)
         if not survey.entry_link:
             return _invalid_survey_link(
                 request,
@@ -1728,6 +1787,7 @@ def survey_start(request):
             )
         answers, errors = _collect_prescreener_answers(request, attempt.survey)
         if not errors:
+            provider = None
             try:
                 prescreener_uid = ensure_attempt_prescreener_uid(attempt)
                 provider = (
@@ -1811,6 +1871,8 @@ def survey_start(request):
                     )
                     detail = str(exc) if isinstance(exc, ProviderError) else "The upstream provider is temporarily unavailable."
                 errors.append(f"Survey provider could not continue: {detail}")
+            finally:
+                close_provider(provider)
     else:
         errors = []
 
@@ -2382,10 +2444,14 @@ class SurveyViewSet(viewsets.ReadOnlyModelViewSet):
     project_count_cache_enabled = True
     lookup_field = "local_id"
     filterset_class = SurveyFilter
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, NullsLastOrderingFilter]
     search_fields = ["local_id", "=source_key", "=source_id", "name", "company_name", "buyer_id", "survey_type", "country", "country_code", "job_category"]
     ordering_fields = ["source_modified_at", "source_created_at", "cpi", "sample_size", "completes", "created_at"]
-    ordering = ["-source_modified_at", "-created_at"]
+    nulls_last_ordering_fields = {"source_modified_at", "source_created_at"}
+    ordering = [
+        F("source_modified_at").desc(nulls_last=True),
+        F("created_at").desc(),
+    ]
     permission_classes = [HasFunctionPermission]
 
     def get_queryset(self):
@@ -2438,8 +2504,22 @@ class SurveyViewSet(viewsets.ReadOnlyModelViewSet):
             direction = "-" if self.request.query_params.get("ordering", "").startswith("-") else ""
             queryset = queryset.order_by(
                 f"{direction}visible_cpi",
-                "-source_modified_at",
-                "-created_at",
+                F("source_modified_at").desc(nulls_last=True),
+                F("created_at").desc(),
+            )
+        elif self.request.query_params.get("ordering", "") in {
+            "source_modified_at",
+            "-source_modified_at",
+        }:
+            descending = self.request.query_params["ordering"].startswith("-")
+            modified_order = (
+                F("source_modified_at").desc(nulls_last=True)
+                if descending
+                else F("source_modified_at").asc(nulls_last=True)
+            )
+            queryset = queryset.order_by(
+                modified_order,
+                F("created_at").desc(),
             )
         return queryset
 
@@ -2498,10 +2578,14 @@ class SurveyViewSet(viewsets.ReadOnlyModelViewSet):
             stale = True
         if stale:
             if survey.integration_id and has_provider(survey.integration.provider_code):
-                get_provider(survey.integration).refresh_details(survey)
+                with managed_provider(get_provider(survey.integration)) as provider:
+                    provider.refresh_details(survey)
             else:
                 refresh = replace_survey_quotas if detail_type == "quotas" else replace_survey_targeting
-                refresh(InnovateMRClient(integration=survey.integration), survey)
+                with managed_provider(
+                    InnovateMRClient(integration=survey.integration)
+                ) as client:
+                    refresh(client, survey)
 
     @extend_schema(
         tags=["Survey details"],
@@ -2602,7 +2686,7 @@ class SurveyAttemptViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = SurveyAttemptSerializer
     permission_classes = [HasFunctionPermission]
     lookup_field = "rid"
-    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, NullsLastOrderingFilter]
     filterset_class = SurveyAttemptFilter
     search_fields = [
         "rid", "user_id", "survey__local_id", "=survey__source_key", "=survey__source_id", "survey__name", "survey__company_name",
@@ -2610,6 +2694,7 @@ class SurveyAttemptViewSet(viewsets.ReadOnlyModelViewSet):
         "initiation_ip", "callback_ip", "entry_browser", "entry_device", "entry_os",
     ]
     ordering_fields = ["initiated_at", "callback_at", "loi_seconds", "status"]
+    nulls_last_ordering_fields = {"callback_at", "loi_seconds"}
     ordering = ["-initiated_at"]
 
     def _filtered_summary(self, queryset):

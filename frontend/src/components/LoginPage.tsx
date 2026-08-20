@@ -3,7 +3,7 @@ import { FormEvent, useEffect, useMemo, useState } from 'react';
 
 type SessionResponse = {
   authenticated: boolean;
-  csrf_token: string;
+  csrf_token?: string;
   redirect_url?: string;
 };
 
@@ -22,7 +22,7 @@ function getDashboardBaseUrl() {
     return new URL(legacyLoginUrl, window.location.origin).origin;
   }
 
-  return import.meta.env.DEV ? 'http://127.0.0.1:8000' : 'https://api.alessarsolutions.in';
+  return import.meta.env.DEV ? 'http://127.0.0.1:8000' : 'https://api.rmwinsights.com';
 }
 
 export default function LoginPage() {
@@ -47,10 +47,12 @@ export default function LoginPage() {
         return response.json() as Promise<SessionResponse>;
       })
       .then((session) => {
-        setCsrfToken(session.csrf_token);
         if (session.authenticated && session.redirect_url) {
           window.location.replace(session.redirect_url);
+          return;
         }
+        if (!session.csrf_token) throw new Error('Could not start a secure login session.');
+        setCsrfToken(session.csrf_token);
       })
       .catch((requestError: Error) => {
         if (requestError.name !== 'AbortError') {
@@ -81,7 +83,18 @@ export default function LoginPage() {
         },
         body: JSON.stringify({ username, password, remember_me: rememberMe }),
       });
-      const result = (await response.json()) as LoginResponse;
+      const isJson = response.headers.get('content-type')?.includes('application/json');
+      const result = isJson
+        ? ((await response.json()) as LoginResponse)
+        : ({
+            authenticated: false,
+            error:
+              response.status === 429
+                ? 'Too many login attempts. Please try again later.'
+                : response.status === 413
+                  ? 'The login request is too large.'
+                  : 'Unable to sign in right now. Please try again.',
+          } satisfies LoginResponse);
 
       if (!response.ok || !result.authenticated) {
         setError(result.error || 'Username or password is incorrect.');
@@ -151,6 +164,7 @@ export default function LoginPage() {
                 onChange={(event) => setUsername(event.target.value)}
                 autoComplete="username"
                 autoFocus
+                maxLength={150}
                 required
                 className="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-slate-900 outline-none transition focus:border-brand-500 focus:ring-4 focus:ring-brand-50"
                 placeholder="Enter your username"
@@ -165,6 +179,7 @@ export default function LoginPage() {
                   value={password}
                   onChange={(event) => setPassword(event.target.value)}
                   autoComplete="current-password"
+                  maxLength={1024}
                   required
                   className="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 pr-12 text-slate-900 outline-none transition focus:border-brand-500 focus:ring-4 focus:ring-brand-50"
                   placeholder="Enter your password"

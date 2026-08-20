@@ -302,11 +302,25 @@ class SyncSummary:
     detail_failures: int
 
 
+def _close_owned_client(client) -> None:
+    try:
+        client.close()
+    except Exception:
+        logger.warning("Could not close an owned InnovateMR HTTP client", exc_info=True)
+
+
 def sync_surveys(client: InnovateMRClient | None = None, integration: ClientIntegration | None = None) -> SyncSummary:
     if integration is None:
         integration = ClientIntegration.objects.filter(is_active=True, client__is_active=True).order_by("id").first()
-    client = client or InnovateMRClient(integration=integration)
-    run = SyncRun.objects.create(integration=integration)
+    owns_client = client is None
+    if owns_client:
+        client = InnovateMRClient(integration=integration)
+    try:
+        run = SyncRun.objects.create(integration=integration)
+    except Exception:
+        if owns_client:
+            _close_owned_client(client)
+        raise
     now = timezone.now()
 
     try:
@@ -354,8 +368,12 @@ def sync_surveys(client: InnovateMRClient | None = None, integration: ClientInte
         logger.exception("InnovateMR survey sync failed")
         raise
     finally:
-        run.finished_at = timezone.now()
-        run.save()
+        try:
+            run.finished_at = timezone.now()
+            run.save()
+        finally:
+            if owns_client:
+                _close_owned_client(client)
 
     if run.status == SyncRun.Status.SUCCESS:
         invalidate_project_cache()

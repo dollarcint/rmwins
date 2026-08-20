@@ -2,6 +2,7 @@
 
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import logging
 import re
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -23,6 +24,9 @@ from .base import (
 )
 
 
+logger = logging.getLogger(__name__)
+
+
 class EnligneProvider(SurveyProvider):
     """Match Enligne LMS feed IDs to InnovateMR survey IDs without writing Lakshaya."""
 
@@ -33,7 +37,7 @@ class EnligneProvider(SurveyProvider):
     credential_fields = (("db_password", "Lakshaya DB password environment key"),)
 
     def __init__(self, integration, *, session=None, db_connect=None, detail_client=None):
-        super().__init__(integration, session=session or requests.Session())
+        super().__init__(integration, session=session)
         self.feed_url = str(integration.base_url or "").strip()
         parsed = urlsplit(self.feed_url)
         if (
@@ -69,11 +73,27 @@ class EnligneProvider(SurveyProvider):
             raise ProviderConfigurationError("Enligne company filter is invalid.")
         self.db_connect = db_connect or pymysql.connect
         self.detail_client = detail_client
+        self._owns_detail_client = detail_client is None
+        self._detail_client_closed = False
         self.inventory_failures = []
+
+    def close(self):
+        """Release the lazily-created detail client and this provider's HTTP pool."""
+
+        if not self._detail_client_closed:
+            self._detail_client_closed = True
+            if self._owns_detail_client and self.detail_client is not None:
+                try:
+                    self.detail_client.close()
+                except Exception:
+                    logger.warning("Could not close the Enligne detail client", exc_info=True)
+        super().close()
 
     def _innovate_client(self):
         """Resolve the original InnovateMR API only for enrichment/details."""
 
+        if self._closed:
+            raise ProviderError("This provider client is already closed.")
         if self.detail_client is not None:
             return self.detail_client
         configured_id = (self.integration.config or {}).get("detail_integration_id")
