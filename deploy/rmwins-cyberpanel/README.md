@@ -70,6 +70,8 @@ The wrapper:
   (`root:root`, mode `0600`);
 - manages the bootstrap administrator and every future staff/superuser account
   through Django Admin at `https://api.rmwinsights.com/admin/`;
+- never resets, recreates, or duplicates an established Django administrator
+  during later deployments;
 - installs/starts only the two `rmwins-*` systemd units;
 - verifies PostgreSQL, both Redis instances, Gunicorn, the frontend, and every
   Supervisor process before reporting success.

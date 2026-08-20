@@ -768,26 +768,44 @@ run_app_clean bash --noprofile --norc -c "
     '$VENV_DIR/bin/python' manage.py check --deploy
 "
 
-log "Reconciling the private administrator and protected credential file"
-ADMIN_TEMP=""
-if test ! -e "$ADMIN_CREDENTIALS"; then
-    ADMIN_TEMP="$(mktemp "$CONFIG_DIR/.admin-credentials.XXXXXX")"
-    TEMP_FILES+=("$ADMIN_TEMP")
-    {
-        printf 'username=rmwins_admin\npassword='
-        openssl rand -hex 24
-        printf 'created_at=%s\n' "$(date --iso-8601=seconds)"
-    } > "$ADMIN_TEMP"
-    chmod 0600 "$ADMIN_TEMP"
-    chown root:root "$ADMIN_TEMP"
-    ADMIN_CREDENTIAL_SOURCE="$ADMIN_TEMP"
+log "Ensuring a private administrator exists without changing established admins"
+ADMIN_STATE="$(run_app_clean env DJANGO_SETTINGS_MODULE=config.settings \
+    PYTHONPATH="$BACKEND_DIR" "$VENV_DIR/bin/python" -c '
+import django
+django.setup()
+from django.contrib.auth import get_user_model
+User = get_user_model()
+print(f"{User.objects.count()}:{User.objects.filter(is_active=True, is_staff=True, is_superuser=True).count()}")
+')"
+ADMIN_TOTAL_USERS="${ADMIN_STATE%%:*}"
+ADMIN_ACTIVE_SUPERUSERS="${ADMIN_STATE##*:}"
+[[ "$ADMIN_TOTAL_USERS" =~ ^[0-9]+$ && "$ADMIN_ACTIVE_SUPERUSERS" =~ ^[0-9]+$ ]] \
+    || fail "Could not determine the administrator state safely."
+
+if test "$ADMIN_ACTIVE_SUPERUSERS" -gt 0; then
+    log "An active Django superuser already exists; leaving every administrator unchanged"
+elif test "$ADMIN_TOTAL_USERS" -gt 0; then
+    fail "Users exist but no active Django superuser is available; recover one manually."
 else
-    reject_symlink_or_nonregular "$ADMIN_CREDENTIALS"
-    test "$(stat -c '%U:%G:%a' "$ADMIN_CREDENTIALS")" = "root:root:600" \
-        || fail "Administrator credentials must be root:root mode 0600."
-    ADMIN_CREDENTIAL_SOURCE="$ADMIN_CREDENTIALS"
-fi
-if run_root_python -c '
+    ADMIN_TEMP=""
+    if test ! -e "$ADMIN_CREDENTIALS"; then
+        ADMIN_TEMP="$(mktemp "$CONFIG_DIR/.admin-credentials.XXXXXX")"
+        TEMP_FILES+=("$ADMIN_TEMP")
+        {
+            printf 'username=rmwins_admin\npassword='
+            openssl rand -hex 24
+            printf 'created_at=%s\n' "$(date --iso-8601=seconds)"
+        } > "$ADMIN_TEMP"
+        chmod 0600 "$ADMIN_TEMP"
+        chown root:root "$ADMIN_TEMP"
+        ADMIN_CREDENTIAL_SOURCE="$ADMIN_TEMP"
+    else
+        reject_symlink_or_nonregular "$ADMIN_CREDENTIALS"
+        test "$(stat -c '%U:%G:%a' "$ADMIN_CREDENTIALS")" = "root:root:600" \
+            || fail "Administrator credentials must be root:root mode 0600."
+        ADMIN_CREDENTIAL_SOURCE="$ADMIN_CREDENTIALS"
+    fi
+    if run_root_python -c '
 import sys
 from pathlib import Path
 values = {}
@@ -815,21 +833,21 @@ user = User.objects.filter(username=username).first()
 if user is None:
     User.objects.create_superuser(username=username, email=os.environ["ADMIN_EMAIL"], password=password)
 else:
-    if not user.is_superuser or not user.is_staff or user.email != os.environ["ADMIN_EMAIL"]:
-        raise SystemExit("Existing rmwins_admin has unexpected identity or privileges")
-    user.set_password(password)
-    user.save(update_fields=["password"])
+    raise SystemExit("Refusing to overwrite an existing bootstrap username")
 ' >/dev/null; then
-    if test -n "$ADMIN_TEMP"; then
-        mv "$ADMIN_TEMP" "$ADMIN_CREDENTIALS"
-        TEMP_FILES=()
+        if test -n "$ADMIN_TEMP"; then
+            mv "$ADMIN_TEMP" "$ADMIN_CREDENTIALS"
+            TEMP_FILES=()
+        fi
+    else
+        fail "Private administrator bootstrap failed."
     fi
-else
-    fail "Private administrator reconciliation failed."
 fi
-reject_symlink_or_nonregular "$ADMIN_CREDENTIALS"
-chmod 0600 "$ADMIN_CREDENTIALS"
-chown root:root "$ADMIN_CREDENTIALS"
+if test -e "$ADMIN_CREDENTIALS"; then
+    reject_symlink_or_nonregular "$ADMIN_CREDENTIALS"
+    chmod 0600 "$ADMIN_CREDENTIALS"
+    chown root:root "$ADMIN_CREDENTIALS"
+fi
 
 log "Validating private service configurations"
 # Redis 6 has no parse-only config flag. Run its standalone memory test here;
