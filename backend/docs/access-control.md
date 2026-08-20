@@ -40,7 +40,7 @@ The code-owned catalog in `accounts/function_catalog.py` is synchronized after `
 - Admin
 - Super Admin
 
-All accounts created without an explicit role default to Employee. The one-time `/setup/` route creates the first Django superuser and assigns the Super Admin role; it permanently closes as soon as any user exists.
+All accounts created without an explicit role default to Employee. Deployment creates the first Django superuser privately, and Django Admin is the canonical place to update it or create every future staff/superuser account. The historical `/setup/` URL redirects to `/admin/`.
 
 ## Management
 

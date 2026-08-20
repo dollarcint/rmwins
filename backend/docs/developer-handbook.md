@@ -59,14 +59,14 @@ flowchart LR
 | `models.py` | `AccessFunction`, `Role`, role-function grants, employee profile and per-user allow/deny overrides. |
 | `function_catalog.py` | Code-owned list of every page/filter/card/column/action permission and default role grants. New UI/backend capabilities must be registered here. |
 | `access.py` | Effective permission calculation, decorators, DRF permission class and organization-scoped visible/manageable user IDs. |
-| `views.py` | Login/setup, Access Control page, Cint email-pool import and access-control API viewsets. |
+| `views.py` | Login/admin handoff, Access Control page, Cint email-pool import and access-control API viewsets. |
 | `serializers.py` | Validation and writes for roles, users, overrides, account type and organization placement. |
-| `forms.py` | Login and first-super-admin setup forms. |
+| `forms.py` | Workspace login form. |
 | `signals.py` | Ensures each Django user has an employee profile. |
 | `context_processors.py` | Makes effective permissions/navigation state available to templates. |
 | `management/commands/role_config.py` | Export, validate and import role definitions between Quest/Quant deployments. |
 | `migrations/` | Immutable permission/model history and catalog seeds. |
-| `tests.py` | Permission resolution, setup, delegation and email-pool UI authorization regressions. |
+| `tests.py` | Permission resolution, admin handoff, delegation and email-pool UI authorization regressions. |
 
 ### `config/` - process configuration and root routing
 

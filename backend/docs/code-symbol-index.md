@@ -43,9 +43,6 @@ regenerate this index after major refactors. Detailed behavior is in
 
 - L9 `WorkspaceAuthenticationForm` (class) - Django/DRF framework hook or declarative data-shaping method.
 - L14 `WorkspaceAuthenticationForm.confirm_login_allowed` (method) - Django/DRF framework hook or declarative data-shaping method.
-- L27 `FirstAdminSetupForm` (class) - Django/DRF framework hook or declarative data-shaping method.
-- L35 `FirstAdminSetupForm.clean_username` (method) - Django/DRF framework hook or declarative data-shaping method.
-- L41 `FirstAdminSetupForm.clean` (method) - Django/DRF framework hook or declarative data-shaping method.
 
 ## `accounts/function_catalog.py`
 
@@ -111,7 +108,7 @@ regenerate this index after major refactors. Detailed behavior is in
 - L31 `WorkspaceLoginView` (class) - Django/DRF framework hook or declarative data-shaping method.
 - L36 `WorkspaceLoginView.form_valid` (method) - Django/DRF framework hook or declarative data-shaping method.
 - L43 `WorkspaceLogoutView` (class) - Django/DRF framework hook or declarative data-shaping method.
-- L48 `first_admin_setup` (function) - Module-internal helper; see its module responsibility and callers.
+- `first_admin_setup` (function) - Compatibility redirect from the historical setup URL to Django Admin.
 - L72 `access_control_page` (function) - Module-internal helper; see its module responsibility and callers.
 - L126 `cint_email_pool_import` (function) - Module-internal helper; see its module responsibility and callers.
 - L194 `AccessFunctionViewSet` (class) - Django/DRF framework hook or declarative data-shaping method.

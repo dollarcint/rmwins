@@ -1,4 +1,4 @@
-"""HTML authentication, setup and Access Control page routes."""
+"""HTML authentication, Django-admin handoff and Access Control routes."""
 
 from django.urls import path
 

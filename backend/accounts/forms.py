@@ -1,7 +1,6 @@
-"""Validated login and one-time first-administrator setup forms."""
+"""Validated workspace login form."""
 
 from django import forms
-from django.contrib.auth import get_user_model
 from django.contrib.auth.forms import AuthenticationForm
 from django.core.exceptions import ValidationError
 
@@ -31,36 +30,4 @@ class WorkspaceAuthenticationForm(AuthenticationForm):
                 "Panel access is not enabled for this supplier account.",
                 code="panel_access_disabled",
             )
-
-
-class FirstAdminSetupForm(forms.Form):
-    first_name = forms.CharField(max_length=150)
-    last_name = forms.CharField(max_length=150, required=False)
-    username = forms.CharField(max_length=150)
-    email = forms.EmailField()
-    password1 = forms.CharField(min_length=8, strip=False, widget=forms.PasswordInput)
-    password2 = forms.CharField(min_length=8, strip=False, widget=forms.PasswordInput)
-
-    def __init__(self, *args, bootstrap_user=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.bootstrap_user = bootstrap_user
-
-    def clean_username(self):
-        username = self.cleaned_data["username"].strip()
-        existing = get_user_model().objects.filter(username__iexact=username)
-        if self.bootstrap_user is not None:
-            existing = existing.exclude(pk=self.bootstrap_user.pk)
-            if username.casefold() == self.bootstrap_user.username.casefold():
-                raise forms.ValidationError(
-                    "Choose a new owner username to complete the one-time setup."
-                )
-        if existing.exists():
-            raise forms.ValidationError("This username is already in use.")
-        return username
-
-    def clean(self):
-        cleaned = super().clean()
-        if cleaned.get("password1") and cleaned.get("password1") != cleaned.get("password2"):
-            self.add_error("password2", "Passwords do not match.")
-        return cleaned
 

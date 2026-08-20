@@ -68,9 +68,8 @@ The wrapper:
 - creates `rmwins_admin` privately and stores its generated password only in
   `/home/www.rmwinsights.com/.config/rmwins/admin-credentials`
   (`root:root`, mode `0600`);
-- exposes the one-time `/setup/` flow only to that authenticated bootstrap
-  administrator; completing the form replaces the temporary username and
-  password and permanently closes setup;
+- manages the bootstrap administrator and every future staff/superuser account
+  through Django Admin at `https://api.rmwinsights.com/admin/`;
 - installs/starts only the two `rmwins-*` systemd units;
 - verifies PostgreSQL, both Redis instances, Gunicorn, the frontend, and every
   Supervisor process before reporting success.
@@ -100,8 +99,9 @@ Provider secrets remain a cutover blocker until the owner authorizes fresh value
 
 Production login is rendered only by the React frontend at
 `https://www.rmwinsights.com/login`. The API host redirects `/login/` there.
-Visiting `/setup` on the frontend redirects to the API setup flow; an anonymous
-visitor is returned to the frontend login with a safe API-only `next` URL.
+The historical `/setup` URL redirects to Django Admin. Use the protected
+bootstrap credentials for the first admin login, immediately change that
+password in Django Admin, and create/manage every future admin there.
 
 ## Public cutover (only after private health passes)
 
