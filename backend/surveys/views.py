@@ -827,6 +827,12 @@ def _prescreener_questions(survey, submitted_data=None, *, qualifying_options_on
             normalized_key == "AGE"
             or ("your age" in normalized_text and not is_dob_question)
         )
+        is_postal_question = (
+            normalized_key in {"ZIP", "ZIP_CODE", "ZIPCODES", "POSTAL_CODE"}
+            or "zipcode" in normalized_text
+            or "zip code" in normalized_text
+            or "postal code" in normalized_text
+        )
         options = []
         age_ranges = []
         allowed_values = _qualifying_option_values(question)
@@ -982,6 +988,7 @@ def _prescreener_questions(survey, submitted_data=None, *, qualifying_options_on
             "type_label": (
                 "Date of birth" if is_dob_question
                 else "Age" if is_age_question
+                else "Postal code" if is_postal_question
                 else "Date" if input_kind == "date_mask"
                 else (question.question_type or "Question")
             ),
@@ -989,9 +996,19 @@ def _prescreener_questions(survey, submitted_data=None, *, qualifying_options_on
             "current_value": current_value,
             "min_value": min_value,
             "max_value": max_value,
-            "input_label": "Age" if is_age_question else "Your answer",
-            "placeholder": "Enter your age" if is_age_question else "Enter a number",
+            "input_label": (
+                "Age" if is_age_question
+                else "ZIP / postal code" if is_postal_question
+                else "Your answer"
+            ),
+            "placeholder": (
+                "Enter your age" if is_age_question
+                else "Enter your ZIP / postal code" if is_postal_question
+                else "Enter a number"
+            ),
             "is_dob_question": is_dob_question,
+            "is_postal_question": is_postal_question,
+            "allowed_values": sorted(allowed_values or []),
             "qualifying_options_only": bool(
                 qualifying_options_only and allowed_values
             ),
@@ -1000,6 +1017,8 @@ def _prescreener_questions(survey, submitted_data=None, *, qualifying_options_on
                 if (is_age_question or is_dob_question) and age_range_labels
                 else "Only answers accepted by this survey are shown."
                 if provider_code == "rfg" and qualifying_options_only and allowed_values
+                else "Enter a ZIP/postal code accepted by this survey."
+                if is_postal_question and qualifying_options_only and allowed_values
                 else qualifying_answer_note
                 if qualifying_options_only and allowed_values else ""
             ),
@@ -1012,6 +1031,10 @@ def _collect_prescreener_answers(request, survey):
 
     answers = {}
     errors = []
+    provider_code = (
+        survey.integration.provider_code
+        if survey.integration_id else "innovatemr"
+    )
     for prepared in _prescreener_questions(
         survey, qualifying_options_only=False
     ):
@@ -1052,15 +1075,28 @@ def _collect_prescreener_answers(request, survey):
             except ValueError:
                 errors.append(f"Enter a valid number for: {prepared['display_text']}")
                 continue
-            matched = [
-                str(option.get("OptionId"))
-                for option in question.options
-                if isinstance(option, dict)
-                and option.get("ageStart") is not None
-                and int(option["ageStart"]) <= numeric_value <= int(option["ageEnd"])
-                and option.get("OptionId") is not None
-            ]
-            upstream_values = matched or [str(numeric_value)]
+            if provider_code == "innovatemr":
+                # Innovate expects the actual open-ended age/number. The
+                # targeting OptionId describes an accepted range, not the
+                # respondent's profile value.
+                upstream_values = [str(numeric_value)]
+            else:
+                matched = [
+                    str(option.get("OptionId"))
+                    for option in question.options
+                    if isinstance(option, dict)
+                    and option.get("ageStart") is not None
+                    and int(option["ageStart"]) <= numeric_value <= int(option["ageEnd"])
+                    and option.get("OptionId") is not None
+                ]
+                upstream_values = matched or [str(numeric_value)]
+        elif prepared.get("is_postal_question") and prepared.get("allowed_values"):
+            accepted = {str(value).casefold() for value in prepared["allowed_values"]}
+            if values[0].casefold() not in accepted:
+                errors.append(
+                    f"Enter a ZIP/postal code accepted by this survey for: {prepared['display_text']}"
+                )
+                continue
 
         answers[str(question.pk)] = {
             "question_id": question.question_id,

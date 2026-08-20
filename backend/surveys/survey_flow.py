@@ -233,7 +233,12 @@ def build_outbound_url(
     *,
     prescreener_uid: str = "",
 ) -> str:
-    """Build legacy/provider-template links with the attempt's stable identifiers."""
+    """Build a provider link with stable routing IDs and mapped profile answers.
+
+    InnovateMR accepts closed answers as ``QuestionKey=OptionId`` and
+    open-ended answers as their submitted values. Existing profile parameters
+    are replaced so stale targeting cannot survive in a reused entry template.
+    """
     # Voqall sends literal ``[#vq_*#]`` placeholders. Their ``#`` characters
     # must be replaced before urlsplit(), otherwise Python treats the rest of
     # the query string as a URL fragment.
@@ -255,8 +260,29 @@ def build_outbound_url(
     hostname = (parts.hostname or "").lower()
     is_voqall = hostname == "voqall.com" or hostname.endswith(".voqall.com")
 
+    reserved_keys = {
+        "pid", "trackid", "survnum", "supcode", "vq_token", "vq_uid",
+    }
+    profile_pairs: list[tuple[str, str]] = []
+    profile_keys: set[str] = set()
+    seen_pairs: set[tuple[str, str]] = set()
+    for answer in answers.values():
+        question_key = str(answer.get("question_key") or "").strip()
+        if not question_key or question_key.casefold() in reserved_keys:
+            continue
+        for value in answer.get("upstream_values") or []:
+            normalized_value = str(value).strip() if value is not None else ""
+            if not normalized_value:
+                continue
+            pair = (question_key, normalized_value)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            profile_pairs.append(pair)
+            profile_keys.add(question_key.casefold())
+
     for key, value in query:
-        lowered = key.lower()
+        lowered = key.casefold()
         if is_voqall and lowered == "vq_token":
             outbound.append((key, rid))
             has_vq_token = True
@@ -266,7 +292,7 @@ def build_outbound_url(
         elif lowered == "pid":
             outbound.append((key, rid))
             has_pid = True
-        elif lowered != "trackid":
+        elif lowered != "trackid" and lowered not in profile_keys:
             outbound.append((key, value))
 
     if is_voqall:
@@ -279,13 +305,7 @@ def build_outbound_url(
             outbound.append(("PID", rid))
         outbound.append(("trackId", rid))
 
-    for answer in answers.values():
-        question_key = answer.get("question_key")
-        upstream_values = answer.get("upstream_values") or []
-        if not question_key:
-            continue
-        for value in upstream_values:
-            outbound.append((str(question_key), str(value)))
+    outbound.extend(profile_pairs)
 
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(outbound), parts.fragment))
 

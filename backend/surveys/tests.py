@@ -612,6 +612,67 @@ class SurveyFlowTests(TestCase):
         self.assertEqual(attempt.exit_os, "Android 14")
         self.assertIsNotNone(attempt.loi_seconds)
 
+    def test_innovate_profile_mapping_replaces_stale_values_and_protects_routing_keys(self):
+        outbound = build_outbound_url(
+            "https://edgeapi.innovatemr.net/startSurvey?survNum=test&supCode=1150&PID=old&trackId=old&GENDER=1",
+            "Aa1Bb2Cc3D",
+            {
+                "gender": {"question_key": "GENDER", "upstream_values": ["2"]},
+                "multi": {"question_key": "HOBBIES", "upstream_values": ["4", "4", "7"]},
+                "reserved": {"question_key": "PID", "upstream_values": ["unsafe"]},
+            },
+        )
+
+        params = parse_qs(urlsplit(outbound).query)
+        self.assertEqual(params["PID"], ["Aa1Bb2Cc3D"])
+        self.assertEqual(params["trackId"], ["Aa1Bb2Cc3D"])
+        self.assertEqual(params["GENDER"], ["2"])
+        self.assertEqual(params["HOBBIES"], ["4", "7"])
+        self.assertEqual(params["survNum"], ["test"])
+        self.assertEqual(params["supCode"], ["1150"])
+
+    def test_innovate_open_ended_age_and_zip_are_sent_as_actual_values(self):
+        age = TargetingQuestion.objects.create(
+            survey=self.survey,
+            question_id=1,
+            key="AGE",
+            text="What is your age?",
+            question_type="Numeric Open Ended",
+            category="Demographic",
+            options=[{"OptionId": 2, "ageStart": 18, "ageEnd": 34}],
+        )
+        zipcode = TargetingQuestion.objects.create(
+            survey=self.survey,
+            question_id=11,
+            key="ZIPCODES",
+            text="What is your zipcode?",
+            question_type="Numeric Open Ended",
+            category="Demographic",
+            options=[{"OptionId": 77, "OptionText": "90012"}],
+        )
+        start = self.client.get(reverse("survey-start"), {
+            "surveyId": self.survey.source_id,
+            "supplierCode": "1000",
+            "userId": self.platform_user.pk,
+            "code": self.survey.local_id,
+        })
+        rid = parse_qs(urlsplit(start["Location"]).query)["rid"][0]
+        submit = self.client.post(reverse("survey-start"), {
+            "rid": rid,
+            f"question_{self.question.pk}": "1",
+            f"question_{age.pk}": "24",
+            f"question_{zipcode.pk}": "90012",
+        })
+
+        self.assertEqual(
+            submit.status_code,
+            302,
+            msg=str(submit.context and submit.context.get("errors")),
+        )
+        params = parse_qs(urlsplit(submit["Location"]).query)
+        self.assertEqual(params["AGE"], ["24"])
+        self.assertEqual(params["ZIPCODES"], ["90012"])
+
     def test_biobrain_primitive_option_values_render_without_server_error(self):
         self.question.options = ["18-60"]
         self.question.question_type = "4"
