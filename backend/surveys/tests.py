@@ -631,6 +631,7 @@ class SurveyFlowTests(TestCase):
         self.assertEqual(params["survNum"], ["test"])
         self.assertEqual(params["supCode"], ["1150"])
 
+    @override_settings(PUBLIC_SUPPLIER_CODE="1000")
     def test_innovate_open_ended_age_and_zip_are_sent_as_actual_values(self):
         age = TargetingQuestion.objects.create(
             survey=self.survey,
