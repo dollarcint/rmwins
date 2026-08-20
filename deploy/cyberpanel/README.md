@@ -1,4 +1,4 @@
-# Alessar Solutions on one CyberPanel VPS
+# Enligne Surveys on one CyberPanel VPS
 
 The current VPS state and exact maintenance commands are in [`ACTUAL-DEPLOYMENT.md`](ACTUAL-DEPLOYMENT.md).
 

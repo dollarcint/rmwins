@@ -21,7 +21,7 @@ export default function Hero() {
             </h1>
 
             <p className="text-lg text-slate-600 leading-relaxed mb-4">
-              Alessar Solutions runs surveys, focus groups, and field research for clients who need to understand audiences across regions — not guess at them.
+              Enligne Surveys runs surveys, focus groups, and field research for clients who need to understand audiences across regions — not guess at them.
             </p>
 
             <p className="text-base text-slate-500 leading-relaxed mb-8">

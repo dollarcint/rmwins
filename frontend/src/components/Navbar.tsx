@@ -26,7 +26,7 @@ export default function Navbar() {
             onClick={() => scrollToSection('home')}
             className="text-lg font-semibold text-slate-900 hover:text-brand-700 transition-colors"
           >
-            Alessar Solutions
+            Enligne Surveys
           </button>
 
           <div className="hidden md:flex items-center gap-8">

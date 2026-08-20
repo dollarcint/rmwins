@@ -10,7 +10,7 @@ export default function Footer() {
       <div className="section-wrap py-12">
         <div className="flex flex-col md:flex-row md:justify-between md:items-start gap-8 mb-10">
           <div className="max-w-sm">
-            <p className="font-semibold text-slate-900 mb-2">Alessar Solutions</p>
+            <p className="font-semibold text-slate-900 mb-2">Enligne Surveys</p>
             <p className="text-sm text-slate-500 leading-relaxed">
               Market research agency. Surveys, focus groups, and field studies across multiple regions.
             </p>
@@ -47,7 +47,7 @@ export default function Footer() {
 
         <div className="border-t border-slate-200 pt-6">
           <p className="text-sm text-slate-400">
-            &copy; {new Date().getFullYear()} Alessar Solutions Pvt Ltd
+            &copy; {new Date().getFullYear()} Enligne Surveys Pvt Ltd
           </p>
         </div>
       </div>

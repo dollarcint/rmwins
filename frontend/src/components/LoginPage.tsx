@@ -131,7 +131,7 @@ export default function LoginPage() {
 
         <a href="/" className="relative z-10 inline-flex items-center gap-3 text-lg font-semibold">
           <span className="grid h-10 w-10 place-items-center rounded-xl bg-white text-sm font-bold text-brand-900">AS</span>
-          Alessar Solutions
+          Enligne Surveys
         </a>
 
         <div className="relative z-10 max-w-xl">
@@ -151,7 +151,7 @@ export default function LoginPage() {
       <section className="flex min-h-screen items-center justify-center px-5 py-10 sm:px-10">
         <div className="w-full max-w-md">
           <a href="/" className="mb-10 inline-flex items-center gap-2 text-sm font-medium text-slate-500 transition-colors hover:text-brand-700 lg:hidden">
-            <ArrowLeft size={16} /> Back to Alessar Solutions
+            <ArrowLeft size={16} /> Back to Enligne Surveys
           </a>
 
           <div className="mb-8">

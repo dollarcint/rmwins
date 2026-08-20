@@ -1,4 +1,4 @@
-# Alessar Solutions monorepo
+# Enligne Surveys monorepo
 
 This repository contains the public React website and the authenticated Django research dashboard.
 

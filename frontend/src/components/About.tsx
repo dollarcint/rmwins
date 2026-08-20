@@ -11,7 +11,7 @@ export default function About() {
       <div className="section-wrap">
         <div className="grid lg:grid-cols-2 gap-12 lg:gap-20">
           <div>
-            <h2 className="section-title mb-6">About Alessar Solutions</h2>
+            <h2 className="section-title mb-6">About Enligne Surveys</h2>
             <div className="space-y-4 text-slate-600 leading-relaxed">
               <p>
                 We started as a small team running field surveys and client interviews. Over time we built a respondent network across several regions and began taking on larger studies — product launches, category entry research, brand tracking.
