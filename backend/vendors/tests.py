@@ -623,13 +623,13 @@ class VendorFoundationTests(TestCase):
         attempt.save(update_fields=["status", "status_source", "is_verified", "upstream_transaction_data"])
         redirect_url = supplier_outcome_redirect(attempt)
         query = parse_qs(urlsplit(redirect_url).query)
-        self.assertEqual(query["pid"], ["SUPPLIER-RID-42"])
+        self.assertNotIn("pid", query)
         self.assertEqual(query["status"], [SurveyAttempt.Status.TERMINATED])
         self.assertEqual(query["rid"], ["SUPPLIER-RID-42"])
         self.assertEqual(query["survey"], [self.survey.local_id])
         self.assertEqual(query["reason"], ["Age quota closed"])
-        self.assertEqual(query["survey_id"], [self.survey.local_id])
-        self.assertEqual(query["term_reason"], ["Age quota closed"])
+        self.assertNotIn("survey_id", query)
+        self.assertNotIn("term_reason", query)
         self.assertEqual(query["hash"], [supplier_outcome_signature(
             raw_hash_key,
             pid="SUPPLIER-RID-42",

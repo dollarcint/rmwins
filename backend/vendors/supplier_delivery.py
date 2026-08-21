@@ -106,17 +106,31 @@ def supplier_outcome_redirect(attempt) -> str:
         "[%%termreason%%]": parameters["term_reason"],
         "[%%hash%%]": parameters.get("hash", ""),
     }
+    embedded_parameters = {
+        parameter_name
+        for parameter_name, placeholders in {
+            "pid": ("[%%pid%%]",),
+            "status": ("[%%status%%]",),
+            "survey_id": ("[%%survey_id%%]", "[%%surveyid%%]"),
+            "term_reason": ("[%%term_reason%%]", "[%%termreason%%]"),
+            "hash": ("[%%hash%%]",),
+        }.items()
+        if any(placeholder in redirect_url for placeholder in placeholders)
+    }
     for placeholder, value in placeholder_values.items():
         redirect_url = redirect_url.replace(
             placeholder,
             quote(str(value or ""), safe=""),
         )
     parts = urlsplit(redirect_url)
-    managed_parameters = {"pid", "status", "survey_id", "term_reason", "hash"}
+    appended_parameters = {
+        key: value for key, value in parameters.items()
+        if key not in embedded_parameters
+    }
     existing = [
         (key, value)
         for key, value in parse_qsl(parts.query, keep_blank_values=True)
-        if key not in managed_parameters
+        if key not in appended_parameters
     ]
-    query = urlencode([*existing, *parameters.items()])
+    query = urlencode([*existing, *appended_parameters.items()])
     return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
