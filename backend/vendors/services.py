@@ -402,7 +402,7 @@ def resolve_vendor_survey_context(user, survey: Survey, *, require_capacity=True
         "vendor", "vendor__employee_profile", "vendor__vendor_commercial_profile", "client"
     )
     if for_update:
-        client_queryset = client_queryset.select_for_update()
+        client_queryset = client_queryset.select_for_update(of=("self",))
     client_allocation = client_queryset.filter(
         vendor_id=vendor_id,
         vendor__is_active=True,
@@ -623,7 +623,7 @@ def reserve_attempt_capacity(
     if client_allocation is None:
         raise AllocationUnavailable("A client allocation is required.")
     client_allocation = (
-        VendorClientAllocation.objects.select_for_update()
+        VendorClientAllocation.objects.select_for_update(of=("self",))
         .select_related("vendor", "vendor__employee_profile", "vendor__vendor_commercial_profile", "client")
         .get(pk=client_allocation.pk)
     )
