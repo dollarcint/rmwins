@@ -2,7 +2,7 @@
 
 import hashlib
 import hmac
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 from django.urls import reverse
 
@@ -97,7 +97,26 @@ def supplier_outcome_redirect(attempt) -> str:
             return ""
         parameters["hash"] = supplier_outcome_signature(secret, **parameters)
 
+    placeholder_values = {
+        "[%%pid%%]": parameters["pid"],
+        "[%%status%%]": parameters["status"],
+        "[%%survey_id%%]": parameters["survey_id"],
+        "[%%surveyid%%]": parameters["survey_id"],
+        "[%%term_reason%%]": parameters["term_reason"],
+        "[%%termreason%%]": parameters["term_reason"],
+        "[%%hash%%]": parameters.get("hash", ""),
+    }
+    for placeholder, value in placeholder_values.items():
+        redirect_url = redirect_url.replace(
+            placeholder,
+            quote(str(value or ""), safe=""),
+        )
     parts = urlsplit(redirect_url)
-    existing = parse_qsl(parts.query, keep_blank_values=True)
+    managed_parameters = {"pid", "status", "survey_id", "term_reason", "hash"}
+    existing = [
+        (key, value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if key not in managed_parameters
+    ]
     query = urlencode([*existing, *parameters.items()])
     return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))

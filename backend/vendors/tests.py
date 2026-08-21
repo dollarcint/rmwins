@@ -586,7 +586,10 @@ class VendorFoundationTests(TestCase):
         self.survey.entry_link = "https://edgeapi.innovatemr.net/startSurvey?PID=[%%pid%%]"
         self.survey.save(update_fields=["entry_link"])
         self.external_client_allocation.complete_redirect_url = "https://supplier.example/complete?campaign=alpha"
-        self.external_client_allocation.terminate_redirect_url = "https://supplier.example/terminate"
+        self.external_client_allocation.terminate_redirect_url = (
+            "https://supplier.example/terminate?status=legacy&rid=[%%pid%%]"
+            "&survey=[%%survey_id%%]&reason=[%%termreason%%]"
+        )
         self.external_client_allocation.save(update_fields=["complete_redirect_url", "terminate_redirect_url"])
 
         owner_api = APIClient()
@@ -622,6 +625,9 @@ class VendorFoundationTests(TestCase):
         query = parse_qs(urlsplit(redirect_url).query)
         self.assertEqual(query["pid"], ["SUPPLIER-RID-42"])
         self.assertEqual(query["status"], [SurveyAttempt.Status.TERMINATED])
+        self.assertEqual(query["rid"], ["SUPPLIER-RID-42"])
+        self.assertEqual(query["survey"], [self.survey.local_id])
+        self.assertEqual(query["reason"], ["Age quota closed"])
         self.assertEqual(query["survey_id"], [self.survey.local_id])
         self.assertEqual(query["term_reason"], ["Age quota closed"])
         self.assertEqual(query["hash"], [supplier_outcome_signature(
