@@ -2,6 +2,7 @@ from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlsplit
 
 from django.contrib.auth import get_user_model
@@ -15,7 +16,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from accounts.models import AccessFunction, EmployeeProfile, Role, UserFunctionOverride
-from surveys.models import Survey, SurveyAttempt
+from surveys.models import Survey, SurveyAttempt, TargetingQuestion
 
 from .models import (
     AllocationReservation,
@@ -630,6 +631,60 @@ class VendorFoundationTests(TestCase):
             survey_id=self.survey.local_id,
             term_reason="Age quota closed",
         )])
+
+    def test_supplier_entry_hydrates_pending_targeting_before_creating_attempt(self):
+        integration = ClientIntegration.objects.create(
+            client=self.client_record,
+            name="Supplier targeting sync",
+            provider_code="innovatemr",
+            base_url="https://example.test",
+        )
+        self.survey.integration = integration
+        self.survey.entry_link = "https://edgeapi.innovatemr.net/startSurvey?PID=[%%pid%%]"
+        self.survey.targeting_synced_at = None
+        self.survey.save(update_fields=["integration", "entry_link", "targeting_synced_at"])
+        self.external_policy.delivery_mode = VendorCommercialProfile.DeliveryMode.BOTH
+        self.external_policy.save(update_fields=["delivery_mode", "updated_at"])
+
+        owner_api = APIClient()
+        owner_api.force_authenticate(self.owner)
+        issued = owner_api.post(reverse("vendor-api-key-list"), {
+            "vendor": self.external.pk,
+            "name": "Pending targeting delivery",
+            "client_allocations": [self.external_client_allocation.pk],
+        }, format="json")
+        catalog = APIClient().get(
+            reverse("survey-list"), HTTP_X_API_KEY=issued.data["api_key"]
+        )
+        entry_link = catalog.data["results"][0]["supplier_entry_link"]
+        parts = urlsplit(entry_link.replace("[%%pid%%]", "PENDING-TARGETING-1"))
+
+        def hydrate(_client, survey):
+            TargetingQuestion.objects.create(
+                survey=survey,
+                question_id=1,
+                key="AGE",
+                text="What is your age?",
+                question_type="Numeric",
+            )
+            survey.targeting_synced_at = timezone.now()
+            survey.save(update_fields=["targeting_synced_at", "updated_at"])
+
+        client = Mock()
+        with (
+            patch("surveys.views.InnovateMRClient", return_value=client),
+            patch("surveys.views.replace_survey_targeting", side_effect=hydrate) as refresh,
+        ):
+            started = self.client.get(f"{parts.path}?{parts.query}")
+
+        self.assertEqual(started.status_code, 302)
+        refresh.assert_called_once()
+        attempt = SurveyAttempt.objects.get(
+            supplier_respondent_id="PENDING-TARGETING-1"
+        )
+        form = self.client.get(started["Location"])
+        self.assertContains(form, "What is your age?")
+        self.assertEqual(attempt.survey.targeting_questions.count(), 1)
 
     def test_delivery_mode_blocks_wrong_channel(self):
         owner_api = APIClient()
