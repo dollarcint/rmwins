@@ -18,7 +18,13 @@ from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from accounts.models import AccessFunction, EmployeeProfile, Role, UserFunctionOverride
+from accounts.models import (
+    AccessFunction,
+    EmployeeProfile,
+    Role,
+    RoleFunctionPermission,
+    UserFunctionOverride,
+)
 from vendors.models import Client, ClientIntegration, OrganizationUnit
 from vendors.services import survey_pricing_for_user
 
@@ -2115,7 +2121,13 @@ class DashboardAnalyticsTests(TestCase):
         page = self.client.get(reverse("dashboard"))
 
         self.assertEqual(page.status_code, 200)
-        self.assertContains(page, "Performance intelligence")
+        self.assertContains(page, "Performance overview")
+        self.assertContains(page, "Summary range")
+        self.assertContains(page, "Chart range")
+        self.assertRegex(
+            page.content.decode(),
+            r'/static/surveys/dashboard(?:\.[0-9a-f]+)?\.css\?v=1',
+        )
         self.assertContains(page, 'id="volumeChart"')
         self.assertContains(page, 'id="financeChart"')
         self.assertContains(page, 'id="trafficGraphClient"')
@@ -2135,7 +2147,8 @@ class DashboardAnalyticsTests(TestCase):
         self.assertContains(page, "Historical hit-time CPI")
 
     def test_dashboard_api_returns_overall_kpis_client_share_and_time_series(self):
-        response = self.api.get(reverse("dashboard-api"))
+        with CaptureQueriesContext(connection) as queries:
+            response = self.api.get(reverse("dashboard-api"))
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data["range"]["key"], "24h")
@@ -2162,6 +2175,64 @@ class DashboardAnalyticsTests(TestCase):
         )
         self.assertEqual(response.data["top_users"][0]["name"], "Dash Employee")
         self.assertNotIn("recent_activity", response.data)
+        self.assertEqual(
+            response.data["range"]["end"],
+            response.data["traffic_chart"]["range"]["end"],
+        )
+        self.assertEqual(
+            response.data["range"]["end"],
+            response.data["finance_chart"]["range"]["end"],
+        )
+        performance_queries = [
+            item["sql"] for item in queries.captured_queries
+            if "hits_0" in item["sql"] and "revenue_0" in item["sql"]
+        ]
+        self.assertEqual(len(performance_queries), 1)
+
+    def test_average_cpi_chart_does_not_require_revenue_card_access(self):
+        viewer = get_user_model().objects.create_user(username="dashboard-cpi-only")
+        role = Role.objects.create(
+            name="Dashboard CPI viewer", slug="dashboard-cpi-viewer", rank=90,
+            cpi_visibility_percent=100,
+        )
+        profile, _created = EmployeeProfile.objects.get_or_create(user=viewer)
+        profile.role = role
+        profile.save(update_fields=["role"])
+        for code in (
+            "dashboard.view",
+            "dashboard.card.average_cpi",
+            "dashboard.chart.performance",
+        ):
+            RoleFunctionPermission.objects.create(
+                role=role,
+                function=AccessFunction.objects.get(code=code),
+                allowed=True,
+            )
+        SurveyAttempt.objects.create(
+            rid="CpiOnly123",
+            survey=self.survey_a,
+            platform_user=viewer,
+            user_id=str(viewer.pk),
+            status=SurveyAttempt.Status.COMPLETED,
+            source_cpi_snapshot="4.00",
+            cpi_currency_snapshot="USD",
+            callback_at=timezone.now(),
+        )
+        scoped = APIClient()
+        scoped.force_authenticate(viewer)
+
+        response = scoped.get(reverse("dashboard-api"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.data["summary"]["revenue"])
+        self.assertEqual(str(response.data["summary"]["average_cpi"]), "4.00")
+        completed_points = [
+            point for point in response.data["finance_chart"]["points"]
+            if point["completes"]
+        ]
+        self.assertEqual(len(completed_points), 1)
+        self.assertIsNone(completed_points[0]["revenue"])
+        self.assertEqual(str(completed_points[0]["average_cpi"]), "4.00")
 
     def test_dashboard_supports_every_global_analytics_range(self):
         expected = {

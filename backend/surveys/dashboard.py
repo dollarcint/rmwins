@@ -259,12 +259,13 @@ def _range_payload(range_window):
 def _permission_scoped_performance(queryset, range_window, user, card_access):
     points = _performance_series(queryset, range_window)
     for point in points:
-        point_revenue = _visible_revenue(user, point["revenue"])
+        raw_revenue = point["revenue"]
+        point_revenue = _visible_revenue(user, raw_revenue)
         point["revenue"] = point_revenue if card_access.get("revenue") else None
         point["average_cpi"] = (
             visible_cpi_for_user(
                 user,
-                point["revenue"] / point["completes"] if point["completes"] else Decimal("0.00"),
+                raw_revenue / point["completes"] if point["completes"] else Decimal("0.00"),
             )
         ) if card_access.get("average_cpi") else None
         point["rpc"] = (
@@ -348,21 +349,32 @@ def build_dashboard_payload(
     finance_queryset = finance_queryset if finance_queryset is not None else queryset
     traffic_chart = None
     finance_chart = None
+    performance_cache = {}
+
+    def performance_points(scoped_queryset, scoped_window):
+        cache_key = (
+            id(scoped_queryset),
+            scoped_window["key"],
+            scoped_window["start"],
+            scoped_window["end"],
+        )
+        if cache_key not in performance_cache:
+            performance_cache[cache_key] = _permission_scoped_performance(
+                scoped_queryset, scoped_window, user, card_access
+            )
+        return [dict(point) for point in performance_cache[cache_key]]
+
     if chart_access.get("performance"):
         traffic_chart = {
             "range": _range_payload(traffic_range_window),
             "client_id": traffic_client_id,
-            "points": _permission_scoped_performance(
-                traffic_queryset, traffic_range_window, user, card_access
-            ),
+            "points": performance_points(traffic_queryset, traffic_range_window),
         }
         if any(card_access.get(key) for key in ("revenue", "average_cpi", "rpc")):
             finance_chart = {
                 "range": _range_payload(finance_range_window),
                 "client_id": finance_client_id,
-                "points": _permission_scoped_performance(
-                    finance_queryset, finance_range_window, user, card_access
-                ),
+                "points": performance_points(finance_queryset, finance_range_window),
             }
     return {
         "range": _range_payload(range_window),

@@ -14,6 +14,7 @@
     trafficClient: initialQuery.get('traffic_client') || '',
     financeClient: initialQuery.get('finance_client') || '',
     controller: null,
+    requestId: 0,
     data: null,
     resizeTimer: null,
   };
@@ -28,6 +29,15 @@
 
   const number = (value) => Number(value || 0).toLocaleString('en-IN', { maximumFractionDigits: 0 });
   const moneyNumber = (value) => Number(value || 0);
+
+  function niceIntegerMaximum(value) {
+    const maximum = Math.max(0, Math.ceil(Number(value || 0)));
+    return Math.max(4, Math.ceil(maximum / 4) * 4);
+  }
+
+  function markReady(element) {
+    element?.setAttribute('aria-busy', 'false');
+  }
 
   function formatCurrency(value, currency, compact = false) {
     try {
@@ -78,6 +88,7 @@
       card.classList.remove('bi-kpi-ready');
       setTimeout(() => card.classList.add('bi-kpi-ready'), reducedMotion ? 0 : index * 45);
     });
+    markReady(document.querySelector('.bi-kpi-grid'));
   }
 
   function svgLine(points) {
@@ -111,10 +122,16 @@
 
   function renderVolume(rows, rangeLabel = '') {
     const host = byId('volumeChart'); if (!host) return;
-    if (!rows?.length) { host.innerHTML = '<div class="dashboard-empty">No traffic data is available for this range.</div>'; return; }
+    const totalHits = (rows || []).reduce((sum, row) => sum + Number(row.hits || 0), 0);
+    const totalCompletes = (rows || []).reduce((sum, row) => sum + Number(row.completes || 0), 0);
+    if (!rows?.length || (!totalHits && !totalCompletes)) {
+      host.innerHTML = '<div class="dashboard-empty">No respondent traffic was recorded in this chart range.</div>';
+      markReady(host);
+      return;
+    }
     const width = 860; const height = 300; const left = 52; const right = 48; const top = 24; const bottom = 42;
     const plotWidth = width - left - right; const plotHeight = height - top - bottom;
-    const maximum = Math.max(1, ...rows.flatMap((row) => [Number(row.hits), Number(row.completes)]));
+    const maximum = niceIntegerMaximum(Math.max(...rows.flatMap((row) => [Number(row.hits), Number(row.completes)])));
     const group = plotWidth / rows.length; const barWidth = Math.max(4, Math.min(18, group * .28));
     const x = (index) => left + group * index + group / 2;
     const y = (value) => top + plotHeight - Number(value || 0) / maximum * plotHeight;
@@ -129,13 +146,18 @@
     const labels = rows.map((row, index) => index % stride === 0 || index === rows.length - 1
       ? `<text class="bi-x-label" x="${x(index)}" y="${height - 15}" text-anchor="middle">${escapeHtml(row.short_label)}</text>` : '').join('');
     const rightAxis = [0, 50, 100].map((value) => `<text class="bi-right-axis" x="${width - right + 9}" y="${rateY(value) + 4}">${value}%</text>`).join('');
-    host.innerHTML = `<svg class="bi-chart-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="Entrants, completes and conversion over ${escapeHtml(rangeLabel)}"><g class="bi-chart-grid">${axisGrid({ width, height, left, right, top, bottom, maximum })}</g>${rightAxis}${bars}<path class="bi-chart-line bi-conversion-line" d="${svgLine(ratePoints)}"/>${rateDots}${labels}</svg>`;
+    host.innerHTML = `<svg class="bi-chart-svg" viewBox="0 0 ${width} ${height}" role="img" tabindex="0" aria-label="Entrants, completes and conversion over ${escapeHtml(rangeLabel)}"><desc>${number(totalHits)} entrants and ${number(totalCompletes)} completes in this chart range.</desc><g class="bi-chart-grid">${axisGrid({ width, height, left, right, top, bottom, maximum })}</g>${rightAxis}${bars}<path class="bi-chart-line bi-conversion-line" d="${svgLine(ratePoints)}"/>${rateDots}${labels}</svg>`;
+    markReady(host);
     animateChart(host);
   }
 
   function renderFinance(rows, currency, rangeLabel = '') {
     const host = byId('financeChart'); if (!host) return;
-    if (!rows?.length) { host.innerHTML = '<div class="dashboard-empty">No financial data is available for this range.</div>'; return; }
+    if (!rows?.length) {
+      host.innerHTML = '<div class="dashboard-empty">No financial data is available for this chart range.</div>';
+      markReady(host);
+      return;
+    }
     const hasRevenue = rows.some((row) => row.revenue != null);
     const lineKey = rows.some((row) => row.rpc != null) ? 'rpc' : 'average_cpi';
     const lineLabel = lineKey === 'rpc' ? 'RPC' : 'Average CPI';
@@ -145,6 +167,13 @@
     if (lineLegend) {
       lineLegend.hidden = !hasLine;
       lineLegend.lastChild.textContent = lineLabel;
+    }
+    const revenueTotal = rows.reduce((sum, row) => sum + Number(row.revenue || 0), 0);
+    const lineTotal = rows.reduce((sum, row) => sum + Number(row[lineKey] || 0), 0);
+    if ((!hasRevenue || !revenueTotal) && (!hasLine || !lineTotal)) {
+      host.innerHTML = '<div class="dashboard-empty">No completed revenue was recorded in this chart range.</div>';
+      markReady(host);
+      return;
     }
     const width = 620; const height = 300; const left = 58; const right = 48; const top = 24; const bottom = 42;
     const plotWidth = width - left - right; const plotHeight = height - top - bottom;
@@ -170,13 +199,18 @@
       : '';
     const line = hasLine ? `<path class="bi-chart-line bi-rpc-line" d="${svgLine(linePoints)}"/>${dots}` : '';
     const accessibleLabel = hasLine ? `Revenue and ${lineLabel}` : 'Revenue';
-    host.innerHTML = `<svg class="bi-chart-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="${accessibleLabel} over ${escapeHtml(rangeLabel)}"><g class="bi-chart-grid">${axisGrid({ width, height, left, right, top, bottom, maximum: maxRevenue, formatter: (value) => formatCurrency(value, currency, true) })}</g>${rightAxis}${bars}${line}${labels}</svg>`;
+    host.innerHTML = `<svg class="bi-chart-svg" viewBox="0 0 ${width} ${height}" role="img" tabindex="0" aria-label="${accessibleLabel} over ${escapeHtml(rangeLabel)}"><desc>Total revenue ${escapeHtml(formatCurrency(revenueTotal, currency))} in this chart range.</desc><g class="bi-chart-grid">${axisGrid({ width, height, left, right, top, bottom, maximum: maxRevenue, formatter: (value) => formatCurrency(value, currency, true) })}</g>${rightAxis}${bars}${line}${labels}</svg>`;
+    markReady(host);
     animateChart(host);
   }
 
   function renderClients(rows) {
     const host = byId('clientShareChart'); if (!host) return;
-    if (!rows?.length) { host.innerHTML = '<div class="dashboard-empty">No completed client activity matches this range.</div>'; return; }
+    if (!rows?.length) {
+      host.innerHTML = '<div class="dashboard-empty">No completed client activity matches this range.</div>';
+      markReady(host);
+      return;
+    }
     let cursor = 0;
     const segments = rows.map((row, index) => {
       const start = cursor; cursor += Number(row.share_percent || 0);
@@ -185,6 +219,7 @@
     if (cursor < 100) segments.push(`#edf2f6 ${cursor}% 100%`);
     const total = rows.reduce((sum, row) => sum + Number(row.completes || 0), 0);
     host.innerHTML = `<div class="bi-client-donut" style="--segments:${segments.join(',')}"><span><b>${number(total)}</b><small>Completes</small></span></div><ol class="bi-client-list">${rows.map((row, index) => `<li style="--index:${index}"><i style="--series:${colors[index % colors.length]}"></i><span><b>${escapeHtml(row.name)}</b><small>${number(row.completes)} completes</small></span><strong>${Number(row.share_percent || 0).toFixed(1)}%</strong></li>`).join('')}</ol>`;
+    markReady(host);
   }
 
   function renderStatus(data) {
@@ -195,7 +230,11 @@
       ['security', 'Quality / security', data.security],
     ];
     const total = Math.max(1, rows.reduce((sum, row) => sum + Number(row[2] || 0), 0));
-    host.innerHTML = rows.map(([type, label, value], index) => `<div class="bi-status-row ${type}" style="--index:${index}"><span><i></i>${label}</span><div><b style="--progress:${Number(value || 0) / total * 100}%"></b></div><strong>${number(value)}</strong><em>${(Number(value || 0) / total * 100).toFixed(1)}%</em></div>`).join('');
+    host.innerHTML = rows.map(([type, label, value], index) => {
+      const percent = Number(value || 0) / total * 100;
+      return `<div class="bi-status-row ${type}" style="--index:${index}"><span><i></i>${label}</span><div role="progressbar" aria-label="${escapeHtml(label)} share" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent.toFixed(1)}"><b style="--progress:${percent}%"></b></div><strong>${number(value)}</strong><em>${percent.toFixed(1)}%</em></div>`;
+    }).join('');
+    markReady(host);
   }
 
   function renderDevices(data) {
@@ -212,13 +251,19 @@
     });
     if (!total) segments.push('#edf2f6 0 100%');
     host.innerHTML = `<div class="bi-device-ring" style="--segments:${segments.join(',')}"><span><b>${number(total)}</b><small>Completes</small></span></div><div class="bi-device-list">${rows.map(([key, label, color], index) => `<div style="--index:${index}"><i style="--series:${color}"></i><span>${label}</span><strong>${number(data[key])}</strong><small>${total ? (Number(data[key] || 0) / total * 100).toFixed(1) : '0.0'}%</small></div>`).join('')}</div>`;
+    markReady(host);
   }
 
   function renderTopUsers(rows) {
     const host = byId('dashboardTopUsers'); if (!host) return;
-    if (!rows?.length) { host.innerHTML = '<div class="dashboard-empty">No user activity matches this range.</div>'; return; }
+    if (!rows?.length) {
+      host.innerHTML = '<div class="dashboard-empty">No user activity matches this range.</div>';
+      markReady(host);
+      return;
+    }
     const maximum = Math.max(1, ...rows.map((row) => Number(row.completes || 0)));
     host.innerHTML = rows.map((row, index) => `<div class="bi-performer-row" style="--index:${index}"><span class="bi-performer-rank">${String(index + 1).padStart(2, '0')}</span><span class="bi-performer-avatar">${escapeHtml(String(row.name || '?').charAt(0).toUpperCase())}</span><div><b>${escapeHtml(row.name)}</b><small>${number(row.hits)} hits · ${Number(row.conversion_rate || 0).toFixed(1)}% conversion</small><span><i style="--progress:${Number(row.completes || 0) / maximum * 100}%"></i></span></div><strong>${number(row.completes)}<small>completes</small></strong></div>`).join('');
+    markReady(host);
   }
 
   function updateGraphControls(data) {
@@ -239,6 +284,8 @@
 
   function render(data) {
     state.data = data;
+    const errorBanner = byId('dashboardErrorBanner');
+    if (errorBanner) errorBanner.hidden = true;
     updateSummary(data.summary || {});
     const caption = byId('dashboardRangeCaption'); if (caption) caption.textContent = data.range.label;
     if (byId('trafficBucketLabel') && data.traffic_chart) byId('trafficBucketLabel').textContent = data.traffic_chart.range.bucket_label;
@@ -255,16 +302,34 @@
   }
 
   function showError(message) {
-    document.querySelectorAll('.bi-chart-stage,.bi-client-body,.bi-status-list,.bi-device-body,.bi-performer-list').forEach((host) => {
-      host.innerHTML = `<div class="dashboard-error"><strong>Could not load analytics</strong><span>${escapeHtml(message)}</span><button type="button" data-dashboard-retry>Try again</button></div>`;
+    const banner = byId('dashboardErrorBanner');
+    const errorMessage = byId('dashboardErrorMessage');
+    if (errorMessage) errorMessage.textContent = message || 'Please try again.';
+    if (banner) banner.hidden = false;
+    if (!state.data) {
+      document.querySelectorAll('.bi-chart-stage,.bi-client-body,.bi-status-list,.bi-device-body,.bi-performer-list').forEach((host) => {
+        host.innerHTML = '<div class="dashboard-empty dashboard-error-placeholder">Analytics are unavailable until the request succeeds.</div>';
+        markReady(host);
+      });
+    }
+  }
+
+  function setLoading(loading) {
+    document.body.classList.toggle('dashboard-refreshing', loading);
+    document.querySelectorAll('[data-dashboard-range],[data-graph-range],#trafficGraphClient,#financeGraphClient').forEach((control) => {
+      control.disabled = loading;
     });
-    document.querySelectorAll('[data-dashboard-retry]').forEach((button) => button.addEventListener('click', loadDashboard));
+    document.querySelectorAll('.bi-kpi-grid,.bi-chart-stage,.bi-client-body,.bi-status-list,.bi-device-body,.bi-performer-list').forEach((host) => {
+      host.setAttribute('aria-busy', String(loading));
+    });
   }
 
   async function loadDashboard() {
-    state.controller?.abort(); state.controller = new AbortController();
-    document.body.classList.add('dashboard-refreshing');
-    document.querySelectorAll('[data-dashboard-range]').forEach((button) => { button.disabled = true; });
+    state.controller?.abort();
+    const controller = new AbortController();
+    const requestId = ++state.requestId;
+    state.controller = controller;
+    setLoading(true);
     try {
       const query = new URLSearchParams({ range: state.range });
       if (document.querySelector('[data-graph-toolbar="traffic"]')) {
@@ -276,18 +341,20 @@
         if (state.financeClient) query.set('finance_client', state.financeClient);
       }
       const response = await fetch(`/api/v1/dashboard/?${query.toString()}`, {
-        signal: state.controller.signal, credentials: 'same-origin',
+        signal: controller.signal, credentials: 'same-origin',
       });
-      const data = await response.json();
+      const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.detail || `Request failed (${response.status})`);
+      if (requestId !== state.requestId) return;
       render(data);
     } catch (error) {
-      if (error.name !== 'AbortError') showError(error.message);
+      if (error.name !== 'AbortError' && requestId === state.requestId) showError(error.message);
     } finally {
-      document.body.classList.remove('dashboard-refreshing');
-      document.querySelectorAll('[data-dashboard-range]').forEach((button) => { button.disabled = false; });
+      if (requestId === state.requestId) setLoading(false);
     }
   }
+
+  byId('dashboardRetry')?.addEventListener('click', loadDashboard);
 
   document.querySelectorAll('[data-dashboard-range]').forEach((button) => {
     const selected = button.dataset.dashboardRange === state.range;

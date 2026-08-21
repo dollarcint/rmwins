@@ -3242,8 +3242,23 @@ class SurveyAttemptViewSet(viewsets.ReadOnlyModelViewSet):
         )
 
 
+class DashboardFunctionPermission(HasFunctionPermission):
+    """Resolve dashboard permissions once for the permission gate and payload."""
+
+    def has_permission(self, request, view):
+        user = request.user
+        codes = effective_permission_codes(user)
+        request._dashboard_permission_codes = codes
+        return bool(
+            user
+            and user.is_authenticated
+            and user.is_active
+            and (user.is_superuser or "dashboard.view" in codes)
+        )
+
+
 class DashboardAPIView(APIView):
-    permission_classes = [HasFunctionPermission]
+    permission_classes = [DashboardFunctionPermission]
     required_function_permission = "dashboard.view"
 
     @extend_schema(
@@ -3281,7 +3296,9 @@ class DashboardAPIView(APIView):
         responses={200: DashboardResponseSerializer},
     )
     def get(self, request):
-        codes = effective_permission_codes(request.user)
+        codes = getattr(request, "_dashboard_permission_codes", None)
+        if codes is None:
+            codes = effective_permission_codes(request.user)
         if any(request.query_params.get(key) not in {None, ""} for key in (
             "traffic_range", "traffic_client"
         )) and DASHBOARD_GRAPH_FILTER_PERMISSIONS["traffic"] not in codes:
@@ -3291,12 +3308,21 @@ class DashboardAPIView(APIView):
         )) and DASHBOARD_GRAPH_FILTER_PERMISSIONS["finance"] not in codes:
             raise PermissionDenied("Your account cannot filter the Finance dashboard graph.")
         try:
-            range_window = dashboard_range_window(request.query_params.get("range", "24h"))
-            traffic_window = dashboard_range_window(
-                request.query_params.get("traffic_range") or range_window["key"]
+            range_now = timezone.now()
+            range_window = dashboard_range_window(
+                request.query_params.get("range", "24h"), now=range_now
             )
-            finance_window = dashboard_range_window(
-                request.query_params.get("finance_range") or range_window["key"]
+            traffic_range_key = request.query_params.get("traffic_range") or range_window["key"]
+            finance_range_key = request.query_params.get("finance_range") or range_window["key"]
+            traffic_window = (
+                range_window
+                if traffic_range_key == range_window["key"]
+                else dashboard_range_window(traffic_range_key, now=range_now)
+            )
+            finance_window = (
+                range_window
+                if finance_range_key == range_window["key"]
+                else dashboard_range_window(finance_range_key, now=range_now)
             )
             visible_queryset = dashboard_attempts(request.user, {})
             client_options = dashboard_client_options(visible_queryset)
@@ -3317,11 +3343,18 @@ class DashboardAPIView(APIView):
             traffic_client_id = selected_client("traffic_client")
             finance_client_id = selected_client("finance_client")
 
+            graph_querysets = {}
+
             def graph_queryset(window, client_id=None):
-                scoped = visible_queryset.filter(
-                    initiated_at__gte=window["start"], initiated_at__lte=window["end"]
-                )
-                return scoped.filter(survey__client_id=client_id) if client_id else scoped
+                cache_key = (window["start"], window["end"], client_id)
+                if cache_key not in graph_querysets:
+                    scoped = visible_queryset.filter(
+                        initiated_at__gte=window["start"], initiated_at__lte=window["end"]
+                    )
+                    graph_querysets[cache_key] = (
+                        scoped.filter(survey__client_id=client_id) if client_id else scoped
+                    )
+                return graph_querysets[cache_key]
 
             queryset = graph_queryset(range_window)
             traffic_queryset = graph_queryset(traffic_window, traffic_client_id)
