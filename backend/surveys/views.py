@@ -1636,6 +1636,36 @@ def _mark_attempt_redirected(attempt, answers, outbound_url):
     return bool(updated)
 
 
+def _hydrate_targeting_for_entry(survey):
+    """Synchronously close the inventory/detail race before respondent entry."""
+
+    targeting_stale = survey.inventory_source != Survey.InventorySource.MANUAL and (
+        survey.targeting_synced_at is None or (
+            survey.source_modified_at
+            and survey.targeting_synced_at < survey.source_modified_at
+        )
+    )
+    if targeting_stale and survey.integration_id:
+        try:
+            if has_provider(survey.integration.provider_code):
+                with managed_provider(get_provider(survey.integration)) as provider:
+                    provider.refresh_details(survey)
+            else:
+                with managed_provider(
+                    InnovateMRClient(integration=survey.integration)
+                ) as client:
+                    replace_survey_targeting(client, survey)
+        except Exception:
+            logger.exception(
+                "Respondent entry detail hydration failed for survey=%s integration=%s",
+                survey.pk,
+                survey.integration_id,
+            )
+            if not survey.targeting_questions.exists():
+                return False
+    return True
+
+
 @require_http_methods(["GET"])
 def supplier_survey_start(request):
     """Claim a supplier respondent using a signed, API-key-scoped entry URL."""
@@ -1673,34 +1703,12 @@ def supplier_survey_start(request):
     ).filter(local_id=survey_local_id, status=Survey.Status.LIVE).first()
     if not survey:
         return _invalid_survey_link(request, "This project is not assigned to the supplier.", status_code=404)
-    targeting_stale = survey.inventory_source != Survey.InventorySource.MANUAL and (
-        survey.targeting_synced_at is None or (
-            survey.source_modified_at
-            and survey.targeting_synced_at < survey.source_modified_at
+    if not _hydrate_targeting_for_entry(survey):
+        return _invalid_survey_link(
+            request,
+            "Pre-screening criteria are still syncing. Please try again shortly.",
+            status_code=503,
         )
-    )
-    if targeting_stale and survey.integration_id:
-        try:
-            if has_provider(survey.integration.provider_code):
-                with managed_provider(get_provider(survey.integration)) as provider:
-                    provider.refresh_details(survey)
-            else:
-                with managed_provider(
-                    InnovateMRClient(integration=survey.integration)
-                ) as client:
-                    replace_survey_targeting(client, survey)
-        except Exception:
-            logger.exception(
-                "Supplier entry detail hydration failed for survey=%s integration=%s",
-                survey.pk,
-                survey.integration_id,
-            )
-            if not survey.targeting_questions.exists():
-                return _invalid_survey_link(
-                    request,
-                    "Pre-screening criteria are still syncing. Please try again shortly.",
-                    status_code=503,
-                )
     entry_location = resolve_entry_geolocation(request)
     entry_client_data = {
         **get_request_client_data(request),
@@ -1910,6 +1918,15 @@ def survey_start(request):
     if attempt is None or attempt.platform_user is None or not attempt.platform_user.is_active:
         return _invalid_survey_link(request, status_code=404)
     attempt = backfill_attempt_entry_audit(attempt, request)
+    if (
+        attempt.status == SurveyAttempt.Status.INITIATED
+        and not _hydrate_targeting_for_entry(attempt.survey)
+    ):
+        return _invalid_survey_link(
+            request,
+            "Pre-screening criteria are still syncing. Please try again shortly.",
+            status_code=503,
+        )
 
     entry_location = {
         "ip": attempt.initiation_ip or "",
