@@ -44,6 +44,10 @@ INNOVATE_TAG = "InnovateMR APIs"
 RFG_TAG = "RFG APIs"
 RFG_CALLBACK_TAG = "RFG Callbacks"
 CINT_TAG = "Cint Exchange APIs"
+INNOVATEMR_CALLBACK_TEMPLATE = (
+    "https://rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]"
+    "&termReason=[%%termReason%%]&hash=[%%hashdata%%]"
+)
 PROVIDER_ALIASES = {
     "innovate": "innovatemr",
     "innovate-mr": "innovatemr",
@@ -120,11 +124,11 @@ MUTATION_EXAMPLES = {
     "set_global_redirects": {
         "confirm_upstream_mutation": True,
         "payload": {
-            "sUrl": "https://rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]",
-            "fUrl": "https://rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]",
-            "oUrl": "https://rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]",
-            "qTUrl": "https://rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]",
-            "tUrl": "https://rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]",
+            "sUrl": INNOVATEMR_CALLBACK_TEMPLATE,
+            "fUrl": INNOVATEMR_CALLBACK_TEMPLATE,
+            "oUrl": INNOVATEMR_CALLBACK_TEMPLATE,
+            "qTUrl": INNOVATEMR_CALLBACK_TEMPLATE,
+            "tUrl": INNOVATEMR_CALLBACK_TEMPLATE,
         },
     },
     "delete_global_redirects": {
@@ -135,10 +139,10 @@ MUTATION_EXAMPLES = {
         "confirm_upstream_mutation": True,
         "survey_id": "16003381",
         "payload": {
-            "sUrl": "https://rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]",
-            "fUrl": "https://rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]",
-            "oUrl": "https://rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]",
-            "tUrl": "https://rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]",
+            "sUrl": INNOVATEMR_CALLBACK_TEMPLATE,
+            "fUrl": INNOVATEMR_CALLBACK_TEMPLATE,
+            "oUrl": INNOVATEMR_CALLBACK_TEMPLATE,
+            "tUrl": INNOVATEMR_CALLBACK_TEMPLATE,
         },
     },
     "delete_survey_redirects": {

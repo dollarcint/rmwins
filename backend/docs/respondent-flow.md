@@ -40,13 +40,13 @@ The public copied link always uses the platform-facing supplier code, so an upst
 
 InnovateMR owns the browser redirect after the respondent leaves this application. Configure every account-level or survey-level return URL to the same secure callback:
 
-`https://rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&hash=[%%hashdata%%]`
+`https://rmwinsights.com/imr_callback?pid=[%%pid%%]&status=[%%status%%]&termReason=[%%termReason%%]&hash=[%%hashdata%%]`
 
-The callback uses InnovateMR's hydrated `pid`, `status` and `hashdata` merge fields. The upstream PID is our 10-character attempt RID. A redirect to another domain and a `code=null` value are produced by that upstream redirect configuration, not by the local Django callback route.
+The callback uses InnovateMR's hydrated `pid`, `status`, `termReason` and `hashdata` merge fields. The upstream PID is our 10-character attempt RID. A redirect to another domain and a `code=null` value are produced by that upstream redirect configuration, not by the local Django callback route.
 
 ## Callback contract
 
-`GET /imr_callback?pid={RID}&status={1|2|3|4|5|7|8}&hash={SHA1_HEX}`
+`GET /imr_callback?pid={RID}&status={1|2|3|4|5|7|8}&termReason={REASON}&hash={SHA1_HEX}`
 
 The server reconstructs the complete hydrated HTTPS callback URL with an empty `hash=` value, calculates its HMAC-SHA1 lowercase hexadecimal digest using `INNOVATEMR_CALLBACK_HASH_SECRET`, and compares it in constant time. The first verified callback sets the terminal status, callback time/exit IP, exit browser/device/OS/user-agent and `loi_seconds = callback_at - initiated_at`. Later requests only update `last_callback_at` and `callback_count`, protecting the original outcome, exit audit and LOI from refreshes.
 

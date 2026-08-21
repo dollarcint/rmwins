@@ -2431,6 +2431,7 @@ def _record_innovatemr_result(
     request,
     *,
     hash_valid,
+    term_reason="",
     rejection_reason="",
 ):
     """Persist the first authoritative InnovateMR decision and finalize capacity.
@@ -2477,6 +2478,7 @@ def _record_innovatemr_result(
         audit = dict(locked.upstream_transaction_data or {})
         audit["innovatemr_redirect"] = {
             "upstream_status": str(upstream_status or ""),
+            "termReason": str(term_reason or "").strip(),
             "hash_valid": bool(hash_valid),
             "algorithm": "hmac-sha1-hex",
             "rejection_reason": rejection_reason,
@@ -2566,9 +2568,13 @@ def innovatemr_callback(request):
     pid_values = request.GET.getlist("pid")
     status_values = request.GET.getlist("status")
     hash_values = request.GET.getlist("hash")
+    term_reason_values = request.GET.getlist("termReason")
     pid = pid_values[0].strip() if len(pid_values) == 1 else ""
     upstream_status = status_values[0].strip() if len(status_values) == 1 else ""
     received_hash = hash_values[0].strip() if len(hash_values) == 1 else ""
+    term_reason = (
+        term_reason_values[0].strip() if len(term_reason_values) == 1 else ""
+    )
 
     if len(pid) != 10 or not pid.isalnum():
         return render(request, "surveys/flow_error.html", {
@@ -2592,6 +2598,7 @@ def innovatemr_callback(request):
         len(pid_values) == 1
         and len(status_values) == 1
         and len(hash_values) == 1
+        and len(term_reason_values) <= 1
     )
     hash_valid = False
     rejection_reason = "invalid_parameters" if not valid_shape else ""
@@ -2614,6 +2621,7 @@ def innovatemr_callback(request):
         upstream_status,
         request,
         hash_valid=hash_valid,
+        term_reason=term_reason,
         rejection_reason=rejection_reason,
     )
     return _respondent_result_redirect(attempt)

@@ -147,6 +147,25 @@ class InnovateMRCallbackTests(TestCase):
         self.assertEqual(attempt.status, SurveyAttempt.Status.COMPLETED)
         self.assertTrue(attempt.is_verified)
 
+    def test_signed_term_reason_is_persisted_for_supplier_forwarding(self):
+        attempt = self.create_attempt()
+
+        response = self.client.get(
+            self.callback_url(
+                attempt.rid,
+                "5",
+                extra="&termReason=Qualifications%20did%20not%20match",
+            )
+        )
+
+        self.assertEqual(response.status_code, 302)
+        attempt.refresh_from_db()
+        self.assertTrue(attempt.is_verified)
+        self.assertEqual(
+            attempt.upstream_transaction_data["innovatemr_redirect"]["termReason"],
+            "Qualifications did not match",
+        )
+
     def test_unsigned_legacy_callback_cannot_credit_innovatemr_attempt(self):
         attempt = self.create_attempt()
 

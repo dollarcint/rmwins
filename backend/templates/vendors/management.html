@@ -113,7 +113,7 @@
         <label class="wide"><span>Over-quota redirect URL</span><input name="over_quota_redirect_url" type="url" placeholder="https://supplier.example/quota"></label>
         <label class="wide"><span>Quality / security redirect URL</span><input name="quality_redirect_url" type="url" placeholder="https://supplier.example/quality"></label>
         <label class="wide"><span>Invalid survey-hit URL (optional)</span><input name="invalid_redirect_url" type="url" placeholder="https://supplier.example/invalid"></label>
-        <p class="vendor-form-note wide">Every live project is available automatically. Redirects receive pid, status, survey_id, term_reason and—when enabled—the signed hash.</p>
+        <p class="vendor-form-note wide">Every live project is available automatically. Redirects substitute only the placeholders configured in each URL, including pid, status, survey ID, term reason and hash.</p>
       </div>
       <label class="vendor-active-toggle"><input name="is_active" type="checkbox" checked><span>Active</span><small>Inactive client grants hide every allocated project.</small></label>
       <div class="vendor-form-error" data-vendor-form-error hidden></div>
