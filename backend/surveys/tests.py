@@ -29,6 +29,7 @@ from vendors.models import Client, ClientIntegration, OrganizationUnit
 from vendors.services import survey_pricing_for_user
 
 from .integrations import InnovateMRClient, InnovateMRNotFound, PagedSurveyResult
+from .markets import normalize_country_code
 from .models import Survey, SurveyAttempt, SurveyQuota, SyncLease, SyncRun, TargetingQuestion
 from .services import (
     merge_inventory,
@@ -103,6 +104,20 @@ class FakeClient:
 
 
 class MergeAndDateTests(TestCase):
+    def test_country_code_is_derived_when_innovatemr_only_sends_country_name(self):
+        summary = sync_surveys(
+            FakeClient(full=[survey_payload(Country="United Kingdom", CountryCode="")])
+        )
+
+        survey = Survey.objects.get(source_id=12632)
+        self.assertEqual(summary.created, 1)
+        self.assertEqual(survey.country, "United Kingdom")
+        self.assertEqual(survey.country_code, "GB")
+
+    def test_country_code_normalizer_preserves_valid_provider_code(self):
+        self.assertEqual(normalize_country_code("ca", "Canada"), "CA")
+        self.assertEqual(normalize_country_code("", "Unknown market"), "")
+
     def test_latest_modified_payload_wins_across_sources(self):
         older = survey_payload(surveyName="Old name")
         newer = survey_payload(modified="10/09/2017, 9:26:27 am PST", surveyName="New name")

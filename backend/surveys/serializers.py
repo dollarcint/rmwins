@@ -390,7 +390,11 @@ class SurveyListSerializer(serializers.ModelSerializer):
         return None
 
     def get_country_label(self, obj) -> str:
-        return " ".join(part for part in [obj.country_code, obj.language_code] if part) or obj.country
+        parts = []
+        for value in [obj.country, obj.country_code, obj.language_code or obj.language]:
+            if value and value not in parts:
+                parts.append(value)
+        return " · ".join(parts)
 
     @extend_schema_field({"oneOf": [{"type": "integer"}, {"type": "string"}]})
     def get_source_id(self, obj):

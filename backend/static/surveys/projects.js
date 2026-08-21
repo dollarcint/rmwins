@@ -345,7 +345,7 @@
     const clientName = survey.client_name || survey.display_company_name || survey.company_name || 'Survey client';
     if (projectColumns.has('project_id')) cells.push(`<td><div class="project-id-stack">${projectIdControl(survey)}${canViewProjectClientName ? `<small>${escapeHtml(clientName)}</small>` : ''}</div></td>`);
     if (projectColumns.has('survey')) cells.push(`<td><div class="survey-name"><strong>${escapeHtml(survey.source_id ?? '—')}</strong><span>${survey.buyer_id ? escapeHtml(survey.buyer_id) : 'Buyer ID unavailable'}</span></div></td>`);
-    if (projectColumns.has('market')) cells.push(`<td><span class="market-pill">${escapeHtml(survey.country_code || '—')} <i>${escapeHtml(survey.language_code || '')}</i></span><small class="country-name">${escapeHtml(survey.country || '')}</small></td>`);
+    if (projectColumns.has('market')) cells.push(`<td><span class="market-pill">${escapeHtml(survey.country_code || survey.country || '—')} <i>${escapeHtml(survey.language_code || '')}</i></span><small class="country-name">${escapeHtml(survey.country || survey.country_code || 'Country unavailable')}</small></td>`);
     if (projectColumns.has('completes')) cells.push(`<td><div class="complete-value"><strong>${survey.completes.toLocaleString()} / ${survey.sample_size.toLocaleString()}</strong><span><i style="width:${percent}%"></i></span></div></td>`);
     if (projectColumns.has('cpi')) cells.push(`<td><strong class="cpi">${money(survey.cpi)}</strong></td>`);
     if (projectColumns.has('loi_ir')) cells.push(`<td><div class="metric-pair"><span><b>${survey.loi ?? '—'}</b> min</span><span><b>${survey.incidence_rate ?? '—'}</b>%</span></div><small class="survey-type-tag">${escapeHtml(survey.survey_type || survey.group_type || 'Type unavailable')}</small></td>`);
@@ -360,7 +360,11 @@
     const clientName = survey.client_name || survey.display_company_name || survey.company_name || 'Survey client';
     const top = `${projectColumns.has('project_id') ? `${projectIdControl(survey)}${canViewProjectClientName ? `<small class="project-card-client">${escapeHtml(clientName)}</small>` : ''}` : ''}${projectColumns.has('modified') ? `<span class="status ${survey.status}"><i></i>${escapeHtml(survey.status)}</span>` : ''}`;
     const metrics = [];
-    if (projectColumns.has('market')) metrics.push(`<span><small>Market</small><b>${escapeHtml(survey.country_code || '—')} ${escapeHtml(survey.language_code || '')}</b></span>`);
+    if (projectColumns.has('market')) {
+      const country = survey.country || survey.country_code || '—';
+      const code = survey.country_code && survey.country_code !== country ? ` · ${survey.country_code}` : '';
+      metrics.push(`<span><small>Country</small><b>${escapeHtml(country + code)}</b></span>`);
+    }
     if (projectColumns.has('completes')) metrics.push(`<span><small>Completes</small><b>${survey.completes} / ${survey.sample_size}</b></span>`);
     if (projectColumns.has('cpi')) metrics.push(`<span><small>CPI</small><b>${money(survey.cpi)}</b></span>`);
     if (projectColumns.has('loi_ir')) metrics.push(`<span><small>LOI / IR · Type</small><b>${survey.loi ?? '—'}m · ${survey.incidence_rate ?? '—'}% · ${escapeHtml(survey.survey_type || survey.group_type || '—')}</b></span>`);

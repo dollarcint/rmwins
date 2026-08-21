@@ -16,6 +16,7 @@ from django.utils import timezone
 from vendors.models import ClientIntegration
 
 from .integrations import InnovateMRAPIError, InnovateMRClient, InnovateMRNotFound
+from .markets import normalize_country_code
 from .models import Survey, SurveyAttempt, SurveyQuota, SyncRun, TargetingQuestion
 from .project_cache import invalidate_project_cache
 from .survey_flow import normalize_client_ip
@@ -98,6 +99,7 @@ def _survey_values(payload: dict[str, Any], seen_at: datetime) -> dict[str, Any]
         survey_type = "B2C"
     else:
         survey_type = group_type[:20]
+    country = str(payload.get("Country") or "").strip()
     return {
         "company_name": str(payload.get("_provider_name") or "InnovateMR"),
         "name": str(payload.get("surveyName") or ""),
@@ -109,8 +111,8 @@ def _survey_values(payload: dict[str, Any], seen_at: datetime) -> dict[str, Any]
         "cpi": _decimal(payload.get("CPI")),
         "loi": max(0, _integer(payload.get("LOI"))) if payload.get("LOI") is not None else None,
         "incidence_rate": _decimal(payload.get("IR")),
-        "country": str(payload.get("Country") or ""),
-        "country_code": str(payload.get("CountryCode") or "").upper(),
+        "country": country,
+        "country_code": normalize_country_code(payload.get("CountryCode"), country),
         "language": str(payload.get("Language") or ""),
         "language_code": str(payload.get("LanguageCode") or "").upper(),
         "group_type": group_type,
