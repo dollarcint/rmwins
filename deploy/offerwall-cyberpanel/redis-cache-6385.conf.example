@@ -1,0 +1,21 @@
+# Copy to /home/www.rmwinsights.com/.config/rmwins-offerwall/redis-6385.conf, replace the
+# password. The deploy wrapper stores it as root:wwwrm1759 mode 0640. Cache data is rebuildable, so persistence is
+# deliberately disabled to remove AOF/RDB I/O from request hot paths.
+bind 127.0.0.1
+protected-mode yes
+requirepass replace-with-cache-redis-password
+port 6385
+daemonize no
+supervised no
+pidfile /home/www.rmwinsights.com/app/offerwall/run/supervisor/rmwins-redis-6385.pid
+loglevel notice
+logfile ""
+databases 2
+dir /home/www.rmwinsights.com/app/offerwall/data/redis-cache
+save ""
+appendonly no
+maxmemory 512mb
+maxmemory-policy allkeys-lru
+lazyfree-lazy-eviction yes
+lazyfree-lazy-expire yes
+lazyfree-lazy-server-del yes

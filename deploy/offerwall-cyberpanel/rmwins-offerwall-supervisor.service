@@ -1,0 +1,29 @@
+[Unit]
+Description=RMWins Gunicorn, Celery and private Redis processes
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=wwwrm1759
+Group=wwwrm1759
+WorkingDirectory=/home/www.rmwinsights.com/offerwall/backend
+Environment=HOME=/home/www.rmwinsights.com
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/home/www.rmwinsights.com/.config/rmwins-offerwall/backend.env
+ExecStart=/home/www.rmwinsights.com/offerwall/backend/.venv/bin/supervisord -n -c /home/www.rmwinsights.com/offerwall/deploy/offerwall-cyberpanel/supervisord.conf
+ExecReload=/home/www.rmwinsights.com/offerwall/backend/.venv/bin/supervisorctl -c /home/www.rmwinsights.com/offerwall/deploy/offerwall-cyberpanel/supervisord.conf reload
+Restart=always
+RestartSec=5
+TimeoutStopSec=90
+KillMode=mixed
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=false
+ReadOnlyPaths=/home/www.rmwinsights.com/.config/rmwins-offerwall
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
