@@ -587,8 +587,8 @@ class VendorFoundationTests(TestCase):
         self.survey.save(update_fields=["entry_link"])
         self.external_client_allocation.complete_redirect_url = "https://supplier.example/complete?campaign=alpha"
         self.external_client_allocation.terminate_redirect_url = (
-            "https://supplier.example/terminate?status=legacy&rid=[%%pid%%]"
-            "&survey=[%%survey_id%%]&reason=[%%termreason%%]"
+            "https://supplier.example/terminate?status=legacy&rid=[%%rid%%]"
+            "&survey=[%%survey_id%%]&reason=[%%termreason%%]&signature=[%%hash%%]"
         )
         self.external_client_allocation.save(update_fields=["complete_redirect_url", "terminate_redirect_url"])
 
@@ -624,13 +624,13 @@ class VendorFoundationTests(TestCase):
         redirect_url = supplier_outcome_redirect(attempt)
         query = parse_qs(urlsplit(redirect_url).query)
         self.assertNotIn("pid", query)
-        self.assertEqual(query["status"], [SurveyAttempt.Status.TERMINATED])
-        self.assertEqual(query["rid"], ["SUPPLIER-RID-42"])
+        self.assertEqual(query["status"], ["legacy"])
+        self.assertEqual(query["rid"], [attempt.rid])
         self.assertEqual(query["survey"], [self.survey.local_id])
         self.assertEqual(query["reason"], ["Age quota closed"])
         self.assertNotIn("survey_id", query)
         self.assertNotIn("term_reason", query)
-        self.assertEqual(query["hash"], [supplier_outcome_signature(
+        self.assertEqual(query["signature"], [supplier_outcome_signature(
             raw_hash_key,
             pid="SUPPLIER-RID-42",
             status=SurveyAttempt.Status.TERMINATED,
