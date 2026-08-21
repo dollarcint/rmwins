@@ -722,6 +722,23 @@ class SurveyFlowTests(TestCase):
         self.assertEqual(attempt.exit_os, "Android 14")
         self.assertIsNotNone(attempt.loi_seconds)
 
+    @override_settings(PRESCREENER_VAULT_ENABLED=True)
+    def test_survey_without_questions_skips_empty_vault_capture_and_redirects(self):
+        self.question.delete()
+        attempt = create_attempt(self.survey, self.platform_user, None)
+
+        with patch("surveys.views.capture_prescreener_submission") as capture:
+            response = self.client.post(reverse("survey-start"), {"rid": attempt.rid})
+
+        self.assertEqual(response.status_code, 302)
+        capture.assert_not_called()
+        params = parse_qs(urlsplit(response["Location"]).query)
+        self.assertEqual(params["PID"], [attempt.rid])
+        self.assertEqual(params["trackId"], [attempt.rid])
+        attempt.refresh_from_db()
+        self.assertEqual(attempt.status, SurveyAttempt.Status.REDIRECTED)
+        self.assertEqual(attempt.answers, {})
+
     def test_innovate_profile_mapping_replaces_stale_values_and_protects_routing_keys(self):
         outbound = build_outbound_url(
             "https://edgeapi.innovatemr.net/startSurvey?survNum=test&supCode=1150&PID=old&trackId=old&GENDER=1",

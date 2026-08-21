@@ -1928,10 +1928,9 @@ def survey_start(request):
                     eligible, reason = provider.validate_prescreener(attempt.survey, answers)
                     if not eligible:
                         if settings.PRESCREENER_VAULT_ENABLED:
-                            capture_prescreener_submission(
-                                attempt,
-                                answers_with_entry_postal_code(attempt, answers),
-                            )
+                            vault_answers = answers_with_entry_postal_code(attempt, answers)
+                            if vault_answers:
+                                capture_prescreener_submission(attempt, vault_answers)
                         _finish_local_rfg_attempt(
                             attempt, answers, request, result="7", reason=reason
                         )
@@ -1943,10 +1942,9 @@ def survey_start(request):
                 # still unique so callbacks cannot collide between journeys.
                 reuse_event = maybe_assign_reusable_profile(attempt, answers)
                 if settings.PRESCREENER_VAULT_ENABLED and reuse_event is None:
-                    capture_prescreener_submission(
-                        attempt,
-                        answers_with_entry_postal_code(attempt, answers),
-                    )
+                    vault_answers = answers_with_entry_postal_code(attempt, answers)
+                    if vault_answers:
+                        capture_prescreener_submission(attempt, vault_answers)
 
                 if provider and attempt.survey.integration.provider_code == "rfg":
                     if provider.duplicate_check(
