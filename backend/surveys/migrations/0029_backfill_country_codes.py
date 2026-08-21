@@ -13,7 +13,7 @@ COUNTRY_CODES = {
     "Romania": "RO", "Saudi Arabia": "SA", "Singapore": "SG", "South Africa": "ZA",
     "Spain": "ES", "Sweden": "SE", "Switzerland": "CH", "Taiwan": "TW",
     "Thailand": "TH", "Turkey": "TR", "United Arab Emirates": "AE",
-    "United Kingdom": "GB", "United States": "US",
+    "United Kingdom": "GB", "United States": "US", "Vietnam": "VN",
 }
 
 
