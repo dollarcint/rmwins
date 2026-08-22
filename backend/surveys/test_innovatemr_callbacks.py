@@ -108,7 +108,7 @@ class InnovateMRCallbackTests(TestCase):
         self.assertEqual(attempt.status_source, "innovatemr_hash_rejected")
         self.assertNotIn(supplied_hash, str(attempt.upstream_transaction_data))
 
-    def test_first_security_decision_cannot_be_upgraded_by_later_valid_hash(self):
+    def test_valid_signed_callback_recovers_after_rejected_callback(self):
         attempt = self.create_attempt()
         self.client.get(
             reverse("innovatemr-callback"),
@@ -118,10 +118,17 @@ class InnovateMRCallbackTests(TestCase):
         self.client.get(self.callback_url(attempt.rid, "1"))
 
         attempt.refresh_from_db()
-        self.assertEqual(attempt.status, SurveyAttempt.Status.QUALITY_TERMINATED)
-        self.assertFalse(attempt.is_verified)
-        self.assertEqual(attempt.status_source, "innovatemr_hash_rejected")
+        self.assertEqual(attempt.status, SurveyAttempt.Status.COMPLETED)
+        self.assertTrue(attempt.is_verified)
+        self.assertEqual(attempt.status_source, "innovatemr_redirect_hash")
         self.assertEqual(attempt.callback_count, 2)
+        audit = attempt.upstream_transaction_data["innovatemr_redirect"]
+        self.assertTrue(audit["hash_valid"])
+        self.assertTrue(audit["recovered_after_rejection"])
+        self.assertEqual(
+            attempt.upstream_transaction_data["innovatemr_rejected_callback_count"],
+            1,
+        )
 
     def test_invalid_replay_cannot_downgrade_verified_completion(self):
         attempt = self.create_attempt()
@@ -136,6 +143,12 @@ class InnovateMRCallbackTests(TestCase):
         self.assertEqual(attempt.status, SurveyAttempt.Status.COMPLETED)
         self.assertTrue(attempt.is_verified)
         self.assertEqual(attempt.status_source, "innovatemr_redirect_hash")
+        self.assertTrue(
+            attempt.upstream_transaction_data["innovatemr_redirect"]["hash_valid"]
+        )
+        self.assertFalse(
+            attempt.upstream_transaction_data["innovatemr_last_callback"]["hash_valid"]
+        )
 
     def test_complete_url_with_additional_signed_data_verifies_byte_for_byte(self):
         attempt = self.create_attempt()

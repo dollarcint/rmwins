@@ -2412,7 +2412,6 @@ def _record_enligne_s2s_result(attempt, status_code, request, payload):
 
 INNOVATEMR_FINAL_SOURCES = {
     "innovatemr_redirect_hash",
-    "innovatemr_hash_rejected",
     "innovatemr_status_rejected",
 }
 
@@ -2434,24 +2433,30 @@ def _record_innovatemr_result(
     term_reason="",
     rejection_reason="",
 ):
-    """Persist the first authoritative InnovateMR decision and finalize capacity.
+    """Persist the first *verified* InnovateMR decision and finalize capacity.
 
-    An invalid first callback is terminal and cannot later be upgraded. Likewise,
-    an invalid replay cannot downgrade an already verified completion.
+    InnovateMR can send a server callback immediately before the respondent's
+    browser follows the signed redirect.  A rejected/legacy callback must never
+    credit an attempt, but it must not permanently block the valid signed result
+    that follows.  Once a signed result is accepted, later replays cannot change
+    it.
     """
 
     with transaction.atomic():
         locked = SurveyAttempt.objects.select_for_update().get(pk=attempt.pk)
         now = timezone.now()
         already_final = locked.is_verified or locked.status_source in INNOVATEMR_FINAL_SOURCES
-        first_authoritative_result = not already_final
+        recovered_after_rejection = (
+            not locked.is_verified and locked.status_source == "innovatemr_hash_rejected"
+        )
+        first_authoritative_result = bool(hash_valid and not already_final)
         mapped_status = INNOVATEMR_STATUS_MAP.get(str(upstream_status or ""))
-        if first_authoritative_result:
-            if hash_valid and mapped_status:
+        if not already_final:
+            if first_authoritative_result and mapped_status:
                 locked.status = mapped_status
                 locked.status_source = "innovatemr_redirect_hash"
                 locked.is_verified = True
-            elif hash_valid:
+            elif first_authoritative_result:
                 locked.status = SurveyAttempt.Status.QUALITY_TERMINATED
                 locked.status_source = "innovatemr_status_rejected"
                 locked.is_verified = True
@@ -2463,7 +2468,7 @@ def _record_innovatemr_result(
                 rejection_reason = rejection_reason or "hash_mismatch"
 
             exit_client_data = get_request_client_data(request)
-            if locked.callback_at is None:
+            if locked.callback_at is None or recovered_after_rejection:
                 locked.callback_at = now
                 locked.loi_seconds = locked.calculate_loi_seconds(now)
             locked.callback_ip = get_request_ip(request)
@@ -2476,14 +2481,25 @@ def _record_innovatemr_result(
         locked.last_callback_at = now
         locked.callback_count += 1
         audit = dict(locked.upstream_transaction_data or {})
-        audit["innovatemr_redirect"] = {
+        callback_audit = {
             "upstream_status": str(upstream_status or ""),
             "termReason": str(term_reason or "").strip(),
             "hash_valid": bool(hash_valid),
             "algorithm": "hmac-sha1-hex",
             "rejection_reason": rejection_reason,
-            "duplicate": not first_authoritative_result,
+            "duplicate": bool(already_final or (not hash_valid and locked.callback_count > 1)),
+            "recovered_after_rejection": bool(
+                first_authoritative_result and recovered_after_rejection
+            ),
         }
+        if first_authoritative_result or "innovatemr_redirect" not in audit:
+            audit["innovatemr_redirect"] = callback_audit
+        else:
+            audit["innovatemr_last_callback"] = callback_audit
+        if not hash_valid:
+            audit["innovatemr_rejected_callback_count"] = (
+                int(audit.get("innovatemr_rejected_callback_count") or 0) + 1
+            )
         locked.upstream_transaction_data = audit
         locked.save(update_fields=[
             "status", "callback_at", "last_callback_at", "callback_ip", "callback_count",
