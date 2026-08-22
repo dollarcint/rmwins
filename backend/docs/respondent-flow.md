@@ -50,6 +50,8 @@ The callback uses InnovateMR's hydrated `pid`, `status`, `termReason` and `hashd
 
 The server reconstructs the complete hydrated HTTPS callback URL with an empty `hash=` value, calculates its HMAC-SHA1 lowercase hexadecimal digest using `INNOVATEMR_CALLBACK_HASH_SECRET`, and compares it in constant time. The first verified callback sets the terminal status, callback time/exit IP, exit browser/device/OS/user-agent and `loi_seconds = callback_at - initiated_at`. Later requests only update `last_callback_at` and `callback_count`, protecting the original outcome, exit audit and LOI from refreshes.
 
+Every callback URL configured upstream must be listed explicitly. `INNOVATEMR_CALLBACK_PUBLIC_URL` is the primary browser redirect and `INNOVATEMR_CALLBACK_PUBLIC_URLS` is a comma-separated allowlist of additional signed endpoints, such as the `api.rmwinsights.com` server postback alias. Verification tries only this allowlist and records which public URL matched without storing the received hash.
+
 Only a verified status 1 is eligible to consume/credit a completion. A missing, malformed or mismatched hash is recorded as `innovatemr_hash_rejected` and immediately displayed as a quality/security termination, but it is not authoritative. This allows InnovateMR's valid signed browser redirect to recover an attempt when an unsigned server callback arrived first. Once a signed result is accepted it is final, so an invalid replay cannot downgrade a verified result. Rejected callback counts are audited, while callback hashes and the shared secret are never stored.
 
 GMS uses four separate unsigned redirects and does not send a termination-reason or hash parameter:

@@ -2432,6 +2432,7 @@ def _record_innovatemr_result(
     hash_valid,
     term_reason="",
     rejection_reason="",
+    hash_public_url="",
 ):
     """Persist the first *verified* InnovateMR decision and finalize capacity.
 
@@ -2486,6 +2487,7 @@ def _record_innovatemr_result(
             "termReason": str(term_reason or "").strip(),
             "hash_valid": bool(hash_valid),
             "algorithm": "hmac-sha1-hex",
+            "public_url": str(hash_public_url or ""),
             "rejection_reason": rejection_reason,
             "duplicate": bool(already_final or (not hash_valid and locked.callback_count > 1)),
             "recovered_after_rejection": bool(
@@ -2574,8 +2576,10 @@ def innovatemr_callback(request):
     """Verify InnovateMR's signed redirect before recording any completion."""
 
     secret = settings.INNOVATEMR_CALLBACK_HASH_SECRET
-    public_url = settings.INNOVATEMR_CALLBACK_PUBLIC_URL
-    if not secret or not public_url:
+    public_urls = tuple(getattr(settings, "INNOVATEMR_CALLBACK_PUBLIC_URLS", ()))
+    if not public_urls and settings.INNOVATEMR_CALLBACK_PUBLIC_URL:
+        public_urls = (settings.INNOVATEMR_CALLBACK_PUBLIC_URL,)
+    if not secret or not public_urls:
         return render(request, "surveys/flow_error.html", {
             "title": "Callback temporarily unavailable",
             "message": "The secure survey callback is not configured.",
@@ -2617,17 +2621,25 @@ def innovatemr_callback(request):
         and len(term_reason_values) <= 1
     )
     hash_valid = False
+    hash_public_url = ""
     rejection_reason = "invalid_parameters" if not valid_shape else ""
     if valid_shape:
-        try:
-            hash_valid = verify_callback_hash(
-                secret=secret,
-                public_url=public_url,
-                raw_query=request.META.get("QUERY_STRING", ""),
-                received_hash=received_hash,
-            )
-        except (CallbackConfigurationError, ValueError):
-            hash_valid = False
+        invalid_contract = False
+        for public_url in public_urls:
+            try:
+                hash_valid = verify_callback_hash(
+                    secret=secret,
+                    public_url=public_url,
+                    raw_query=request.META.get("QUERY_STRING", ""),
+                    received_hash=received_hash,
+                )
+            except (CallbackConfigurationError, ValueError):
+                invalid_contract = True
+                continue
+            if hash_valid:
+                hash_public_url = public_url
+                break
+        if not hash_valid and invalid_contract:
             rejection_reason = "invalid_hash_contract"
     if not hash_valid and not rejection_reason:
         rejection_reason = "hash_mismatch"
@@ -2639,6 +2651,7 @@ def innovatemr_callback(request):
         hash_valid=hash_valid,
         term_reason=term_reason,
         rejection_reason=rejection_reason,
+        hash_public_url=hash_public_url,
     )
     return _respondent_result_redirect(attempt)
 

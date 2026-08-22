@@ -11,11 +11,13 @@ from .models import Survey, SurveyAttempt
 
 CALLBACK_SECRET = "test-only-innovatemr-callback-secret"
 CALLBACK_URL = "https://rmwinsights.com/imr_callback"
+CALLBACK_ALIAS_URL = "https://api.rmwinsights.com/imr_callback"
 
 
 @override_settings(
     INNOVATEMR_CALLBACK_HASH_SECRET=CALLBACK_SECRET,
     INNOVATEMR_CALLBACK_PUBLIC_URL=CALLBACK_URL,
+    INNOVATEMR_CALLBACK_PUBLIC_URLS=(CALLBACK_URL, CALLBACK_ALIAS_URL),
     PUBLIC_RESULT_BASE_URL="https://www.rmwinsights.com",
 )
 class InnovateMRCallbackTests(TestCase):
@@ -48,8 +50,16 @@ class InnovateMRCallbackTests(TestCase):
             status=SurveyAttempt.Status.REDIRECTED,
         )
 
-    def callback_url(self, rid, status, *, extra="", secret=CALLBACK_SECRET):
-        unsigned = f"{CALLBACK_URL}?pid={rid}&status={status}{extra}&hash="
+    def callback_url(
+        self,
+        rid,
+        status,
+        *,
+        extra="",
+        secret=CALLBACK_SECRET,
+        public_url=CALLBACK_URL,
+    ):
+        unsigned = f"{public_url}?pid={rid}&status={status}{extra}&hash="
         digest = hmac.new(
             secret.encode("utf-8"),
             unsigned.encode("utf-8"),
@@ -73,6 +83,22 @@ class InnovateMRCallbackTests(TestCase):
         self.assertEqual(attempt.status_source, "innovatemr_redirect_hash")
         self.assertEqual(attempt.callback_count, 1)
         self.assertTrue(attempt.upstream_transaction_data["innovatemr_redirect"]["hash_valid"])
+
+    def test_valid_api_subdomain_callback_is_accepted_from_allowlist(self):
+        attempt = self.create_attempt()
+
+        response = self.client.get(
+            self.callback_url(attempt.rid, "1", public_url=CALLBACK_ALIAS_URL)
+        )
+
+        self.assertEqual(response.status_code, 302)
+        attempt.refresh_from_db()
+        self.assertEqual(attempt.status, SurveyAttempt.Status.COMPLETED)
+        self.assertTrue(attempt.is_verified)
+        self.assertEqual(
+            attempt.upstream_transaction_data["innovatemr_redirect"]["public_url"],
+            CALLBACK_ALIAS_URL,
+        )
 
     def test_all_documented_upstream_statuses_map_to_non_credit_outcomes(self):
         cases = {

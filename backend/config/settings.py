@@ -407,6 +407,17 @@ INNOVATEMR_API_TOKEN = os.getenv("INNOVATEMR_API_TOKEN", "")
 INNOVATEMR_BASE_URL = os.getenv("INNOVATEMR_BASE_URL", "https://supplier.innovatemr.net/api/v2").rstrip("/")
 INNOVATEMR_CALLBACK_HASH_SECRET = os.getenv("INNOVATEMR_CALLBACK_HASH_SECRET", "").strip()
 INNOVATEMR_CALLBACK_PUBLIC_URL = os.getenv("INNOVATEMR_CALLBACK_PUBLIC_URL", "").strip()
+INNOVATEMR_CALLBACK_PUBLIC_URLS = tuple(dict.fromkeys(
+    value
+    for value in (
+        INNOVATEMR_CALLBACK_PUBLIC_URL,
+        *(
+            item.strip()
+            for item in os.getenv("INNOVATEMR_CALLBACK_PUBLIC_URLS", "").split(",")
+        ),
+    )
+    if value
+))
 PUBLIC_SUPPLIER_CODE = os.getenv("PUBLIC_SUPPLIER_CODE", "1000").strip() or "1000"
 INTEGRATION_CREDENTIAL_ENCRYPTION_KEY = os.getenv("INTEGRATION_CREDENTIAL_ENCRYPTION_KEY", SECRET_KEY)
 RESPONDENT_EMAIL_ENCRYPTION_KEY = os.getenv(
