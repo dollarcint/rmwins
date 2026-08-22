@@ -73,7 +73,20 @@ def provider_outcome(attempt):
         "reason": config_mapping.get("reason") or field_mapping.get("outcome_reason"),
         "category": config_mapping.get("category") or field_mapping.get("outcome_category"),
     }
-    candidates = [data]
+    candidates = []
+    if provider_code == "innovatemr":
+        # Only a hash-verified callback may contribute a provider reason. The
+        # stable outcome survives later callback retries, while the two audit
+        # keys keep older production rows readable without a data migration.
+        for key in (
+            "innovatemr_outcome",
+            "innovatemr_last_callback",
+            "innovatemr_redirect",
+        ):
+            callback = data.get(key)
+            if isinstance(callback, dict) and callback.get("hash_valid") is True:
+                candidates.append(callback)
+    candidates.append(data)
     candidates.extend(
         value for key in ("transaction", "outcome", "result", "local_country_guard")
         if isinstance((value := data.get(key)), dict)

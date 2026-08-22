@@ -9,7 +9,7 @@ byte-for-byte when reconstructing the signed value.
 import hashlib
 import hmac
 import re
-from urllib.parse import unquote_plus, urlsplit
+from urllib.parse import unquote, unquote_plus, urlsplit
 
 
 HASH_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -65,6 +65,35 @@ def unsigned_callback_url(public_url: str, raw_query: str) -> str:
     return f"{base_url}?{'&'.join(components)}"
 
 
+def unsigned_callback_url_candidates(public_url: str, raw_query: str) -> tuple[str, ...]:
+    """Return the exact and Innovate-normalized forms that may be signed.
+
+    Innovate's browser redirect has been observed signing the hydrated
+    ``termReason`` value before the browser percent-encodes spaces and other
+    characters.  The exact wire representation remains the primary contract;
+    the second candidate only decodes that one documented outcome value.
+    """
+
+    exact = unsigned_callback_url(public_url, raw_query)
+    components = str(raw_query or "").split("&")
+    normalized_components = []
+    changed = False
+    for component in components:
+        raw_name, separator, raw_value = component.partition("=")
+        if separator and unquote_plus(raw_name) == "termReason":
+            normalized_value = unquote(raw_value)
+            normalized_components.append(f"{raw_name}={normalized_value}")
+            changed = changed or normalized_value != raw_value
+        else:
+            normalized_components.append(component)
+    if not changed:
+        return (exact,)
+    base_url = _validated_public_url(public_url)
+    normalized_query = "&".join(normalized_components)
+    normalized = unsigned_callback_url(base_url, normalized_query)
+    return (exact, normalized)
+
+
 def expected_callback_hash(secret: str, unsigned_url: str) -> str:
     """Generate InnovateMR's configured HMAC-SHA1 lowercase hex digest."""
 
@@ -82,6 +111,8 @@ def verify_callback_hash(*, secret: str, public_url: str, raw_query: str, receiv
     supplied = str(received_hash or "").strip()
     if not HASH_PATTERN.fullmatch(supplied):
         return False
-    unsigned_url = unsigned_callback_url(public_url, raw_query)
-    expected = expected_callback_hash(secret, unsigned_url)
-    return hmac.compare_digest(expected, supplied.lower())
+    verified = False
+    for unsigned_url in unsigned_callback_url_candidates(public_url, raw_query):
+        expected = expected_callback_hash(secret, unsigned_url)
+        verified |= hmac.compare_digest(expected, supplied.lower())
+    return verified

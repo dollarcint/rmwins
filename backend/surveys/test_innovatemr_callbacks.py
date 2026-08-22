@@ -7,6 +7,7 @@ from django.urls import reverse
 from vendors.models import Client, ClientIntegration
 
 from .models import Survey, SurveyAttempt
+from .outcomes import provider_outcome
 
 
 CALLBACK_SECRET = "test-only-innovatemr-callback-secret"
@@ -204,6 +205,68 @@ class InnovateMRCallbackTests(TestCase):
             attempt.upstream_transaction_data["innovatemr_redirect"]["termReason"],
             "Qualifications did not match",
         )
+
+    def test_verified_browser_reason_survives_reasonless_server_callback(self):
+        attempt = self.create_attempt()
+        self.client.get(
+            self.callback_url(
+                attempt.rid,
+                "5",
+                public_url=CALLBACK_ALIAS_URL,
+            )
+        )
+
+        term_reason = "Group NA"
+        unsigned = (
+            f"{CALLBACK_URL}?pid={attempt.rid}&status=5"
+            f"&termReason={term_reason}&hash="
+        )
+        digest = hmac.new(
+            CALLBACK_SECRET.encode("utf-8"),
+            unsigned.encode("utf-8"),
+            hashlib.sha1,
+        ).hexdigest()
+        response = self.client.get(
+            f"{reverse('innovatemr-callback')}?pid={attempt.rid}&status=5"
+            f"&termReason=Group%20NA&hash={digest}"
+        )
+
+        self.assertEqual(response.status_code, 302)
+        attempt.refresh_from_db()
+        self.assertEqual(attempt.status, SurveyAttempt.Status.TERMINATED)
+        self.assertTrue(attempt.is_verified)
+        self.assertTrue(
+            attempt.upstream_transaction_data["innovatemr_last_callback"]["hash_valid"]
+        )
+        self.assertEqual(
+            attempt.upstream_transaction_data["innovatemr_outcome"]["termReason"],
+            term_reason,
+        )
+        self.assertEqual(provider_outcome(attempt)["reason"], term_reason)
+
+    def test_invalid_duplicate_reason_is_never_promoted(self):
+        attempt = self.create_attempt()
+        self.client.get(
+            self.callback_url(
+                attempt.rid,
+                "5",
+                public_url=CALLBACK_ALIAS_URL,
+            )
+        )
+
+        self.client.get(
+            reverse("innovatemr-callback"),
+            {
+                "pid": attempt.rid,
+                "status": "5",
+                "termReason": "Forged reason",
+                "hash": "0" * 40,
+            },
+        )
+
+        attempt.refresh_from_db()
+        self.assertNotIn("innovatemr_outcome", attempt.upstream_transaction_data)
+        self.assertEqual(provider_outcome(attempt)["reason"], "")
 
     def test_unsigned_legacy_callback_cannot_credit_innovatemr_attempt(self):
         attempt = self.create_attempt()

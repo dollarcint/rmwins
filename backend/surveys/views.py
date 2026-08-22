@@ -2498,6 +2498,13 @@ def _record_innovatemr_result(
             audit["innovatemr_redirect"] = callback_audit
         else:
             audit["innovatemr_last_callback"] = callback_audit
+        if hash_valid and str(term_reason or "").strip():
+            audit["innovatemr_outcome"] = {
+                "upstream_status": str(upstream_status or ""),
+                "termReason": str(term_reason).strip(),
+                "hash_valid": True,
+                "public_url": str(hash_public_url or ""),
+            }
         if not hash_valid:
             audit["innovatemr_rejected_callback_count"] = (
                 int(audit.get("innovatemr_rejected_callback_count") or 0) + 1
